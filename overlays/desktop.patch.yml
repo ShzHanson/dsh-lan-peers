@@ -1,0 +1,21 @@
+# 桌面版（Electron）覆盖片段
+#
+# 桌面版 profile 由应用独占管理，CLI 装不进去。手工做三步：
+#   1) 把包放进 ~/.dsh/profiles/desktop/node_modules（pnpm add link:<path> 或解压 tarball 后改名）
+#   2) 在 ~/.dsh/profiles/desktop/package.json 的 dependencies 加 "dsh-lan-peers"，
+#      并把它加入 dsh.profile.bundles
+#   3) 把下面这段贴到 ~/.dsh/profiles/desktop/cordis.patch.yml 末尾
+# 然后重启桌面版。
+- id: lan-peers
+  name: dsh-lan-peers
+  config:
+    name: my-desktop
+    listenPort: 7788
+    stateDir: ~/.dsh/lan-peers-desktop
+    workspace: ~/.dsh/lan-peers-workspace
+    allowRemotePrompts: false
+    requireEncryption: true
+    agentPreset: standard
+    # v0.4.0 新增（有默认值，不填 = 0.3.1 行为）：
+    # pairingMode: auto      # auto | ecdh | legacy
+    # answerWaitMs: 25000    # /v1/answer waitMs 单次 hold 上限（最大 25000）

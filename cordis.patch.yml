@@ -1,0 +1,12 @@
+# dsh-lan-peers bundle patch: inserts its plugin row into the web plugin roster.
+- insert:
+    - id: lan-peers
+      name: dsh-lan-peers
+      config:
+        listenPort: 7788
+        allowRemotePrompts: false
+        # v0.4.0 新增，均有默认值；不填就完全保持 0.3.1 的行为。
+        # pairingMode: auto      # auto | ecdh | legacy；auto 看对端 /v1/health 的
+        #                        # capability "pair-ecdh"，有则走 ECDH 两轮配对，
+        #                        # 没有（0.3.1 对端）则回退旧明文 /v1/pair
+        # answerWaitMs: 25000    # GET /v1/answer 单次 waitMs hold 上限，默认 25000、最大 25000

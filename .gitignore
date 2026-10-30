@@ -1,0 +1,25 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+
+# 运行期状态与密钥文件（插件生成，绝不入库）
+**/peers.json
+**/state.json
+**/group.json
+**/group-key.json
+**/group-replica.json
+**/group-role.json
+**/known-groups.json
+**/advertise-state.json
+**/*.log
+
+# 本地临时物与测试产物
+.tmp/
+interop/state/
+interop/last-run*.txt
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

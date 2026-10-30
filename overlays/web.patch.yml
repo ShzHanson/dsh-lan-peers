@@ -1,0 +1,18 @@
+# 网页版（浏览器访问的 dsh web）覆盖片段
+#
+# 粘贴到 <DSH_HOME>/profiles/web/cordis.patch.yml 的末尾，按需改值。
+# 同时务必把 "dsh-lan-peers" 加入该 profile package.json 的 dsh.profile.bundles。
+- id: lan-peers
+  name: dsh-lan-peers
+  config:
+    name: my-web-dsh
+    listenPort: 7788
+    stateDir: ~/.dsh/lan-peers-web
+    workspace: ~/.dsh/lan-peers-web/workspace
+    allowRemotePrompts: false
+    requireEncryption: true
+    agentPreset: standard
+    # trustedCidrs: ["192.168.1.0/24"]
+    # v0.4.0 新增（有默认值，不填 = 0.3.1 行为）：
+    # pairingMode: auto      # auto | ecdh | legacy
+    # answerWaitMs: 25000    # /v1/answer waitMs 单次 hold 上限（最大 25000）

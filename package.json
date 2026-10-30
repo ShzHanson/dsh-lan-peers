@@ -1,0 +1,61 @@
+{
+  "name": "dsh-lan-peers",
+  "version": "0.8.1-α",
+  "description": "局域网 DSH 协同：一次性配对互认、HMAC 签名 + AES-256-GCM 加密、agent 互派任务",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "host",
+    "client",
+    "overlays",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-lan-peers": "client/cli.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "lan",
+    "peer",
+    "pairing",
+    "group-chat",
+    "cluster",
+    "ecdh"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShzHanson/dsh-lan-peers.git"
+  },
+  "homepage": "https://github.com/ShzHanson/dsh-lan-peers#readme",
+  "bugs": {
+    "url": "https://github.com/ShzHanson/dsh-lan-peers/issues"
+  },
+  "author": "ShzHanson"
+}
