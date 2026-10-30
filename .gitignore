@@ -23,3 +23,6 @@ interop/last-run*.txt
 Thumbs.db
 .idea/
 .vscode/
+
+# 本机内部特征名单（各人自建，不入库）
+.leak-patterns.local.json

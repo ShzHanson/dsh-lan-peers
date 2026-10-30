@@ -57,5 +57,10 @@
   "bugs": {
     "url": "https://github.com/ShzHanson/dsh-lan-peers/issues"
   },
-  "author": "ShzHanson"
+  "author": "ShzHanson",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 host/test/*.test.mjs lib/*.test.mjs client/*.test.mjs",
+    "leak-check": "node scripts/leak-check.mjs --history",
+    "prepublishOnly": "node scripts/leak-check.mjs --history"
+  }
 }
