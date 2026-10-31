@@ -55,11 +55,14 @@ import {
   GROUP_APPLICATION_TTL_MS,
   GROUP_AUTH_CLOCK_SKEW_MS,
   GROUP_AUTH_HEADER,
+  GROUP_ACCEPT_HEADER,
   GROUP_AUTH_NONCE_WINDOW_MS,
   GROUP_AUTH_PATHS,
   GROUP_AUTH_VALUE,
   GROUP_BASE_HEADER,
+  GROUP_DEFAULT_ACCEPT_DISPATCH,
   GROUP_DEFAULT_COMMIT_TIMEOUT_MS,
+  GROUP_DEFAULT_DISPATCH_RATE_MS,
   GROUP_DEFAULT_HEARTBEAT_MS,
   GROUP_DEFAULT_HUB_PRIORITY,
   GROUP_DEFAULT_REPLICA_PULL_MS,
@@ -74,13 +77,18 @@ import {
   broadcastGroupAdvertisement,
   buildGroupCanonical,
   commitGroupMessage,
+  createGroupDispatcher,
   decryptGroupBody,
   deriveGroupKeys,
   encryptGroupBody,
   fetchGroupState,
   groupCall,
+  groupDispatchSummary,
   joinGroup,
   normalizeGroupName,
+  parseAcceptFlag,
+  postGroup,
+  postGroupWithGroupKey,
   proposeGroupMessage,
   pullGroupMessages,
   quorumSize,
@@ -110,7 +118,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.8.1';
+export const PLUGIN_VERSION = '0.8.2';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -229,7 +237,11 @@ const TRAILING_SLASHES = /\/+$/;
 /** §3 kind 白名单 */
 export const GROUP_KINDS = Object.freeze(['chat', 'progress', 'result', 'system']);
 
-/** §3 meta 白名单：不在表里的字段在落盘前丢弃 */
+/**
+ * §3 meta 白名单：不在表里的字段在落盘前丢弃。
+ * v0.8.2-α 追加 target/by/reason —— 群内派单的 progress/result 靠它们说明
+ * 「谁派给谁、为什么没派成」；正文永远不进 meta。
+ */
 export const GROUP_META_FIELDS = Object.freeze([
   'peer',
   'sessionId',
@@ -238,6 +250,9 @@ export const GROUP_META_FIELDS = Object.freeze([
   'transport',
   'elapsedMs',
   'replyChars',
+  'target',
+  'by',
+  'reason',
 ]);
 
 /** meta 里的字符串字段上限（防止有人用 meta 夹带大块数据） */
@@ -261,6 +276,12 @@ export const GROUP_ARCHIVE_INDEX_LIMIT = 200;
 
 /** §18：归档目录名（<stateDir>/group-archive） */
 export const GROUP_ARCHIVE_DIR = 'group-archive';
+
+/**
+ * v0.8.2-α §4：本机接单开关的运行期落盘文件（<stateDir>/group-dispatch-prefs.json）。
+ * 刻意与 DSH profile 配置分开：profile 是用户手改过的文件，插件不回写。
+ */
+export const GROUP_DISPATCH_PREFS_FILE = 'group-dispatch-prefs.json';
 
 /** v0.8.0-β §A1：失败选举的指数退避 base / 上限 / 抖动 */
 export const GROUP_ELECTION_BACKOFF_BASE_MS = 5_000;
@@ -429,6 +450,8 @@ export function normalizeGroupConfig(raw) {
   const heartbeatMs = Number(value.heartbeatMs);
   const commitMs = Number(value.commitTimeoutMs);
   const priority = Number(value.hubPriority);
+  // v0.8.2-α §2/§4：群内派单的两个旋钮（与 lib/group-client.mjs 的同名归一化保持一致）
+  const dispatchRateMs = Number(value.dispatchRateMs);
   return {
     enabled: value.enabled === true,
     hub: String(value.hub ?? '').trim(),
@@ -451,6 +474,12 @@ export function normalizeGroupConfig(raw) {
       ? Math.floor(commitMs)
       : GROUP_DEFAULT_COMMIT_TIMEOUT_MS,
     hubPriority: Number.isFinite(priority) ? Math.floor(priority) : GROUP_DEFAULT_HUB_PRIORITY,
+    // 本机是否接群内派单（缺省 true：老配置与老对端都按接单处理）
+    acceptDispatch: value.acceptDispatch !== false,
+    // 同一目标的最小派单间隔；0 = 关闭限流（只允许显式配置成 0）
+    dispatchRateMs: Number.isFinite(dispatchRateMs) && dispatchRateMs >= 0
+      ? Math.floor(dispatchRateMs)
+      : GROUP_DEFAULT_DISPATCH_RATE_MS,
   };
 }
 
@@ -1181,6 +1210,12 @@ export class GroupStore {
     data.pending = data.pending.filter((entry) => entry && typeof entry === 'object'
       && Number.isFinite(Number(entry.seq)) && Number(entry.seq) > 0);
     if (typeof data.members !== 'object' || data.members === null || Array.isArray(data.members)) data.members = {};
+    // v0.8.2-α §4：成员的接单开关。读写都只认「显式 false = 关闭」，
+    // 缺失/垃圾值一律按 true（老 group.json 与老对端都是这个口径）。
+    for (const member of Object.values(data.members)) {
+      if (!member || typeof member !== 'object') continue;
+      if (member.acceptDispatch !== undefined) member.acceptDispatch = member.acceptDispatch !== false;
+    }
     // §18：归档索引 [{ file, fromSeq, toSeq, count, bytes, createdAt }]
     data.archives = (Array.isArray(data.archives) ? data.archives : [])
       .filter((entry) => entry && typeof entry === 'object'
@@ -1262,6 +1297,25 @@ export class GroupStore {
       this.#save(data);
     }
     return data.members[id];
+  }
+
+  /**
+   * v0.8.2-α §4：记下某个成员自报的接单开关（hub 侧权威落盘）。
+   * 只在该值真的变化时写盘 —— 心跳/拉取是 3s/10s 一次的周期性请求，静默期必须零写入。
+   * 返回是否发生了变更。
+   */
+  setMemberAcceptDispatch(peerId, accept) {
+    const id = String(peerId ?? '');
+    const data = this.#load();
+    const member = data.members[id];
+    if (!member || typeof member !== 'object') return false;
+    const next = accept !== false;
+    // 字段缺失时也写一次：让 group.json 里每个人都有**实数**（运维/面板要看得见）。
+    // 写一次之后值不变就不再落盘 —— 心跳 3s、pull 10s 一级的周期上报不会造成写放大。
+    if (member.acceptDispatch !== undefined && member.acceptDispatch !== false === next) return false;
+    member.acceptDispatch = next;
+    this.#save(data);
+    return true;
   }
 
   /** 这个 peerId 是否被运维移除过（自助 join 必须拒绝） */
@@ -2107,6 +2161,33 @@ export function createPeerServer(overrides = {}) {
   // v0.8.0：role 可以被**运行期提升**（按名入群拿到 grant 后原地变成员），所以是 let
   let groupRole = resolveGroupRole();
 
+  // -------------------------------------------------------------------------
+  // v0.8.2-α §4：本机「接单」开关（热生效）
+  //
+  // 配置 group.acceptDispatch 是**默认值来源**；运行期切换（面板/CLI 调
+  // server.group.setAcceptDispatch）落 <stateDir>/group-dispatch-prefs.json，启动时覆盖配置。
+  // 刻意不回写 DSH profile：那是用户手改过的文件，插件写坏一次就要人工修。
+  // -------------------------------------------------------------------------
+  const groupPrefsPath = path.join(config.stateDir, GROUP_DISPATCH_PREFS_FILE);
+
+  function readAcceptDispatchPref() {
+    try {
+      const raw = JSON.parse(fs.readFileSync(groupPrefsPath, 'utf8'));
+      return parseAcceptFlag(raw?.acceptDispatch);
+    } catch {
+      return null;
+    }
+  }
+
+  let localAcceptDispatch = (() => {
+    const pref = readAcceptDispatchPref();
+    if (pref !== null) return pref;
+    return config.group.acceptDispatch === false ? false : GROUP_DEFAULT_ACCEPT_DISPATCH;
+  })();
+
+  /** 本机接单开关（所有自报点与群状态视图都读这里，切换后立刻生效） */
+  const acceptDispatchNow = () => localAcceptDispatch === true;
+
   /** §18：归档触发体积（默认 20 MB；overrides.groupArchive.bytes 只给测试压缩用） */
   const archiveBytesLimit = Number.isFinite(Number(overrides.groupArchive?.bytes))
     ? Math.max(1, Math.floor(Number(overrides.groupArchive.bytes)))
@@ -2124,6 +2205,11 @@ export function createPeerServer(overrides = {}) {
         logger: config.logger,
       })
     : null;
+
+  // v0.8.2-α §4：hub 自己那条成员的接单开关必须**落成实数**。
+  // 它收不到自己的心跳，若不在这里写，group.json 里就永远是 undefined；作者侧读到
+  // undefined 会按向后兼容当 true → not-accepting 永远触发不了（2026-11-01 真机复现）。
+  if (groupStore) groupStore.setMemberAcceptDispatch(store.instanceId, localAcceptDispatch);
 
   /**
    * S2：只有成员落盘副本；hub 的权威日志仍是 group.json。
@@ -2175,7 +2261,12 @@ export function createPeerServer(overrides = {}) {
     if (!keyFile) return null;
     const replica = replicaStore.state();
     const members = { ...keyFile.members };
-    if (!members[store.instanceId]) members[store.instanceId] = { name: config.name };
+    // 自己那一行永远用本机实时开关（group-key.json 是从 hub 抄来的副本，可能是旧的）
+    members[store.instanceId] = {
+      ...(members[store.instanceId] ?? { name: config.name }),
+      name: members[store.instanceId]?.name || config.name,
+      acceptDispatch: acceptDispatchNow(),
+    };
     return {
       node: 'member',
       groupId: keyFile.groupId,
@@ -2838,6 +2929,8 @@ export function createPeerServer(overrides = {}) {
         lastSeq: isSelf
           ? groupStore.state().lastSeq
           : (memberProgress.get(peerId)?.lastSeq ?? null),
+        // v0.8.2-α §4：接单开关（老对端缺字段 = true）。自己那一行读本机实时值。
+        acceptDispatch: isSelf ? acceptDispatchNow() : member?.acceptDispatch !== false,
       };
     });
   }
@@ -3617,6 +3710,24 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
+   * v0.8.2-α §4：成员自报的接单开关（心跳 body / probe·pull 的 X-Peer-Accept）。
+   * hub 侧权威落盘进 group.json.members[].acceptDispatch；值缺失/垃圾一律忽略
+   * （「没报」≠「关闭」，也绝不把老对端当成不接单）。
+   */
+  function rememberMemberAcceptDispatch(peerId, raw) {
+    const value = parseAcceptFlag(raw);
+    if (value === null) return false;
+    const id = String(peerId ?? '');
+    if (id === '' || id === store.instanceId) return false;
+    if (!groupStore) return false;
+    const changed = groupStore.setMemberAcceptDispatch(id, value);
+    if (changed && config.logger) {
+      config.logger('[group] accept-dispatch from=' + shortPeerId(id) + ' value=' + (value ? 'on' : 'off'));
+    }
+    return changed;
+  }
+
+  /**
    * S2 成员复制进度（内存，不落盘）：peerId -> {lastSeq, at}。
    * 成员在 probe/pull 的 X-Peer-LastSeq 里自报，hub 只用来算「落后 leader 多少条」。
    * 刻意不写 group.json：每 10s 一次 pull 的写放大不值当，重启后重新上报即可。
@@ -3699,6 +3810,7 @@ export function createPeerServer(overrides = {}) {
         members[peerId] = {
           name: String(member?.name ?? '') || String(previous[peerId]?.name ?? ''),
           baseUrl: String(member?.baseUrl ?? '') || String(previous[peerId]?.baseUrl ?? ''),
+          acceptDispatch: member?.acceptDispatch !== false,
         };
       }
       if (Object.keys(members).length === 0) Object.assign(members, previous);
@@ -3814,6 +3926,7 @@ export function createPeerServer(overrides = {}) {
     const ctx = auth.ctx;
     rememberMemberBaseUrl(auth.peerId, headerValue(req, GROUP_BASE_HEADER.toLowerCase()));
     rememberMemberProgress(auth.peerId, headerValue(req, GROUP_LASTSEQ_HEADER.toLowerCase()));
+    rememberMemberAcceptDispatch(auth.peerId, headerValue(req, GROUP_ACCEPT_HEADER.toLowerCase()));
     const advertiseBaseUrl = localAdvertiseBaseUrl();
     if (config.logger) {
       config.logger(
@@ -3831,6 +3944,8 @@ export function createPeerServer(overrides = {}) {
         leaderPeerId: ctx.leaderPeerId,
         lastSeq: ctx.lastSeq,
         advertiseBaseUrl,
+        // v0.8.2-α §4：本机接单开关（对端据此判断能不能往我这派单）
+        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
@@ -3847,15 +3962,28 @@ export function createPeerServer(overrides = {}) {
         leaderPeerId: ctx.leaderPeerId,
         lastSeq: ctx.lastSeq,
         advertiseBaseUrl: localAdvertiseBaseUrl(),
+        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
+  }
+
+  /** v0.8.2-α §4：成员接单开关掩码（自己那一行用本机实时值，其余读成员表） */
+  function groupMemberAcceptMask(ctx) {
+    const mask = {};
+    for (const [peerId, member] of Object.entries(ctx?.members ?? {})) {
+      mask[peerId] = peerId === store.instanceId ? acceptDispatchNow() : member?.acceptDispatch !== false;
+    }
+    return mask;
   }
 
   function groupPull(req, rawBody, url, auth) {
     const ctx = auth.ctx;
     rememberMemberBaseUrl(auth.peerId, headerValue(req, GROUP_BASE_HEADER.toLowerCase()));
     rememberMemberProgress(auth.peerId, headerValue(req, GROUP_LASTSEQ_HEADER.toLowerCase()));
+    // follower 不心跳（心跳只由 leader 发），它唯一的周期自报渠道就是 pull：
+    // 接单开关也随这里上报，否则「关掉接单」要等下一次选举才传得到 hub。
+    rememberMemberAcceptDispatch(auth.peerId, headerValue(req, GROUP_ACCEPT_HEADER.toLowerCase()));
     const sinceSeq = readGroupSinceSeq(url);
     const limit = readGroupLimit(url);
     // hub 读权威日志，成员读本地副本（成员之间也能互相补差）
@@ -3878,6 +4006,10 @@ export function createPeerServer(overrides = {}) {
         messages,
         // 成员靠它把成员表刷新到最新（新成员加进来后不会一直判 not-a-member）
         memberIds: Object.keys(ctx.members),
+        memberAcceptDispatch: groupMemberAcceptMask(ctx),
+        // v0.8.2-α §4：接单开关随 pull 下发（只多这一张 id→bool 的小表）。
+        // 少了它，成员本地表永远停在默认值 true —— 作者侧前置检查读到旧值，
+        // 「hub 关单后成员派单」就照常执行（真机现象）。老端忽略该字段。
       },
       peerId: auth.peerId,
     };
@@ -4367,6 +4499,8 @@ export function createPeerServer(overrides = {}) {
       commitSeq: renewed.commitSeq,
       priority: hubPriority,
       selfBaseUrl: localAdvertiseBaseUrl(),
+      // v0.8.2-α §4：接单开关随心跳自报
+      acceptDispatch: acceptDispatchNow(),
       timeoutMs: peerTimeoutMs,
     };
     const results = await Promise.allSettled(targets.map((peerId) => withGroupKey((keyCtx) => sendGroupHeartbeat({
@@ -4554,6 +4688,7 @@ export function createPeerServer(overrides = {}) {
             candidate: store.instanceId,
             priority: hubPriority,
             selfBaseUrl: localAdvertiseBaseUrl(),
+            acceptDispatch: acceptDispatchNow(),
             timeoutMs: peerTimeoutMs,
           }));
           if (Number(reply?.epoch) > epoch && String(reply?.leaderPeerId ?? '') !== '') ahead = reply;
@@ -4841,6 +4976,8 @@ export function createPeerServer(overrides = {}) {
         keyVersion: groupKeyVersion(),
         degraded: isDegraded(),
         advertiseBaseUrl: localAdvertiseBaseUrl(),
+        // v0.8.2-α §4：本机接单开关（排障用，与心跳/probe 同一口径）
+        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
@@ -4865,6 +5002,7 @@ export function createPeerServer(overrides = {}) {
     // 少了这一笔，成员重启换端口后只有下一次 pull（测试里 600s 一次）才会纠正地址，
     // 期间 leader 的提案会打到旧地址上（表现：post 503 quorum-unavailable，而成员明明在线）。
     rememberMemberBaseUrl(auth.peerId, senderBaseUrl);
+    rememberMemberAcceptDispatch(auth.peerId, body.acceptDispatch);
     if (Number.isFinite(Number(body.priority))) peerPriorities.set(leaderPeerId, Math.floor(Number(body.priority)));
     const st = ensureRole();
     if (!st) return { status: 404, body: { error: 'not-found' }, peerId: auth.peerId };
@@ -4905,7 +5043,17 @@ export function createPeerServer(overrides = {}) {
     }
     // 契约 §5：心跳里的 commitSeq 更高说明本机漏了提交，用 pull 补齐（成员侧）
     if (groupRole === 'member' && commitSeq > before) void memberTick().catch(() => {});
-    return { status: 200, body: { ok: true, epoch: accepted.epoch, commitSeq: accepted.commitSeq }, peerId: auth.peerId };
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        epoch: accepted.epoch,
+        commitSeq: accepted.commitSeq,
+        // v0.8.2-α §4：本机接单开关（心跳是对端周期性学到它的渠道）
+        acceptDispatch: acceptDispatchNow(),
+      },
+      peerId: auth.peerId,
+    };
   }
 
   /**
@@ -4925,6 +5073,7 @@ export function createPeerServer(overrides = {}) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
     }
     rememberPeerBaseUrl(auth.peerId, headerValue(req, GROUP_BASE_HEADER.toLowerCase()));
+    rememberMemberAcceptDispatch(auth.peerId, body.acceptDispatch);
     peerPriorities.set(candidate, priority);
     const st = ensureRole();
     if (!st) return { status: 404, body: { error: 'not-found' }, peerId: auth.peerId };
@@ -5386,11 +5535,18 @@ export function createPeerServer(overrides = {}) {
    *
    * 名字与地址仍尽量沿用本地已知值（快照里通常没有），但**条目本身以权威快照为准**。
    */
-  function replaceGroupMembers(members, names = {}) {
+  function replaceGroupMembers(members, names = {}, accepts = null) {
     const existing = readGroupKeyFile(config.stateDir);
     if (!existing) return null;
     const previous = existing.members ?? {};
     const next = {};
+    const acceptOf = (id) => {
+      // v0.8.2-α §4：pull 带来的掩码是权威值；掩码没提这个成员就沿用本地已知值。
+      // 少了这一笔，每轮 pull 都会把成员的接单开关重置回默认 true（真机上就是
+      // 「hub 关了单、成员还在照派」）。
+      if (accepts && Object.prototype.hasOwnProperty.call(accepts, id)) return accepts[id] !== false;
+      return previous[id]?.acceptDispatch !== false;
+    };
     for (const peerId of members) {
       const id = String(peerId ?? '');
       if (id === '') continue;
@@ -5400,6 +5556,7 @@ export function createPeerServer(overrides = {}) {
       next[id] = {
         name: String(names[id]?.name ?? previous[id]?.name ?? ''),
         baseUrl,
+        acceptDispatch: acceptOf(id),
       };
     }
     if (Object.keys(next).length === 0) return null;
@@ -5407,6 +5564,7 @@ export function createPeerServer(overrides = {}) {
       next[store.instanceId] = {
         name: config.name,
         baseUrl: String(previous[store.instanceId]?.baseUrl ?? '') || localAdvertiseBaseUrl(),
+        acceptDispatch: acceptDispatchNow(),
       };
     }
     rememberAuthoritativeMembers(Object.keys(next), 'pull');
@@ -5433,7 +5591,12 @@ export function createPeerServer(overrides = {}) {
       for (const member of Array.isArray(state.members) ? state.members : []) {
         const peerId = String(member?.peerId ?? '');
         if (peerId === '') continue;
-        members[peerId] = { name: String(member?.name ?? ''), baseUrl: String(member?.baseUrl ?? '') };
+        members[peerId] = {
+          name: String(member?.name ?? ''),
+          baseUrl: String(member?.baseUrl ?? ''),
+          // v0.8.2-α §4：hub 的 state.members[].acceptDispatch 是权威值
+          acceptDispatch: member?.acceptDispatch !== false,
+        };
       }
       if (!members[hub.peerId]) members[hub.peerId] = { name: hub.name, baseUrl: hub.baseUrl };
       if (!members[store.instanceId]) members[store.instanceId] = { name: config.name, baseUrl: '' };
@@ -5565,6 +5728,8 @@ export function createPeerServer(overrides = {}) {
         selfBaseUrl: localAdvertiseBaseUrl(),
         // 自报复制进度：hub 的面板据此显示「落后 leader 多少条」
         lastSeq: sinceSeq,
+        // v0.8.2-α §4：follower 的周期自报渠道就是 pull（心跳只由 leader 发）
+        acceptDispatch: acceptDispatchNow(),
         timeoutMs: Math.max(1000, replicaPullMs),
       }));
       if (String(page?.groupId ?? '') !== String(ctx.groupId)) {
@@ -5577,7 +5742,7 @@ export function createPeerServer(overrides = {}) {
         messages: Array.isArray(page.messages) ? page.messages : [],
       });
       if (Array.isArray(page.memberIds) && page.memberIds.length > 0) {
-        replaceGroupMembers(page.memberIds, ctx.members);
+        replaceGroupMembers(page.memberIds, ctx.members, page.memberAcceptDispatch ?? null);
       }
       memberLastError = '';
       // hub 在 pull 响应里自报地址（X-Peer-Base 同一口径）：按名入群的节点本地没有 hub 的
@@ -5908,6 +6073,204 @@ export function createPeerServer(overrides = {}) {
     return '';
   }
 
+  // -------------------------------------------------------------------------
+  // v0.8.2-α §1–§3 群内派单：作者侧门面（单例）+ 摘要投影
+  //
+  // 为什么门面在 host 里：派单的执行侧是「本机作为作者发一次 1:1 ask」，
+  // 而回执要写进群。面板/CLI/工具都经这里，避免解析与前置检查写三遍。
+  // -------------------------------------------------------------------------
+
+  /** peers.json 的**完整**记录（带 secret）：派单要真签名，脱敏视图不够用 */
+  function groupPeersFull() {
+    const loaded = store.reloadPeers();
+    return Object.entries(loaded.peers ?? {}).map(([peerId, peer]) => ({ peerId, ...peer }));
+  }
+
+  /**
+   * 群级签名的回执通道（v0.8.0 §18.5 已有能力）：只有群密钥、没和 hub 配对的成员
+   * （按名入群）靠它把进度写进群。目标按「leader → hub」顺序试：
+   * /v1/group/post 的群级通道只在 hub 上生效，正常情况下 leader 就是 hub 角色。
+   */
+  async function postGroupReceiptWithGroupKey({ kind, text = '', meta = null }) {
+    const ctx = localGroupContext();
+    if (!ctx?.groupKey || String(ctx.groupId ?? '') === '') throw new Error('group-key-unavailable');
+    const targets = [];
+    const leaderId = String(ctx.leaderPeerId ?? '');
+    if (leaderId !== '' && leaderId !== store.instanceId) {
+      const leaderUrl = baseUrlOf(leaderId);
+      if (leaderUrl !== '') targets.push(leaderUrl);
+    }
+    const hubUrl = String(groupHubPeer()?.baseUrl ?? '').trim().replace(TRAILING_SLASHES, '');
+    if (hubUrl !== '' && !targets.includes(hubUrl)) targets.push(hubUrl);
+    if (targets.length === 0) throw new Error('group-post-unreachable');
+    let lastError = null;
+    for (const baseUrl of targets) {
+      try {
+        const sent = await withGroupKey((keyCtx) => postGroupWithGroupKey({
+          baseUrl,
+          groupKey: keyCtx.groupKey,
+          groupId: String(keyCtx.groupId),
+          senderId: store.instanceId,
+          kind,
+          text,
+          meta,
+          selfBaseUrl: localAdvertiseBaseUrl(),
+          timeoutMs: 5_000,
+        }));
+        return { ok: true, seq: sent?.seq ?? null };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error('group-post-failed');
+  }
+
+  /**
+   * 往群里投一条派单回执（progress/result）。三条通道，按可用性依次降级：
+   *   1. hub（有 groupStore）→ 直写 group.json，自己当 leader 时顺手入复制队列；
+   *   2. 有 hub 的 per-peer 密钥 → 既有 per-peer 通道打 hub（与 §14 进度镜像同一条路）；
+   *   3. 只有群密钥（按名入群）→ 群级签名通道打 leader，leader 未知回落 hub。
+   * 只有 2/3 都失败才抛（派单器记 group.error + 一行日志）；回执成败绝不影响派单本身。
+   */
+  async function postGroupReceipt({ kind, text = '', meta = null }) {
+    if (groupStore) {
+      const message = groupStore.append({
+        peerId: store.instanceId,
+        name: config.name,
+        kind,
+        text,
+        meta,
+      });
+      if (isLocalLeader()) enqueueReplication(message);
+      return { ok: true, seq: message?.seq ?? null };
+    }
+    const hub = groupHubPeer();
+    let peerError = null;
+    if (hub && hub.secret && hub.baseUrl) {
+      try {
+        const sent = await postGroup({
+          baseUrl: hub.baseUrl,
+          secret: hub.secret,
+          senderId: store.instanceId,
+          kind,
+          text,
+          meta,
+          timeoutMs: 5_000,
+        });
+        return { ok: true, seq: sent?.seq ?? null };
+      } catch (error) {
+        peerError = error;
+      }
+    }
+    try {
+      return await postGroupReceiptWithGroupKey({ kind, text, meta });
+    } catch (error) {
+      throw peerError ?? error;
+    }
+  }
+
+  let groupDispatcher = null;
+
+  /** 派单器单例：限流表与 dispatchState 必须全进程一份 */
+  function dispatcher() {
+    if (!groupDispatcher) {
+      groupDispatcher = createGroupDispatcher({
+        config,
+        peers: () => groupPeersFull(),
+        self: () => ({ instanceId: store.instanceId, name: config.name }),
+        post: (payload) => postGroupReceipt(payload),
+        memberView: () => groupMembersMap(),
+        log: config.logger,
+        now: () => config.now(),
+      });
+    }
+    return groupDispatcher;
+  }
+
+  /** 本机群功能是否可用（关闭时派单直接回 group-disabled，而不是静默什么都不做） */
+  function dispatchFacadeOff() {
+    return {
+      status: 'failed',
+      reason: 'group-disabled',
+      target: null,
+      targetName: null,
+      elapsedMs: 0,
+      replyChars: 0,
+    };
+  }
+
+  /**
+   * v0.8.2-α §4：切换本机接单开关（热生效）。
+   * 落 <stateDir>/group-dispatch-prefs.json —— 写成功即 persisted=true；
+   * 写不了也必须在**本进程**立刻生效，并如实回 persisted=false。
+   */
+  function setAcceptDispatch(value) {
+    const next = value === true || value === 1 || String(value).trim().toLowerCase() === 'true';
+    localAcceptDispatch = next;
+    config.group.acceptDispatch = next;
+    if (groupStore) groupStore.setMemberAcceptDispatch(store.instanceId, next);
+    // hub 自己也是成员：本机切换必须立刻落进自己那条 members[]，
+    // 否则别的节点（经 pull 掩码 / 群状态）永远读不到这次关闭。
+    let persisted = false;
+    try {
+      writeJson0600(groupPrefsPath, { acceptDispatch: next, updatedAt: new Date(config.now()).toISOString() });
+      persisted = true;
+    } catch (error) {
+      if (config.logger) {
+        config.logger('[group] accept-dispatch persist failed: ' + String(error?.message ?? error));
+      }
+    }
+    if (config.logger) {
+      config.logger('[group] accept-dispatch local=' + (next ? 'on' : 'off') + ' persisted=' + persisted);
+    }
+    return { acceptDispatch: next, persisted };
+  }
+
+  const dispatchFacade = {
+    /**
+     * **冻结签名**（Lane Y 的面板/CLI 消费）：
+     * dispatch({ target, task }) 或 dispatch({ text })（作者侧解析 @!）
+     *   → { status: 'done'|'failed'|'skipped', reason, target, targetName, elapsedMs, replyChars }
+     * **只返回摘要**：reply 正文在这里被剥掉，群历史里也只有摘要。
+     */
+    dispatch: async (input = {}) => {
+      if (groupRole === 'off') return dispatchFacadeOff();
+      return groupDispatchSummary(await dispatcher().dispatch(input ?? {}));
+    },
+    /**
+     * 内部入口：返回**含 reply** 的完整结果。
+     * 只允许 lan_group_ask 工具使用 —— 不得经由任何管理接口或 HTTP 路由暴露；
+     * 面板与 CLI 只能拿到 dispatch() 的摘要（契约 §3：正文只回发起方）。
+     */
+    dispatchWithReply: async (input = {}) => {
+      if (groupRole === 'off') {
+        return {
+          dispatched: false,
+          ok: false,
+          status: 'failed',
+          reason: 'group-disabled',
+          target: null,
+          targetName: null,
+          sessionId: '',
+          reply: '',
+          replyChars: 0,
+          elapsedMs: 0,
+          multiTarget: false,
+          unknownTarget: false,
+          group: { progressSeq: null, resultSeq: null, error: 'group-disabled' },
+        };
+      }
+      return dispatcher().dispatch(input ?? {});
+    },
+    /** 冻结签名：{ lastTarget, lastAt, inFlight }（只读；群关闭时是空快照） */
+    dispatchState: () => (groupRole === 'off'
+      ? { lastTarget: null, lastAt: 0, inFlight: false }
+      : dispatcher().state()),
+    setAcceptDispatch: (value) => setAcceptDispatch(value),
+    /** 本机接单开关（面板/群状态同一口径） */
+    acceptDispatch: () => acceptDispatchNow(),
+  };
+
   const discoveryFacade = {
     broadcast: (reason = 'manual') => broadcastGroupName({ manual: true, reason }),
     identity: () => localGroupIdentity(),
@@ -5949,6 +6312,7 @@ export function createPeerServer(overrides = {}) {
           isHub: true,
           ...s3Facade,
           ...discoveryFacade,
+          ...dispatchFacade,
           state: (options = {}) => groupStore.state(options),
           members: () => groupMembersView(),
           addMember: (peerId, name) => groupStore.addMember(peerId, name),
@@ -5992,6 +6356,7 @@ export function createPeerServer(overrides = {}) {
           isHub: false,
           ...s3Facade,
           ...discoveryFacade,
+          ...dispatchFacade,
           // S2 成员侧：本地副本 + 拉取/推送入口（hub 端点仍在 hub 那边）。
           // v0.8.0：副本可能因「按名入群」在运行期才出现（role 从 off 提升成 member），
           // 所以这里必须是 getter —— 否则门面永远拿到初始化那一刻的 null。

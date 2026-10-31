@@ -1,6 +1,6 @@
 {
   "name": "dsh-lan-peers",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "局域网 DSH 协同：一次性配对互认、HMAC 签名 + AES-256-GCM 加密、agent 互派任务",
   "type": "module",
   "main": "lib/index.js",

@@ -123,6 +123,8 @@ export async function startCluster(t, options = {}) {
     now: nowOverride = null,
     // 额外的选举覆盖（v0.8.0-β §A1/A2：退避参数、周期纠偏节奏、关掉启动期一次性接管）
     electionExtra = {},
+    // v0.8.2-α：群配置的额外字段（dispatchRateMs / acceptDispatch 等），逐台透传
+    groupExtra = {},
   } = options;
 
   const ids = customIds ?? Array.from({ length: count }, (_, index) => `peer-s3-${String.fromCharCode(97 + index)}`);
@@ -191,6 +193,7 @@ export async function startCluster(t, options = {}) {
       heartbeatMs: heartbeatOverride,
       commitTimeoutMs: commitOverride,
       hubPriority: priorities[index] ?? 0,
+      ...groupExtra,
     };
     if (!isHubRole) group.hub = names[0];
     const peerOptions = {

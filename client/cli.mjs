@@ -23,6 +23,9 @@ import {
   probePeer,
 } from './peer-call.mjs';
 import { readPeerEvents } from './sse.mjs';
+// v0.8.2-α（契约 §1/§5）：@! 的解析口径与面板共用一份 —— 解析属于协议，不属于某一端。
+// 面板在管理接口里解析，CLI 在发完消息后解析，两边落在同一个函数上。
+import { parseGroupDispatchCommand } from '../lib/admin.mjs';
 import {
   GROUP_APPLY_POLL_INTERVAL_MS,
   GROUP_APPLY_POLL_TIMEOUT_MS,
@@ -137,6 +140,9 @@ const GROUP_USAGE = [
   '子命令:',
   '  state                     群信息 + 成员表（会拿到 groupKey，但不打印内容）',
   '  post --text "..."         发一条消息 [--kind chat|progress|result|system]',
+  '                            正文含 @!名字 时作者侧自动派单（由本机 host 执行并打印回执摘要）',
+  '  dispatch <目标> <任务...>  等价发一条 "@!目标 任务" 并派单，打印回执摘要',
+  '  accept on|off             切换本机接单（写 profile 配置，热生效）',
   '  history [--since N]       取历史消息 [--limit 1..200]',
   '  tail [--since N]          跟随事件流并逐条打印 [--duration 秒]',
   '  join [--name 显示名]      向 hub 自助加入（hub 开了 autoJoin 才成功）',
@@ -703,8 +709,68 @@ async function cmdGroupState(dir, args) {
   console.log('groupKey: 已在 group-key.json（32B，不显示）');
 }
 
-async function cmdGroupPost(dir, args) {
-  const text = String(args.text ?? args._.slice(1).join(' ') ?? '').trim();
+/**
+ * 契约 §3 的回执摘要（CLI 口径，与面板同形）：派单 → 目标：done/failed（reason / 耗时 / 字数）。
+ * skipped 是第三种终态：这条消息没有 @! 目标 —— 零消息写入，不能说成完成也不能说成失败。
+ */
+function formatDispatchLine(dispatch) {
+  const data = dispatch && typeof dispatch === 'object' ? dispatch : {};
+  const status = String(data.status ?? '');
+  const who = String(data.targetName ?? '') || String(data.target ?? '') || '—';
+  if (status === 'skipped') return '未派单（消息里没有 @! 目标）: ' + String(data.reason ?? 'no-target');
+  const parts = [];
+  // done 也可能带 reason（契约 §1：多个 @! 只取第一个，reason=multi-target-ignored）。
+  const reason = String(data.reason ?? '');
+  if (reason !== '') parts.push(reason);
+  else if (status !== 'done') parts.push('error');
+  const elapsed = Number(data.elapsedMs);
+  if (Number.isFinite(elapsed) && elapsed >= 0) parts.push(Math.round(elapsed) + 'ms');
+  const chars = Number(data.replyChars);
+  if (Number.isFinite(chars) && chars >= 0) parts.push(Math.round(chars) + '字');
+  return '派单 → ' + who + '：' + (status === 'done' ? 'done' : 'failed')
+    + (parts.length ? '（' + parts.join(' / ') + '）' : '');
+}
+
+/**
+ * 契约 §5：作者侧派单的执行口 = 本机回环的 POST /api/lan-peers/group/dispatch。
+ * 派单要开 1:1 会话、要往群里写 progress/result，只有本机 host 做得到；CLI 直连 hub
+ * 发消息，所以这里必须再打一次本机管理接口。
+ *
+ * 本机没有 host（纯 CLI 节点、host 没起）→ **如实报错并 exit 2**：
+ * 静默把 "@!X 任务" 当成一条普普通通的群消息发出去，是最坏的一种失败。
+ */
+async function triggerDispatch(args, command) {
+  const url = String(args.url ?? '').trim() || ADMIN_DEFAULT_URL;
+  let out;
+  try {
+    out = await adminCall(url, 'group/dispatch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target: command.target,
+        task: command.task,
+        extraTargets: command.extraTargets,
+      }),
+    });
+  } catch (error) {
+    const reason = String(error?.message ?? error);
+    process.stderr.write('消息已发出，但派单未触发：本机 host 未响应 ' + url + '（' + reason + '）\n'
+      + '修法：先起本机 host（或对 --url 指向的管理接口重试 group dispatch）\n');
+    process.exitCode = 2;
+    return;
+  }
+  const dispatch = out && out.dispatch && typeof out.dispatch === 'object' ? out.dispatch : null;
+  if (!dispatch) {
+    process.stderr.write('派单未返回结果：本机 host 未按契约回 dispatch 摘要\n');
+    process.exitCode = 2;
+    return;
+  }
+  console.log(formatDispatchLine(dispatch));
+  if (dispatch.status === 'failed') process.exitCode = 1;
+}
+
+/** 发一条群消息（post 与 dispatch 共用）；作者侧在 POST 之后按契约 §1 解析 @! 并派单。 */
+async function postGroupText(dir, args, text) {
   if (!text) throw new Error(GROUP_USAGE);
   if (Array.from(text).length > GROUP_TEXT_MAX_CHARS) {
     throw new Error('text 超过 ' + GROUP_TEXT_MAX_CHARS + ' 字符上限（hub 会回 413 payload-too-large）');
@@ -726,6 +792,53 @@ async function cmdGroupPost(dir, args) {
     '已发送 seq=' + sent.seq + ' ts=' + new Date(Number(sent.ts)).toISOString()
       + (channel.mode === 'group' ? '（群级签名直连 ' + channel.key.baseUrl + '）' : ''),
   );
+  // 只有 chat 参与解析：progress/result 本身就是回执，再解析一遍等于自己派自己。
+  if (kind !== 'chat') return;
+  const command = parseGroupDispatchCommand(text);
+  if (!command) return;
+  await triggerDispatch(args, command);
+}
+
+async function cmdGroupPost(dir, args) {
+  const text = String(args.text ?? args._.slice(1).join(' ') ?? '').trim();
+  await postGroupText(dir, args, text);
+}
+
+/** 契约 §5：显式入口 —— 等价发一条 "@!目标 任务" 再派单（消息先入库，回执摘要打印出来）。 */
+async function cmdGroupDispatch(dir, args) {
+  const target = String(args._[1] ?? '').trim();
+  const task = args._.slice(2).join(' ').trim() || String(args.text ?? '').trim();
+  if (target === '' || task === '') {
+    throw new Error('用法: dsh-lan-peers group dispatch <目标> <任务...>\n' + GROUP_USAGE);
+  }
+  await postGroupText(dir, args, '@!' + target + ' ' + task);
+}
+
+/** 契约 §4/§5：切换本机接单开关（写 profile 配置、热生效；结果以 host 回的为准）。 */
+async function cmdGroupAccept(dir, args) {
+  const wanted = String(args._[1] ?? '').trim().toLowerCase();
+  const value = wanted === 'on' ? true : (wanted === 'off' ? false : null);
+  if (value === null) {
+    throw new Error('用法: dsh-lan-peers group accept on|off\n' + GROUP_USAGE);
+  }
+  const url = String(args.url ?? '').trim() || ADMIN_DEFAULT_URL;
+  let out;
+  try {
+    out = await adminCall(url, 'group/accept', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ acceptDispatch: value }),
+    });
+  } catch (error) {
+    const reason = String(error?.message ?? error);
+    process.stderr.write('切换接单失败：本机 host 未接受 ' + url + '（' + reason + '）\n'
+      + '修法：确认本机 host 在跑且群功能已启用（' + reason + ' 为 501 表示 host 还没接线）\n');
+    process.exitCode = /^(40[39]|501)\b/.test(reason) ? 2 : 1;
+    return;
+  }
+  const applied = !(out && out.acceptDispatch === false);
+  console.log('本机接单：' + (applied ? '接单中' : '已关闭')
+    + (out && out.persisted === false ? '（仅本进程生效，重启后回到配置值）' : ''));
 }
 
 async function cmdGroupHistory(dir, args) {
@@ -1340,6 +1453,8 @@ async function cmdGroup(args) {
   const handlers = {
     state: cmdGroupState,
     post: cmdGroupPost,
+    dispatch: cmdGroupDispatch,
+    accept: cmdGroupAccept,
     history: cmdGroupHistory,
     tail: cmdGroupTail,
     join: cmdGroupJoin,
