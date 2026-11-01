@@ -7,8 +7,10 @@
  *
  *   GET  /v1/health                          无认证（capability: ask/pair/pair-ecdh/stream）
  *   POST /v1/pair                            配对码（无 ecdh = 0.3.1 明文路径；有 ecdh = ECDH 第一轮，不消费码）
+ *                                            失败按来源 IP 记数退避，超限 429 rate-limited（S1）
  *   POST /v1/pair/confirm                    配对码消费 + ECDH 第二轮（wrapped 交换双方密钥）
  *   POST /v1/ask                             签名 + allowRemotePrompts
+ *                                            按 peerId 令牌桶 + 全局会话上限，超限 429 rate-limited（H4）
  *   GET  /v1/answer?sessionId=<id>[&waitMs=] 签名（waitMs>0 时服务端 hold 成长轮询）
  *   GET  /v1/events?sessionId=<id>           签名 + SSE（每条事件独立加密）
  *   GET  /v1/peers                           签名
@@ -118,7 +120,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.8.3';
+export const PLUGIN_VERSION = '0.8.4';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -228,6 +230,32 @@ export const DEFAULT_TRUSTED_CIDRS = Object.freeze([
 ]);
 
 const MAX_SESSIONS = 500;
+
+/**
+ * S1（安全审计）：/v1/pair 与 /v1/pair/confirm 曾经没有任何失败计数 ——
+ * 6 位码（10^6）在 10 分钟 TTL 内被 16 并发穷举穿。这里补的是**按来源 IP** 的
+ * 失败计数 + 指数退避：第 n 次失败后压 1s·2^(n-1)，上限 30s；累计 5 次锁 30s；
+ * 累计 20 次直接作废当前码并清零（对手已经把空间试穿一角，留着码没有意义）。
+ */
+export const PAIR_FAIL_BACKOFF_BASE_MS = 1_000;
+export const PAIR_FAIL_BACKOFF_MAX_MS = 30_000;
+export const PAIR_FAIL_LOCK_THRESHOLD = 5;
+export const PAIR_FAIL_LOCK_MS = 30_000;
+export const PAIR_FAIL_INVALIDATE_THRESHOLD = 20;
+/** 失败计数表上限（LRU 淘汰）：来源 IP 由外网决定，表不能无界 */
+export const MAX_PAIR_RATE_ENTRIES = 1_000;
+
+/**
+ * H4（安全审计）：/v1/ask 曾经没有任何频率/并发限制 —— 配对成功即可无限起会话，
+ * MAX_SESSIONS 只淘汰 map 记录、不终止 runner 会话。这里补两个旋钮：
+ *   askRatePerMin          每个 peerId 的令牌桶（默认 6 次/分钟）
+ *   maxConcurrentSessions  全局在跑会话上限（默认 8）
+ */
+export const DEFAULT_ASK_RATE_PER_MIN = 6;
+export const ASK_RATE_WINDOW_MS = 60_000;
+export const DEFAULT_MAX_CONCURRENT_SESSIONS = 8;
+/** 并发名额占满时的重试建议（毫秒）：下一条会话什么时候让位无法预测，给个固定提示 */
+export const ASK_BUSY_RETRY_MS = 1_000;
 
 const GROUP_FILE = 'group.json';
 
@@ -491,6 +519,14 @@ function normalizeAnswerWaitMs(value) {
   return Math.min(Math.floor(numeric), ANSWER_WAIT_MAX_MS);
 }
 
+/** 正整数旋钮（S1/H4）：非法值一律回落默认，不抛错（老配置里没有这些键） */
+function normalizeCount(value, fallback, { min = 1, max = 10_000 } = {}) {
+  if (value == null || value === '') return fallback;
+  const numeric = Math.floor(Number(value));
+  if (!Number.isFinite(numeric) || numeric < min) return fallback;
+  return Math.min(numeric, max);
+}
+
 export function resolveConfig(overrides = {}) {
   const stateDir = expandHome(overrides.stateDir ?? defaultStateDir());
   const name = String(overrides.name ?? os.hostname());
@@ -527,6 +563,11 @@ export function resolveConfig(overrides = {}) {
     // §6 v0.4.0：配对模式（auto 同时接受 ECDH 与旧明文）与长轮询 hold 上限
     pairingMode: normalizePairingMode(overrides.pairingMode),
     answerWaitMs: normalizeAnswerWaitMs(overrides.answerWaitMs),
+    // 安全审计 S1/H4：两条限流默认开启，显式 false 关掉（自建场景与针对性用例用）
+    pairRateLimit: overrides.pairRateLimit !== false,
+    askRateLimit: overrides.askRateLimit !== false,
+    askRatePerMin: normalizeCount(overrides.askRatePerMin, DEFAULT_ASK_RATE_PER_MIN),
+    maxConcurrentSessions: normalizeCount(overrides.maxConcurrentSessions, DEFAULT_MAX_CONCURRENT_SESSIONS),
     // §2 v0.5.0 群：默认关闭，hub 留空表示本机是 hub
     group: normalizeGroupConfig(overrides.group),
   };
@@ -874,6 +915,14 @@ export class StateStore {
     }
     if (!timingSafeStringEqual(pair.code, String(candidate ?? ''))) return { ok: false, reason: 'invalid' };
     return { ok: true, expiresAt: Number(pair.expiresAt ?? 0) };
+  }
+
+  /**
+   * S1：作废当前码（累计失败到阈值时用）。
+   * 只清内存里那枚码，不动 state.json —— 配对码本来就不落盘（M6）。
+   */
+  clearPairingCode() {
+    this.#pairingCode = null;
   }
 
   #readPeers() {
@@ -2427,6 +2476,135 @@ export function createPeerServer(overrides = {}) {
     return { ok: true, peerId, peer };
   }
 
+  // ---- S1：/v1/pair 失败计数 + 指数退避（按来源 IP） ----------------------
+  //
+  // 状态只在进程内存：配对码本身就不落盘（M6），退避状态跟着码走才合理 ——
+  // 重启后计数归零可以接受（攻击者重启不了别人机器上的服务），而写盘会多一条
+  // 需要保护、需要清理、会写坏的文件。
+  // 表里只有计数与时间戳：**不存配对码正文、不存 IP 明文到日志**。
+
+  /** ip -> { fails, backoffUntil, lockedUntil }（LRU，容量 MAX_PAIR_RATE_ENTRIES） */
+  const pairFailures = new Map();
+
+  /** 归一化来源地址（IPv4-mapped 的 ::ffff:1.2.3.4 与 zone id 都要压平） */
+  function clientAddress(req) {
+    const raw = String(req?.socket?.remoteAddress ?? '');
+    const normalized = raw.replace(/^::ffff:/i, '').split('%')[0].trim();
+    return normalized === '' ? 'unknown' : normalized;
+  }
+
+  function rememberPairFailure(ip, entry) {
+    // 重新插入到队尾 = 最近有动静；超上限时丢最久没动的那条
+    pairFailures.delete(ip);
+    pairFailures.set(ip, entry);
+    while (pairFailures.size > MAX_PAIR_RATE_ENTRIES) {
+      const oldest = pairFailures.keys().next().value;
+      pairFailures.delete(oldest);
+    }
+  }
+
+  /**
+   * 退避 / 锁定期内一律 429，且**连码都不比较**（不消耗算力、不透露正确性）。
+   * 关掉开关时直接放行，计数也不做（自建场景/测试要的就是老行为）。
+   * 日志每个窗口只写一行：这条路径每秒能被踩上千次，逐次记录等于送给对手一个刷日志的开关。
+   */
+  function pairRateGate(req) {
+    if (!config.pairRateLimit) return null;
+    const entry = pairFailures.get(clientAddress(req));
+    if (!entry) return null;
+    const nowMs = config.now();
+    const until = Math.max(Number(entry.backoffUntil ?? 0), Number(entry.lockedUntil ?? 0));
+    if (until <= nowMs) return null;
+    if (config.logger && entry.loggedUntil !== until) {
+      entry.loggedUntil = until;
+      config.logger(`pair: rate-limited (retryAfterMs=${until - nowMs})`);
+    }
+    return { status: 429, body: { error: 'rate-limited', retryAfterMs: until - nowMs } };
+  }
+
+  function resetPairFailures(req) {
+    if (!config.pairRateLimit) return;
+    pairFailures.delete(clientAddress(req));
+  }
+
+  /** 一次「码猜错了」：加计数、压退避、够阈值就锁，够更高阈值就作废当前码 */
+  function notePairFailure(req, nowMs) {
+    if (!config.pairRateLimit) return;
+    const ip = clientAddress(req);
+    const entry = pairFailures.get(ip) ?? { fails: 0, backoffUntil: 0, lockedUntil: 0 };
+    entry.fails += 1;
+    entry.backoffUntil = nowMs
+      + Math.min(PAIR_FAIL_BACKOFF_BASE_MS * 2 ** (entry.fails - 1), PAIR_FAIL_BACKOFF_MAX_MS);
+    if (entry.fails >= PAIR_FAIL_LOCK_THRESHOLD) {
+      entry.lockedUntil = Math.max(entry.lockedUntil, nowMs + PAIR_FAIL_LOCK_MS);
+    }
+    if (entry.fails >= PAIR_FAIL_INVALIDATE_THRESHOLD) {
+      // 对手已经把 10^6 的空间试穿了一角：当前码作废、挂起握手一并丢掉，计数归零
+      store.clearPairingCode();
+      pendingPairs.clear();
+      pairFailures.delete(ip);
+      if (config.logger) {
+        config.logger(`pair: pairing code invalidated after ${entry.fails} failed attempts`);
+      }
+      return;
+    }
+    rememberPairFailure(ip, entry);
+    if (entry.fails >= PAIR_FAIL_LOCK_THRESHOLD && config.logger) {
+      config.logger(`pair: source locked after ${entry.fails} failed attempts (lockMs=${PAIR_FAIL_LOCK_MS})`);
+    }
+  }
+
+  /**
+   * 猜对一次：重置该来源的计数，并作废当前码 ——
+   * 配对成功后码本来就被 consume 掉了，这里是显式收口（也覆盖 ECDH 第二轮）。
+   */
+  function notePairSuccess(req) {
+    resetPairFailures(req);
+    store.clearPairingCode();
+  }
+
+  // ---- H4：/v1/ask 的 peerId 令牌桶 + 全局会话上限 -------------------------
+
+  /** peerId -> { tokens, at }（LRU，容量同样是 1000 条） */
+  const askBuckets = new Map();
+  /** 限流日志节流：被拒请求可以成串到达，日志不该跟着成串 */
+  let lastAskThrottleLogAt = -Infinity;
+
+  /** 取一枚令牌；取不到就给出 retryAfterMs（>0） */
+  function takeAskToken(peerId, nowMs) {
+    const capacity = config.askRatePerMin;
+    const refillPerMs = capacity / ASK_RATE_WINDOW_MS;
+    const bucket = askBuckets.get(peerId) ?? { tokens: capacity, at: nowMs };
+    const elapsed = Math.max(0, nowMs - bucket.at);
+    bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * refillPerMs);
+    bucket.at = nowMs;
+    let result;
+    if (bucket.tokens >= 1) {
+      bucket.tokens -= 1;
+      result = { ok: true, retryAfterMs: 0 };
+    } else {
+      // 攒够 1 枚还需要多久（向上取整，避免返回 0 让客户端立刻重试）
+      result = { ok: false, retryAfterMs: Math.max(1, Math.ceil((1 - bucket.tokens) / refillPerMs)) };
+    }
+    askBuckets.delete(peerId);
+    askBuckets.set(peerId, bucket);
+    while (askBuckets.size > MAX_PAIR_RATE_ENTRIES) {
+      askBuckets.delete(askBuckets.keys().next().value);
+    }
+    return result;
+  }
+
+  /** 正在跑的会话数：已结算或已过 deadline 的不占名额（MAX_SESSIONS 之外的另一把闸） */
+  function runningSessionCount(nowMs) {
+    let count = 0;
+    for (const session of sessions.values()) {
+      if (session.settled === true) continue;
+      if (nowMs >= session.deadline) continue;
+      count += 1;
+    }
+    return count;
+  }
+
   // ---- /v1/ask 的会话与超时 ----------------------------------------------
 
   function normalizeTimeoutSec(value) {
@@ -2436,13 +2614,41 @@ export function createPeerServer(overrides = {}) {
     return Math.min(Math.ceil(numeric), MAX_TIMEOUT_SEC);
   }
 
+  /**
+   * H4：淘汰会话时必须**显式终止 runner 会话**，否则 MAX_SESSIONS 只是丢账本 ——
+   * runner 那边照跑，进程被拖垮，安全审计里那条「无限起会话」一点没修。
+   * runner 提供了 cancel/close 就调用；没有就记一行日志说明无法取消（不编造成功）。
+   */
+  function cancelRunnerSession(session) {
+    const cancel = typeof runner.cancel === 'function'
+      ? runner.cancel
+      : (typeof runner.close === 'function' ? runner.close : null);
+    if (!cancel) {
+      if (config.logger) config.logger('ask: pruned session has no runner cancel/close; runner session stays running');
+      return;
+    }
+    try {
+      const pending = cancel.call(runner, session.runnerSessionId);
+      if (pending && typeof pending.catch === 'function') pending.catch(() => {});
+    } catch {
+      if (config.logger) config.logger('ask: runner cancel failed while pruning a session');
+    }
+  }
+
   function pruneSessions() {
     if (sessions.size <= MAX_SESSIONS) return;
-    const oldestFirst = [...sessions.values()].sort((a, b) => a.startedAt - b.startedAt);
-    while (sessions.size > MAX_SESSIONS && oldestFirst.length > 0) {
-      const session = oldestFirst.shift();
+    // 先丢已结算的（没有副作用），再按 startedAt 由旧到新
+    const victims = [...sessions.values()].sort((a, b) => {
+      const left = a.settled === true ? 0 : 1;
+      const right = b.settled === true ? 0 : 1;
+      if (left !== right) return left - right;
+      return a.startedAt - b.startedAt;
+    });
+    while (sessions.size > MAX_SESSIONS && victims.length > 0) {
+      const session = victims.shift();
       sessions.delete(session.sessionId);
       requestIds.delete(`${session.peerId}\u0000${session.requestId}`);
+      if (session.settled !== true) cancelRunnerSession(session);
     }
   }
 
@@ -2465,12 +2671,15 @@ export function createPeerServer(overrides = {}) {
       startedAt,
       timeoutSec,
       deadline: startedAt + timeoutSec * 1000,
+      // H4：结算后释放全局并发名额（answerFor 是所有观测路径的唯一出口）
+      settled: false,
     });
     requestIds.set(key, sessionId);
     pruneSessions();
     return { sessionId, reused: false };
   }
 
+  /** 观测一次会话；done/error 即视为结算并释放 H4 的并发名额 */
   async function answerFor(session) {
     let result;
     try {
@@ -2481,14 +2690,19 @@ export function createPeerServer(overrides = {}) {
       return { status: 'error', error: 'runner-error' };
     }
     result = result ?? {};
+    /** 终态（done/error/timeout）都算结算：名额立刻还给 H4 的并发闸 */
+    const settle = (outcome) => {
+      session.settled = true;
+      return outcome;
+    };
     if (result.status === 'done') {
-      return { status: 'done', reply: String(result.reply ?? '') };
+      return settle({ status: 'done', reply: String(result.reply ?? '') });
     }
     if (result.status === 'error') {
-      return { status: 'error', error: String(result.error ?? 'runner-error') };
+      return settle({ status: 'error', error: String(result.error ?? 'runner-error') });
     }
     // 会话已完成就不算超时；只有还在跑且过了 deadline 才算 timeout
-    if (config.now() >= session.deadline) return { status: 'error', error: 'timeout' };
+    if (config.now() >= session.deadline) return settle({ status: 'error', error: 'timeout' });
     return { status: 'running' };
   }
 
@@ -2513,7 +2727,7 @@ export function createPeerServer(overrides = {}) {
     };
   }
 
-  function pair(rawBody) {
+  function pair(req, rawBody) {
     let body;
     try {
       body = parseJsonBody(rawBody);
@@ -2521,7 +2735,7 @@ export function createPeerServer(overrides = {}) {
       return { status: 400, body: { error: 'bad-request' } };
     }
     // §2 v0.4.0：带 ecdh 走两轮握手（不消费码）；不带则一字不改地保留 0.3.1 明文路径
-    if (body.ecdh !== undefined && body.ecdh !== null) return pairEcdhRound1(body);
+    if (body.ecdh !== undefined && body.ecdh !== null) return pairEcdhRound1(req, body);
     if (config.pairingMode === 'ecdh') return { status: 400, body: { error: 'ecdh-required' } };
     const { code, peerId, peerName, secret } = body;
     if (!nonEmptyString(peerId, 200) || !nonEmptyString(peerName, 200) || !nonEmptyString(secret, 512)) {
@@ -2530,8 +2744,15 @@ export function createPeerServer(overrides = {}) {
     if (code == null || !/^\d{6}$/.test(String(code))) {
       return { status: 401, body: { error: 'invalid-code' } };
     }
+    // S1：格式合法的码才算「猜了一次」；退避/锁定期内连比较都不做
+    const gate = pairRateGate(req);
+    if (gate) return gate;
     const consumed = store.consumePairingCode(String(code));
-    if (!consumed.ok) return { status: 401, body: { error: 'invalid-code' } };
+    if (!consumed.ok) {
+      notePairFailure(req, config.now());
+      return { status: 401, body: { error: 'invalid-code' } };
+    }
+    notePairSuccess(req);
 
     // §3 step 3：B 保存 A 给的 S（B→A 用），并生成给 A 的 T（A→B 用）
     const inboundSecret = randomSecret();
@@ -2559,7 +2780,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   /** §2 ECDH 第一轮：只发服务端临时公钥，**不消费**配对码 */
-  function pairEcdhRound1(body) {
+  function pairEcdhRound1(req, body) {
     if (config.pairingMode === 'legacy') return { status: 400, body: { error: 'bad-request' } };
     const { code, peerId, peerName, ecdh } = body;
     if (!nonEmptyString(peerId, 200) || !nonEmptyString(peerName, 200)) {
@@ -2577,10 +2798,16 @@ export function createPeerServer(overrides = {}) {
     if (code == null || !/^\d{6}$/.test(String(code))) {
       return { status: 401, body: { error: 'invalid-code' } };
     }
+    // S1：第一轮同样受退避约束（它是另一条可以无限试码的通道）
+    const gate = pairRateGate(req);
+    if (gate) return gate;
     // 只校验不消费：否则第一轮失败一次就把码废了
     if (!store.peekPairingCode(String(code)).ok) {
+      notePairFailure(req, config.now());
       return { status: 401, body: { error: 'invalid-code' } };
     }
+    // 猜对了但码还没被消费（confirm 才消费）：只清计数，不动作废
+    resetPairFailures(req);
     const nowMs = config.now();
     prunePendingPairs(nowMs);
     const ephemeral = generateKeyPair();
@@ -2612,7 +2839,7 @@ export function createPeerServer(overrides = {}) {
    * §2 ECDH 第二轮：W = HKDF(ECDH(serverPriv, clientPub))，解 wrapped 里的 S，
    * 成功才消费配对码、写 peer，再用同一把 W 回 wrapped({secret: T})。
    */
-  function pairConfirm(rawBody) {
+  function pairConfirm(req, rawBody) {
     let body;
     try {
       body = parseJsonBody(rawBody);
@@ -2626,11 +2853,15 @@ export function createPeerServer(overrides = {}) {
     if (code == null || !/^\d{6}$/.test(String(code))) {
       return { status: 401, body: { error: 'invalid-code' } };
     }
+    // S1：格式合法的码才进门（400 类请求不受退避影响，它们不构成一次猜测）
+    const gate = pairRateGate(req);
+    if (gate) return gate;
     prunePendingPairs(config.now());
     const pending = pendingPairs.get(String(code));
     if (!pending) {
       // 码还在但没有挂起的握手 → pairing-expired；码本身不对/已被用掉 → invalid-code
       const known = store.peekPairingCode(String(code)).ok;
+      if (!known) notePairFailure(req, config.now());
       return { status: 401, body: { error: known ? 'pairing-expired' : 'invalid-code' } };
     }
     if (pending.peerId !== peerId) return { status: 400, body: { error: 'bad-request' } };
@@ -2652,6 +2883,7 @@ export function createPeerServer(overrides = {}) {
     const consumed = store.consumePairingCode(String(code));
     pendingPairs.delete(String(code));
     if (!consumed.ok) return { status: 401, body: { error: 'pairing-expired' } };
+    notePairSuccess(req);
 
     // 与明文路径同一语义：存对端给的 S（我→对端），生成 T（对端→我）
     const inboundSecret = randomSecret();
@@ -2692,6 +2924,31 @@ export function createPeerServer(overrides = {}) {
     const timeoutSec = normalizeTimeoutSec(body.timeoutSec);
     if (timeoutSec == null) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    // H4：同一 requestId 的重复请求不建新会话、也不应该白扣配额（幂等语义优先）
+    const reuseKey = `${auth.peerId}\u0000${requestId}`;
+    const reusedId = requestIds.get(reuseKey);
+    const isReuse = reusedId !== undefined && sessions.has(reusedId);
+    if (!isReuse && config.askRateLimit) {
+      const nowMs = config.now();
+      // 先看全局并发名额：占满时直接拒，连令牌都不动（被拒的请求不该被扣配额）
+      const running = runningSessionCount(nowMs);
+      if (running >= config.maxConcurrentSessions) {
+        if (config.logger && nowMs - lastAskThrottleLogAt >= 10_000) {
+          lastAskThrottleLogAt = nowMs;
+          config.logger(`ask: rate-limited (running=${running} max=${config.maxConcurrentSessions})`);
+        }
+        return { status: 429, body: { error: 'rate-limited', retryAfterMs: ASK_BUSY_RETRY_MS }, peerId: auth.peerId };
+      }
+      const token = takeAskToken(auth.peerId, nowMs);
+      if (!token.ok) {
+        // 与 S1 同样的理由：被拒的请求可能连着来，日志全局 10s 一行即可
+        if (config.logger && nowMs - lastAskThrottleLogAt >= 10_000) {
+          lastAskThrottleLogAt = nowMs;
+          config.logger('ask: rate-limited (per-peer token bucket empty)');
+        }
+        return { status: 429, body: { error: 'rate-limited', retryAfterMs: token.retryAfterMs }, peerId: auth.peerId };
+      }
     }
     let created;
     try {
@@ -5893,8 +6150,8 @@ export function createPeerServer(overrides = {}) {
       return { status: 401, body: { error: 'group-auth-scope' } };
     }
     if (method === 'GET' && url.pathname === '/v1/health') return health();
-    if (method === 'POST' && url.pathname === '/v1/pair') return pair(rawBody);
-    if (method === 'POST' && url.pathname === '/v1/pair/confirm') return pairConfirm(rawBody);
+    if (method === 'POST' && url.pathname === '/v1/pair') return pair(req, rawBody);
+    if (method === 'POST' && url.pathname === '/v1/pair/confirm') return pairConfirm(req, rawBody);
     if (method === 'POST' && url.pathname === '/v1/ask') return ask(req, rawBody);
     if (method === 'GET' && url.pathname === '/v1/answer') return answer(req, rawBody, url, res);
     if (method === 'GET' && url.pathname === '/v1/events') return events(req, rawBody, url, res);

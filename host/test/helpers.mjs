@@ -114,6 +114,12 @@ export async function startServer(t, overrides = {}) {
     listenHost: '127.0.0.1',
     // 这组用例验证签名/时钟/重放语义；加密路径见 encryption.test.mjs
     requireEncryption: false,
+    // 安全审计 S1/H4 的限流默认开启，但这批用例验证的是功能语义，
+    // 不是限流语义：同一回环 IP 会做多次失败配对、同一 peerId 会连发多次 ask，
+    // 开着限流会把「一次性配对码」「ask→answer」这类断言变成 429。
+    // 限流本身由 rate-limit.test.mjs 显式打开开关覆盖；调用方可以按需覆盖回去。
+    pairRateLimit: false,
+    askRateLimit: false,
     ...overrides,
     stateDir,
   });
