@@ -178,6 +178,15 @@ test('③ 成员换钥：hub 轮换后首次请求被拒 → 自动 refetch stat
 test('④ 成员侧（副本）自愈仍然有效：表未同步但未移除的成员，election 仍被接受并补表', async (t) => {
   const cluster = await startCluster(t, { count: 3, heartbeatMs: 5_000, tickMs: 60_000 });
   const [, b, c] = cluster.nodes;
+  // H3 之后自愈只认「最近一次权威快照」：先让 c 真的 pull 一轮拿到 hub 的 memberIds
+  // （b 在快照里、只是本地表不全 —— 这正是这条用例要证明的场景）
+  let pulled = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    pulled = await c.server.group.pull();
+    if (pulled?.reason !== 'skipped') break;
+    await sleep(25);
+  }
+  assert.equal(pulled.ok, true, JSON.stringify(pulled));
   // 造「c 的成员表来自不完整快照」：把 b 从 c 的 group-key.json 里删掉
   const keyFile = readGroupKeyFile(c.dir);
   delete keyFile.members[b.peerId];

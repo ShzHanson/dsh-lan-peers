@@ -124,21 +124,26 @@ test('§A1 失败选举指数退避：假时钟推进 60s，失败次数 ≤ 2 �
 test('§A1 退避清零：收到合法 leader 的心跳后，失败计数与退避都归零', async (t) => {
   let fake = 1_760_000_000_000;
   const { server, baseUrl } = await startIsolatedHub(t, { now: () => fake });
+  const roleOfServer = () => server.group.role();
   fake += 1;
   assert.equal((await server.group.tick()).reason, 'quorum-unavailable');
   assert.equal(server.group.elections().failures, 1);
   assert.ok(server.group.elections().backoffMs > 0);
 
-  // 幽灵对端「回来了」：它用更高 epoch 发心跳，本机 acceptLeader（租约重新有效）
+  // 幽灵对端「回来了」：它用**同一个 epoch** 发心跳（S2 之后心跳不得推进 epoch，
+  // 只能在同 epoch 下给自己续租），本机 acceptLeader（租约重新有效）。
+  // 注：失败选举本身会先把本机 epoch 抬一格，所以这里取当前值而不是写死 5。
+  const epochNow = server.group.role().epoch;
   const beat = await request(baseUrl, {
     method: 'POST',
     path: '/v1/group/leader',
     peerId: GHOST.peerId,
     secret: 'sec-ghost',
-    body: { epoch: 6, leaderPeerId: GHOST.peerId, commitSeq: 0, priority: 0 },
+    body: { epoch: epochNow, leaderPeerId: GHOST.peerId, commitSeq: 0, priority: 0 },
     now: () => fake,
   });
   assert.equal(beat.status, 200, beat.text);
+  assert.equal(roleOfServer().epoch, epochNow, '心跳不抬 epoch');
   assert.equal(server.group.elections().failures, 0, '跟上了合法 leader，失败计数清零');
   assert.equal(server.group.elections().backoffMs, 0, '退避清零：下一轮选举可立刻发起');
   assert.equal(server.group.role().role, 'follower');
@@ -172,11 +177,19 @@ test('§A2 周期优先级纠偏：低优先级 leader 在位时按周期夺回�
   const [low, high] = cluster.nodes;
   const takeoverOf = (node) => node.server.group.takeover();
 
-  // 让低优先 leader 的心跳把 leaderPriority 教给 high
-  await sleep(600);
-  assert.equal(roleOf(high).role, 'follower');
-  assert.equal(roleOf(high).leaderPeerId, low.peerId);
-  assert.equal(takeoverOf(high).periodic.attempts, 0, '还没到纠偏节奏');
+  // 让低优先 leader 的心跳把 leaderPriority 教给 high。
+  // 注意：第一次纠偏**不设冷却**（稳定期 2×heartbeat 一过就可能触发），所以这里不能
+  // 用固定 sleep 去赌「还没开始纠偏」—— 机器忙时会正好撞在选举中途（实测偶发红）。
+  const started = await waitFor(() => {
+    const role = roleOf(high);
+    return role.role === 'follower' && role.leaderPeerId === low.peerId ? role : null;
+  }, { timeoutMs: 5_000, intervalMs: 5 });
+  assert.ok(started, 'high 必须以 follower 起步并认 low 为 leader');
+  assert.equal(
+    takeoverOf(high).periodic.attempts <= 1,
+    true,
+    '纠偏最多已经触发一次（首次不设冷却，不能断言恰好 0）',
+  );
   assert.equal(takeoverOf(high).attempts, 0, '启动期一次性接管已被关掉');
 
   // 过了纠偏节奏 → 周期纠偏触发一次并夺回 leadership
@@ -229,7 +242,8 @@ test('§A3 epoch 跳变告警：一次涨幅 499 记一行 suspicious（不含�
   const before = server.group.role();
   assert.equal(before.epoch, 1, 'hub 首次即 leader，epoch 取 keyVersion');
 
-  // 一台声称 epoch=500 的「leader」发心跳（真机事故里就是这么被降级的）
+  // 一台声称 epoch=500 的「leader」发心跳（真机事故里就是这么被降级的）。
+  // S2 之后心跳不能推进 epoch：一律 409 stale-epoch，但**告警照留**（§A3 的监控目的不变）。
   const beat = await request(info.url, {
     method: 'POST',
     path: '/v1/group/leader',
@@ -237,16 +251,17 @@ test('§A3 epoch 跳变告警：一次涨幅 499 记一行 suspicious（不含�
     secret: member.inboundSecret,
     body: { epoch: 500, leaderPeerId: member.peerId, commitSeq: 0, priority: 0 },
   });
-  assert.equal(beat.status, 200, beat.text);
+  assert.equal(beat.status, 409, beat.text);
+  assert.equal(beat.json.error, 'stale-epoch');
   const after = server.group.role();
-  assert.equal(after.epoch, 500);
-  assert.equal(after.role, 'follower');
+  assert.equal(after.epoch, 1, '心跳不得推进 epoch');
+  assert.equal(after.role, 'leader', '本机不会被一条心跳降级');
 
   const jump = lines.filter((line) => line.startsWith('[group] epoch jump suspicious'));
-  assert.equal(jump.length, 1, '一次大跳变只留一行告警: ' + JSON.stringify(lines));
-  assert.match(jump[0], /^\[group\] epoch jump suspicious from=1 to=500 reason=heartbeat$/);
+  assert.equal(jump.length, 1, '一次大跳变尝试只留一行告警: ' + JSON.stringify(lines));
+  assert.match(jump[0], /^\[group\] epoch jump suspicious from=1 to=500 reason=heartbeat-rejected$/);
 
-  // 小幅推进不告警
+  // 原地再被抬一次：还是一行告警（涨幅按**本机 epoch** 算，因为它一直没动）
   const small = await request(info.url, {
     method: 'POST',
     path: '/v1/group/leader',
@@ -254,12 +269,13 @@ test('§A3 epoch 跳变告警：一次涨幅 499 记一行 suspicious（不含�
     secret: member.inboundSecret,
     body: { epoch: 501, leaderPeerId: member.peerId, commitSeq: 0, priority: 0 },
   });
-  assert.equal(small.status, 200);
+  assert.equal(small.status, 409);
   assert.equal(
     lines.filter((line) => line.startsWith('[group] epoch jump suspicious')).length,
-    1,
-    '涨幅 ≤ 50 不该告警',
+    2,
+    '每一次被抬都留一行（本机 epoch 始终是 1，涨幅依旧 > 50）',
   );
+  assert.equal(server.group.role().epoch, 1);
   // 告警行不含任何密钥
   for (const line of lines) {
     assert.ok(!line.includes(member.inboundSecret));

@@ -350,7 +350,8 @@ test('§3/§2 配对码：6 位数字、10 分钟、一次性；成功后写入 
 
   const statePath = path.join(stateDir, 'state.json');
   if (process.platform !== 'win32') assert.equal(fileMode(statePath), 0o600);
-  assert.equal(readJson(statePath).pairingCode.code, issued.code);
+  // M6：配对码只活在进程内存里 —— state.json 里绝不能出现它（重启即失效、也无法被预置）
+  assert.equal(readJson(statePath).pairingCode, undefined, 'M6：配对码不落盘');
 
   const pairBody = {
     code: issued.code,
@@ -453,20 +454,33 @@ test('§3 配对 body 缺字段 → 400；码格式不对 / 没发码 → 401 in
   assert.equal(badFormat.json.error, 'invalid-code');
 });
 
-test('配对码由另一个进程（CLI）写入时，正在运行的 server 也能看到', async (t) => {
+test('M6 配对码不再经 state.json 传递：另一个进程写入的码不被采信（进程内码照常可用）', async (t) => {
   const stateDir = makeTempStateDir();
-  const { baseUrl } = await startServer(t, { stateDir, name: 'nas-box' });
+  const { server, baseUrl } = await startServer(t, { stateDir, name: 'nas-box' });
 
-  // 模拟 `lan-peers code` 在另一个进程里写 state.json
-  const { code } = issuePairingCode({ stateDir, name: 'nas-box' });
+  // 同机另一个进程（CLI/别的身份）往 state.json 里塞一枚码：这是 M6 要堵的植入路径
+  const forged = issuePairingCode({ stateDir, name: 'nas-box' });
+  const onDisk = readJson(path.join(stateDir, 'state.json'));
+  assert.equal(onDisk.pairingCode, undefined, 'M6：issuePairingCode 不再往 state.json 写码');
 
+  const refused = await request(baseUrl, {
+    method: 'POST',
+    path: '/v1/pair',
+    signed: false,
+    body: { code: forged.code, peerId: 'peer-cli', peerName: 'CLI', secret: 's-cli' },
+  });
+  assert.equal(refused.status, 401, refused.text);
+  assert.equal(refused.json.error, 'invalid-code', '另一个进程发的码不能配到这台 server');
+
+  // 本进程发的码照常能用（配对流程本身没变）
+  const ours = server.issuePairingCode();
   const paired = await request(baseUrl, {
     method: 'POST',
     path: '/v1/pair',
     signed: false,
-    body: { code, peerId: 'peer-cli', peerName: 'CLI', secret: 's-cli' },
+    body: { code: ours.code, peerId: 'peer-cli', peerName: 'CLI', secret: 's-cli' },
   });
-  assert.equal(paired.status, 200);
+  assert.equal(paired.status, 200, paired.text);
   assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode, undefined);
 });
 

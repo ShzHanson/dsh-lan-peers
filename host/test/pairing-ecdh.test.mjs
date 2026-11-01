@@ -61,8 +61,8 @@ test('§2/§3 ECDH 两轮握手成功：第一轮不消费码，confirm 返回�
   assert.equal(Buffer.from(first.json.ecdh.publicKey, 'base64url')[0], 0x04);
   assert.equal(first.json.pairingTtlMs, 120_000);
 
-  // 第一轮不消费配对码，也还没有写 peers.json
-  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode.code, code);
+  // 第一轮不消费配对码（M6：码只活在本进程内存里，state.json 里不再有它）
+  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode, undefined, 'M6：配对码不落盘');
   assert.equal(fs.existsSync(path.join(stateDir, 'peers.json')), false);
 
   const wrapKey = deriveWrapKey(client.privateKey, first.json.ecdh.publicKey);
@@ -81,7 +81,7 @@ test('§2/§3 ECDH 两轮握手成功：第一轮不消费码，confirm 返回�
   assert.equal(stored.secret, 'S-from-client');
   assert.equal(stored.inboundSecret, issued.secret);
   assert.equal(stored.baseUrl, CLIENT.baseUrl);
-  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode, undefined, 'confirm 成功才烧码');
+  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode, undefined, 'M6：码从不落盘');
 
   // 全程没有走过明文路径，因此不该出现弃用告警
   assert.equal(logs.some((line) => line.includes('legacy plaintext path used')), false);
@@ -114,7 +114,7 @@ test('§2 wrapped 被篡改 → 400 bad-encryption，配对码与 pending 都不
   const tampered = await post(baseUrl, '/v1/pair/confirm', confirmBody(code, raw.toString('base64url')));
   assert.equal(tampered.status, 400, tampered.text);
   assert.equal(tampered.json.error, 'bad-encryption');
-  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode.code, code, '解密失败不得烧码');
+  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode, undefined, 'M6：配对码不落盘');
 
   // 用别的密钥包裹同样解不开
   const strangerKey = selfWrapKey(generateKeyPair());
@@ -228,8 +228,9 @@ test('§2 publicKey / ecdh 信封非法 → 400 bad-request（码不消费，随
     assert.equal(res.status, 400, `${JSON.stringify(override)} -> ${res.status} ${res.text}`);
     assert.equal(res.json.error, 'bad-request');
   }
-  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode.code, code, '非法的第一轮不得烧码');
+  assert.equal(readJson(path.join(stateDir, 'state.json')).pairingCode, undefined, 'M6：配对码不落盘');
 
+  // 非法的第一轮不得烧码：同一个码随后仍能正常握手（行为断言取代过去的落盘断言）
   const ok = await post(baseUrl, '/v1/pair', round1Body(code, client));
   assert.equal(ok.status, 200, ok.text);
 });

@@ -7,11 +7,9 @@
 //   node cli.mjs events --peer <peerId|name> --session <sessionId> [--duration 300] [--verbose]
 //   node cli.mjs unpair --peer <peerId|name> [--local-only] [--timeout 10]
 import crypto from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_ANSWER_WAIT_MS,
   MAX_ANSWER_WAIT_MS,
@@ -82,9 +80,11 @@ const USAGE = [
 ].join('\n');
 
 const CODE_USAGE = [
-  '用法: dsh-lan-peers code [--state-dir <目录>]',
+  '用法: dsh-lan-peers code [--state-dir <目录>] [--url <本机管理接口>]',
   '',
-  '生成一次性配对码，同时写入 state.json（10 分钟有效，用后即焚）。',
+  '请本机 host 生成一次性配对码（10 分钟有效，用后即焚）。',
+  'M6 起码只活在 host 进程内存里：本命令是独立进程，自己生成的码对正在跑的 host 无效，',
+  '所以必须先启动本机 host（或直接用界面面板的「生成配对码」）。',
 ].join('\n');
 
 const PAIR_USAGE = [
@@ -227,20 +227,40 @@ async function signedCall({ baseUrl, secret, senderId, method = 'GET', apiPath, 
   return callPeer({ baseUrl, secret, senderId, method, apiPath, body, timeoutMs: 60_000 });
 }
 
+/**
+ * M6：配对码只活在 daemon 进程内存里（state.json 不再持久化它）。本命令是**独立进程**，
+ * 自己生成一个码打印出来，正在跑的 host 根本不知道 —— 用户抄走的是一条无效凭据
+ * （旧行为「另一个进程能写码」本身也正是要堵掉的植入路径）。所以这里改成请本机 host 发码：
+ * 它才是唯一该写这条的进程，也是唯一知道码的进程。
+ *
+ * 本机没有 host / 拿不到 token → exit 2 并说清怎么起 host，绝不本地造一个码糊弄过去。
+ */
 async function cmdCode(args) {
-  // The code lives in state.json, which the host process re-reads; issuing it via
-  // the host CLI keeps one writer instead of racing the running server.
-  const pkgRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const out = execFileSync(process.execPath, [
-    path.join(pkgRoot, 'host', 'server.mjs'),
-    '--code',
-    '--state-dir',
-    stateDir(args),
-  ], { encoding: 'utf8' });
-  const match = /(\d{6})/.exec(out);
-  if (!match) throw new Error(out.trim() || 'no pairing code');
-  console.log('配对码: ' + match[1] + '   有效期: 10 分钟，一次性');
+  const dir = stateDir(args);
+  const url = String(args.url ?? '').trim() || ADMIN_DEFAULT_URL;
+  let out;
+  try {
+    out = await adminCall(url, 'code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    }, dir);
+  } catch (error) {
+    const reason = String(error?.message ?? error);
+    process.stderr.write('生成配对码失败：本机 host 未接受 ' + url + '（' + reason + '）\n'
+      + '修法：请先启动本机 host（或用界面面板的「生成配对码」）—— 码只能在 host 进程里生成\n');
+    process.exitCode = 2;
+    return;
+  }
+  const code = String(out && out.code ? out.code : '').trim();
+  if (!/^\d{6}$/.test(code)) {
+    process.stderr.write('生成配对码失败：本机 host 未按契约回 6 位码\n');
+    process.exitCode = 2;
+    return;
+  }
+  console.log('配对码: ' + code + '   有效期: 10 分钟，一次性');
   console.log('对方把它填进「添加伙伴」里即可配对（地址填本机 http://<ip>:7788）');
+  console.log('提示: 这个码只在本机 host 进程里有效，重启 host 即失效');
 }
 
 async function cmdPair(args) {
@@ -718,6 +738,10 @@ function formatDispatchLine(dispatch) {
   const status = String(data.status ?? '');
   const who = String(data.targetName ?? '') || String(data.target ?? '') || '—';
   if (status === 'skipped') return '未派单（消息里没有 @! 目标）: ' + String(data.reason ?? 'no-target');
+  // M1：同名歧义是「用户得先选一个」，不是网络错误 —— 给出可操作的重发语法。
+  if (status === 'failed' && String(data.reason ?? '') === 'ambiguous') {
+    return '派单 → ' + who + '：有多个同名成员，请用 @!名字 (短id) 重发';
+  }
   const parts = [];
   // done 也可能带 reason（契约 §1：多个 @! 只取第一个，reason=multi-target-ignored）。
   const reason = String(data.reason ?? '');
@@ -751,7 +775,7 @@ async function triggerDispatch(args, command) {
         task: command.task,
         extraTargets: command.extraTargets,
       }),
-    });
+    }, stateDir(args));
   } catch (error) {
     const reason = String(error?.message ?? error);
     process.stderr.write('消息已发出，但派单未触发：本机 host 未响应 ' + url + '（' + reason + '）\n'
@@ -828,7 +852,7 @@ async function cmdGroupAccept(dir, args) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ acceptDispatch: value }),
-    });
+    }, dir);
   } catch (error) {
     const reason = String(error?.message ?? error);
     process.stderr.write('切换接单失败：本机 host 未接受 ' + url + '（' + reason + '）\n'
@@ -1052,16 +1076,37 @@ async function cmdGroupClaim(dir, args) {
 
 const ADMIN_DEFAULT_URL = 'http://127.0.0.1:7788';
 const ADMIN_TIMEOUT_MS = 10000;
+// S3：管理接口要 X-Lan-Peers-Token。host 启动时把它写到 <stateDir>/admin-token（0600），
+// CLI 只读不写；token 本身绝不出现在 URL、日志或错误消息里（只说去哪读）。
+const ADMIN_TOKEN_FILE = 'admin-token';
+
+function readAdminToken(dir) {
+  try {
+    return fs.readFileSync(path.join(String(dir || DEFAULT_STATE_DIR), ADMIN_TOKEN_FILE), 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
 
 /** 打本机回环管理接口；非 2xx 抛 `<status> <error>` 形式的 Error（与 group-client 同款）。 */
-async function adminCall(baseUrl, apiPath, init) {
+async function adminCall(baseUrl, apiPath, init, dir) {
   const base = String(baseUrl || ADMIN_DEFAULT_URL).replace(/\/+$/, '');
+  const token = readAdminToken(dir);
+  const headers = { ...(init && init.headers ? init.headers : {}) };
+  if (token !== '') headers['X-Lan-Peers-Token'] = token;
   const reply = await fetch(base + '/api/lan-peers/' + apiPath, {
     ...init,
+    headers,
     signal: AbortSignal.timeout(ADMIN_TIMEOUT_MS),
   });
   const body = await reply.json().catch(() => ({}));
-  if (!reply.ok) throw new Error(reply.status + ' ' + String(body.error || 'admin-call-failed'));
+  if (!reply.ok) {
+    const status = reply.status;
+    const where = path.join(String(dir || DEFAULT_STATE_DIR), ADMIN_TOKEN_FILE);
+    // 401 一定是 token 缺失/不匹配：直接指路（host 启动时写入，权限 0600）。
+    const hint = status === 401 ? '（管理接口需要 token：确认本机 host 在跑，且 ' + where + ' 可读）' : '';
+    throw new Error(status + ' ' + String(body.error || 'admin-call-failed') + hint);
+  }
   return body;
 }
 
@@ -1075,7 +1120,7 @@ function reportArchiveError(error) {
 async function cmdGroupArchives(dir, args) {
   let out;
   try {
-    out = await adminCall(args.url, 'group/archives');
+    out = await adminCall(args.url, 'group/archives', undefined, dir);
   } catch (error) {
     reportArchiveError(error);
     return;
@@ -1111,7 +1156,7 @@ async function cmdGroupArchiveDelete(dir, args) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ file: file, action: 'delete' }),
-    });
+    }, dir);
   } catch (error) {
     reportArchiveError(error);
     return;

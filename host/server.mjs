@@ -118,7 +118,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.8.2';
+export const PLUGIN_VERSION = '0.8.3';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -743,6 +743,9 @@ export class StateStore {
 
   #state = null;
 
+  /** M6：配对码只活在本进程内存里（不落盘、不经文件被别的进程植入，重启即失效） */
+  #pairingCode = null;
+
   #peers = null;
 
   #lastTouchPersist = new Map();
@@ -802,7 +805,8 @@ export class StateStore {
       state.createdAt = nowIso(this.#now());
       dirty = true;
     }
-    if (state.pairingCode && this.#now() >= Number(state.pairingCode.expiresAt ?? 0)) {
+    // M6：配对码不再落盘。老版本留下的字段读回时一律清掉（迁移即焚）
+    if (Object.prototype.hasOwnProperty.call(state, 'pairingCode')) {
       delete state.pairingCode;
       dirty = true;
     }
@@ -831,31 +835,29 @@ export class StateStore {
     return name;
   }
 
-  /** 生成配对码：6 位数字、10 分钟、覆盖旧码（一次性由 consume 保证） */
+  /**
+   * 生成配对码：6 位数字、10 分钟、覆盖旧码（一次性由 consume 保证）。
+   * M6：码**只存进程内存** —— state.json 里不再有它，进程重启即失效，
+   * 同机另一个进程（或拿到文件写权限的人）也无法预置一枚可用的码。
+   */
   issuePairingCode() {
-    const state = this.#readState();
-    this.#state = state;
+    this.#state = this.#readState();
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const expiresAt = this.#now() + PAIRING_CODE_TTL_MS;
-    state.pairingCode = { code, expiresAt };
-    writeJson0600(this.statePath, state);
+    this.#pairingCode = { code, expiresAt };
     return { code, expiresAt };
   }
 
   /** 消费配对码：不存在 / 过期 / 不匹配 -> 失败；成功即焚 */
   consumePairingCode(candidate) {
-    const state = this.#readState();
-    this.#state = state;
-    const pair = state.pairingCode;
+    const pair = this.#pairingCode;
     if (!pair || typeof pair.code !== 'string') return { ok: false, reason: 'invalid' };
     if (this.#now() >= Number(pair.expiresAt ?? 0)) {
-      delete state.pairingCode;
-      writeJson0600(this.statePath, state);
+      this.#pairingCode = null;
       return { ok: false, reason: 'expired' };
     }
     if (!timingSafeStringEqual(pair.code, String(candidate ?? ''))) return { ok: false, reason: 'invalid' };
-    delete state.pairingCode;
-    writeJson0600(this.statePath, state);
+    this.#pairingCode = null;
     return { ok: true };
   }
 
@@ -864,13 +866,10 @@ export class StateStore {
    * 握手失败、篡改、超时都不该把码烧掉，只有 confirm 成功才 consume。
    */
   peekPairingCode(candidate) {
-    const state = this.#readState();
-    this.#state = state;
-    const pair = state.pairingCode;
+    const pair = this.#pairingCode;
     if (!pair || typeof pair.code !== 'string') return { ok: false, reason: 'invalid' };
     if (this.#now() >= Number(pair.expiresAt ?? 0)) {
-      delete state.pairingCode;
-      writeJson0600(this.statePath, state);
+      this.#pairingCode = null;
       return { ok: false, reason: 'expired' };
     }
     if (!timingSafeStringEqual(pair.code, String(candidate ?? ''))) return { ok: false, reason: 'invalid' };
@@ -1448,6 +1447,14 @@ export class GroupStore {
 
   pendingCount() {
     return this.#load().pending.length;
+  }
+
+  /** 未提交区的某一条正文（H1：commit 只认这条，不再采信 body 里的 message） */
+  pendingMessage(seq) {
+    const data = this.#load();
+    const id = Math.floor(Number(seq) || 0);
+    const found = data.pending.find((entry) => Number(entry?.seq) === id);
+    return found ? { ...found, from: { ...found.from }, meta: { ...found.meta } } : null;
   }
 
   /** 未提交区的 seq 列表（只给门面/测试看，不携带正文） */
@@ -2329,6 +2336,14 @@ export function createPeerServer(overrides = {}) {
     if (senderId !== store.instanceId && !Object.prototype.hasOwnProperty.call(ctx.members, senderId)) {
       // hub 是权威成员表：不认识就是不属于群，一律拒绝（自愈只给成员侧的副本用）
       if (!allowUnknownSender || groupStore) return { ok: false, status: 401, error: 'not-a-member' };
+      // H3：自愈不能再「凭签名把任意 id 写进 group-key.json」。
+      // 只允许**最近一次权威快照**（hub 的 state / pull 的 memberIds）里出现过的 id：
+      // 快照说这个人在群里、只是本机表还停在旧版本 → 补进来；
+      // 快照里根本没有的 id → 仍然 not-a-member（否则一个幽灵 id 就能把自己写进成员表）。
+      if (!authoritativeMemberIds.has(senderId)) {
+        if (config.logger) config.logger(`[group] self-heal refused peer=${shortPeerId(senderId)}`);
+        return { ok: false, status: 401, error: 'not-a-member' };
+      }
       // 自愈（真机 not-a-member 回归）：群密钥签名已经证明对端握有群密钥，只是本机成员表
       // 还停在一份不完整的快照上（成员在 bootstrap 之后才加入）。选举/心跳是领导权协议，
       // 先把它补进成员表，否则对端永远投不进来、整个群选不出 leader。
@@ -4034,11 +4049,47 @@ export function createPeerServer(overrides = {}) {
     if (!Number.isFinite(epoch) || epoch < 0) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
     }
+    // H2：副本只接「本机认定的 leader」推来的日志。
+    // 少了这道校验，任何握着群密钥的成员都能往别人的副本里写任意历史（第二作者）。
+    const recordedLeader = String(
+      ensureRole()?.leaderPeerId ?? '',
+    ) || String(replicaStore.state().leaderPeerId ?? '');
+    if (recordedLeader === '') {
+      return { status: 409, body: { error: 'no-leader' }, peerId: auth.peerId };
+    }
+    if (auth.peerId !== recordedLeader) {
+      if (config.logger) {
+        config.logger(
+          `[group] replicate refused not-leader from=${shortPeerId(auth.peerId)} leader=${shortPeerId(recordedLeader)}`,
+        );
+      }
+      return { status: 409, body: { error: 'not-leader', leaderPeerId: recordedLeader }, peerId: auth.peerId };
+    }
+    // H2：逐条校验作者在成员表里；不合规的那条丢弃并记一行（不整批拒，避免一条脏数据
+    // 把整次复制卡死 —— 复制是 best-effort 的追赶通道，不是权威写路径）
+    const knownAuthors = new Set(Object.keys(auth.ctx?.members ?? {}));
+    knownAuthors.add(store.instanceId);
+    const incoming = Array.isArray(body.messages) ? body.messages : [];
+    const messages = [];
+    let dropped = 0;
+    for (const message of incoming) {
+      const author = String(message?.from?.peerId ?? '');
+      if (author === '' || !knownAuthors.has(author)) {
+        dropped += 1;
+        continue;
+      }
+      messages.push(message);
+    }
+    if (dropped > 0 && config.logger) {
+      config.logger(
+        `[group] replicate dropped n=${dropped} from=${shortPeerId(auth.peerId)} reason=unknown-author`,
+      );
+    }
     const applied = replicaStore.append({
       groupId,
       epoch: Math.floor(epoch),
       leaderPeerId: String(body.leaderPeerId ?? ''),
-      messages: Array.isArray(body.messages) ? body.messages : [],
+      messages,
     });
     if (config.logger) {
       config.logger(
@@ -4997,15 +5048,41 @@ export function createPeerServer(overrides = {}) {
     }
     const commitSeq = Math.max(0, Math.floor(Number(body.commitSeq) || 0));
     const senderBaseUrl = headerValue(req, GROUP_BASE_HEADER.toLowerCase());
-    rememberPeerBaseUrl(leaderPeerId, senderBaseUrl);
-    // v0.8.0：心跳里 X-Peer-Base 是**发送方自己**的地址 —— 顺手记到发送方名下。
+    // v0.8.0：心跳里 X-Peer-Base 是**发送方自己**的地址 —— 只记到发送方名下。
     // 少了这一笔，成员重启换端口后只有下一次 pull（测试里 600s 一次）才会纠正地址，
     // 期间 leader 的提案会打到旧地址上（表现：post 503 quorum-unavailable，而成员明明在线）。
     rememberMemberBaseUrl(auth.peerId, senderBaseUrl);
     rememberMemberAcceptDispatch(auth.peerId, body.acceptDispatch);
-    if (Number.isFinite(Number(body.priority))) peerPriorities.set(leaderPeerId, Math.floor(Number(body.priority)));
     const st = ensureRole();
     if (!st) return { status: 404, body: { error: 'not-found' }, peerId: auth.peerId };
+    // S2：心跳只能为**自己**续租。少了这条，任何握着群密钥的成员发一条心跳就能把
+    // 对端的 leaderPeerId 改写成任意 id（实测：一句话让对面变 follower、leader 指向别人）。
+    if (leaderPeerId !== auth.peerId) {
+      if (config.logger) {
+        config.logger(
+          `[group] heartbeat refused not-self-leader from=${shortPeerId(auth.peerId)} claim=${shortPeerId(leaderPeerId)} epoch=${epoch}`,
+        );
+      }
+      return { status: 403, body: { error: 'not-self-leader', epoch: st.epoch }, peerId: auth.peerId };
+    }
+    // 地址与优先级也只许写在自己名下（以前 key 用的是 body 里的 leaderPeerId = 别人的 id）
+    rememberPeerBaseUrl(auth.peerId, senderBaseUrl);
+    if (Number.isFinite(Number(body.priority))) peerPriorities.set(auth.peerId, Math.floor(Number(body.priority)));
+    // S2：心跳不得推进 epoch —— epoch 只能由 /v1/group/election 的票数推进。
+    // 心跳带更高的 epoch 就是「靠一句话篡位」，按 stale-epoch 拒，并留一行告警。
+    if (epoch > st.epoch) {
+      noteEpochJump(st.epoch, epoch, 'heartbeat-rejected');
+      if (config.logger) {
+        config.logger(
+          `[group] heartbeat refused epoch-advance from=${shortPeerId(auth.peerId)} epoch=${epoch} keep=${st.epoch}`,
+        );
+      }
+      return {
+        status: 409,
+        body: { error: 'stale-epoch', epoch: st.epoch, leaderPeerId: st.leaderPeerId, commitSeq: st.commitSeq },
+        peerId: auth.peerId,
+      };
+    }
     if (epoch < st.epoch) {
       return {
         status: 409,
@@ -5013,26 +5090,20 @@ export function createPeerServer(overrides = {}) {
         peerId: auth.peerId,
       };
     }
-    if (epoch === st.epoch && st.leaderPeerId !== '' && st.leaderPeerId !== leaderPeerId) {
-      const wins = leaderWins(
-        { peerId: leaderPeerId, priority: priorityOf(leaderPeerId) },
-        { peerId: st.leaderPeerId, priority: priorityOf(st.leaderPeerId) },
-      );
-      if (!wins) {
-        if (config.logger) {
-          config.logger(
-            `[group] heartbeat conflict from=${shortPeerId(leaderPeerId)} epoch=${epoch} keep=${shortPeerId(st.leaderPeerId)}`,
-          );
-        }
-        return {
-          status: 409,
-          body: { error: 'leader-conflict', epoch: st.epoch, leaderPeerId: st.leaderPeerId, commitSeq: st.commitSeq },
-          peerId: auth.peerId,
-        };
-      }
+    // 同 epoch：只有本机记录的 leader 自己来才续租；领导权变更一律走 election 的票数。
+    // （st.leaderPeerId === '' = 本机还没有 leader 记录，这是成员的 bootstrap 路径：
+    //  此时接受发送方自报的 leader，等于把 group-key.json 里已知的那个 leader 学进角色表。）
+    if (st.leaderPeerId !== '' && st.leaderPeerId !== leaderPeerId) {
       if (config.logger) {
-        config.logger(`[group] heartbeat conflict from=${shortPeerId(leaderPeerId)} epoch=${epoch} adopt`);
+        config.logger(
+          `[group] heartbeat conflict from=${shortPeerId(leaderPeerId)} epoch=${epoch} keep=${shortPeerId(st.leaderPeerId)}`,
+        );
       }
+      return {
+        status: 409,
+        body: { error: 'leader-conflict', epoch: st.epoch, leaderPeerId: st.leaderPeerId, commitSeq: st.commitSeq },
+        peerId: auth.peerId,
+      };
     }
     const before = st.commitSeq;
     const accepted = acceptLeader({ epoch, leaderPeerId, commitSeq });
@@ -5159,6 +5230,17 @@ export function createPeerServer(overrides = {}) {
     return { status: 200, body: { ok: true, accepted: true, epoch: st.epoch }, peerId: auth.peerId };
   }
 
+  /**
+   * 本机未提交区里那一条。两条存放路径都要看：
+   *   · propose 收到的提案 → pendingProposals（内存，hub 与成员都走这里）；
+   *   · 本机自己 stage 的（leader 的 post 路径）→ hub 落 group.json.pending，成员落内存表。
+   */
+  function stagedProposal(seq) {
+    const inMemory = pendingProposals.get(seq)?.message ?? null;
+    if (inMemory) return inMemory;
+    return groupStore ? groupStore.pendingMessage(seq) : null;
+  }
+
   /** POST /v1/group/commit —— 提交确认：pending 转正并推进 commitSeq（契约 §5） */
   function groupCommit(req, rawBody, url, auth) {
     const body = parseS3Body(rawBody);
@@ -5175,10 +5257,30 @@ export function createPeerServer(overrides = {}) {
         peerId: auth.peerId,
       };
     }
-    const staged = pendingProposals.get(seq)?.message ?? null;
-    const raw = body.message && typeof body.message === 'object' ? body.message : staged;
-    let applied = false;
-    if (raw) applied = applyCommitted(normalizeIncomingMessage(raw, seq));
+    // H1：与 propose 同口径 —— 只有 leader 能提交。少了这条，任何成员都能把
+    // 自己发明的消息「转正」进别人的日志（并顺手把 commitSeq 抬到任意值）。
+    if (st.leaderPeerId !== '' && auth.peerId !== st.leaderPeerId) {
+      if (config.logger) {
+        config.logger(
+          `[group] commit refused not-leader from=${shortPeerId(auth.peerId)} seq=${seq} epoch=${epoch}`,
+        );
+      }
+      return { status: 409, body: { error: 'not-leader', epoch: st.epoch, commitSeq: st.commitSeq }, peerId: auth.peerId };
+    }
+    // H1：正文只认本机 pending 里那一条 —— body.message 不再被采信，
+    // 客户端也无法用一个没提案过的 seq 抬高 commitSeq。
+    const staged = stagedProposal(seq);
+    if (!staged) {
+      if (seq <= st.commitSeq) {
+        // 幂等：这条早就转正过了（广播重投），不重复应用、不推进号
+        return { status: 200, body: { ok: true, commitSeq: st.commitSeq, applied: false }, peerId: auth.peerId };
+      }
+      if (config.logger) {
+        config.logger(`[group] commit refused unknown-seq from=${shortPeerId(auth.peerId)} seq=${seq} epoch=${epoch}`);
+      }
+      return { status: 409, body: { error: 'unknown-seq', epoch: st.epoch, commitSeq: st.commitSeq }, peerId: auth.peerId };
+    }
+    const applied = applyCommitted(normalizeIncomingMessage(staged, seq));
     pendingProposals.delete(seq);
     const next = roleStore.update({
       commitSeq: Math.max(st.commitSeq, seq),

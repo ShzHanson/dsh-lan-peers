@@ -32,17 +32,19 @@ function makeResponse() {
 }
 
 /** 回环 admin 请求（与 GUI 面板同一个 handle 入口） */
-function makeRequest(method, apiPath, body) {
+function makeRequest(method, apiPath, body, admin) {
   const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+  const token = admin && typeof admin.token === 'string' ? admin.token : '';
   const req = {
     method,
     url: apiPath,
     socket: { remoteAddress: '127.0.0.1', setNoDelay() {} },
-    // 回环 authority：admin 用 Host 头做回环门控
+    // 回环 authority + 进程 token：S3 之后两道门都要过（面板带的就是这两个头）
     headers: {
       host: '127.0.0.1:7788',
       'content-type': 'application/json',
       'content-length': String(chunks[0]?.length ?? 0),
+      ...(token === '' ? {} : { 'x-lan-peers-token': token }),
     },
     on() { return req; },
     once() { return req; },
@@ -53,7 +55,7 @@ function makeRequest(method, apiPath, body) {
 
 async function hit(admin, method, apiPath, body) {
   const res = makeResponse();
-  const handled = await admin.handle(makeRequest(method, apiPath, body), res, new URL('http://127.0.0.1' + apiPath));
+  const handled = await admin.handle(makeRequest(method, apiPath, body, admin), res, new URL('http://127.0.0.1' + apiPath));
   let json = null;
   try { json = JSON.parse(res.body); } catch { json = null; }
   return { handled, status: res.status, json };

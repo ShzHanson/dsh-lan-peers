@@ -118,7 +118,7 @@ test('S3 少数派：三成员只剩一台时选举拿不到多数票，角色�
 // §4 冲突裁决
 // ---------------------------------------------------------------------------
 
-test('S3 同 epoch 冲突：priority 小者胜；priority 相同按 peerId 字典序', async (t) => {
+test('S3 同 epoch：心跳改不了领导权；priority/peerId 裁决只发生在投票端', async (t) => {
   // 心跳设长、租约检查设到很远：这个用例只裁决冲突，不让后台选举插进来
   const cluster = await startCluster(t, {
     count: 3,
@@ -140,66 +140,131 @@ test('S3 同 epoch 冲突：priority 小者胜；priority 相同按 peerId 字�
     ...extra,
   });
 
-  // ① priority 更小者胜：-5 < 0，follower 改认 lowPriority
-  const taken = await heartbeat(lowPriority.peerId, { priority: -5 });
-  assert.equal(taken.ok, true, JSON.stringify(taken));
-  await waitFor(() => roleOf(follower).leaderPeerId === lowPriority.peerId);
-  assert.equal(roleOf(follower).epoch, 1, '同 epoch 裁决不抬 epoch');
-
-  // ② 合法的旧 leader 再自称一次 → 409 leader-conflict（它优先级更大）
+  // ① S2：同 epoch 里「优先级更小者的心跳就能夺权」是漏洞形状，现在一律 409，
+  //    且本机记录的 leader 一个字都不变 —— 领导权只能由 election 的票数推进
   await assert.rejects(
-    () => heartbeat(incumbent.peerId, { priority: 0 }),
+    () => heartbeat(lowPriority.peerId, { priority: -5 }),
     (error) => {
       assert.equal(error.status, 409);
       assert.equal(error.code, 'leader-conflict');
-      assert.equal(error.body.leaderPeerId, lowPriority.peerId);
+      assert.equal(error.body.leaderPeerId, incumbent.peerId, '心跳绝不能改认别人当 leader');
       return true;
     },
   );
+  assert.equal(roleOf(follower).leaderPeerId, incumbent.peerId);
+  assert.equal(roleOf(follower).epoch, 1, '冲突不改 epoch');
 
-  // ③ priority 相同 → peerId 字典序小者胜：'peer-b0' < 'peer-m0'
+  // ② 合法的旧 leader 用自己 id 再自称一次 → 200（续租不受影响，优先级同时被学到）
+  const renewed = await heartbeat(incumbent.peerId, { priority: 0 });
+  assert.equal(renewed.ok, true, JSON.stringify(renewed));
+
+  // ③ 裁决语义保留在投票端：priority 更小者（-5 < 0）照样能拿到票
+  const taken = await requestGroupVote({
+    baseUrl: follower.baseUrl,
+    ...groupArgs(cluster, lowPriority.peerId),
+    epoch: 1,
+    candidate: lowPriority.peerId,
+    priority: -5,
+  });
+  assert.equal(taken.vote, true, JSON.stringify(taken));
+  await waitFor(() => roleOf(follower).leaderPeerId === lowPriority.peerId);
+  assert.equal(roleOf(follower).epoch, 1, '同 epoch 裁决不抬 epoch');
+
+  // ④ 反向：优先级更大的候选在同 epoch 里拿不到票
+  const refused = await requestGroupVote({
+    baseUrl: follower.baseUrl,
+    ...groupArgs(cluster, incumbent.peerId),
+    epoch: 1,
+    candidate: incumbent.peerId,
+    priority: 0,
+  });
+  assert.equal(refused.vote, false);
+  assert.equal(refused.reason, 'lower-priority');
+  assert.equal(roleOf(follower).leaderPeerId, lowPriority.peerId);
+
+  // ⑤ priority 相同 → peerId 字典序小者胜：'peer-b0' < 'peer-m0'（同样在投票端）
   const cluster2 = await startCluster(t, {
     count: 3,
     ids: ['peer-m0', 'peer-b0', 'peer-z0'],
     heartbeatMs: 5_000,
     tickMs: 60_000,
   });
-  const [incumbent2, follower2] = cluster2.nodes;
-  const heartbeat2 = (fromId) => sendGroupHeartbeat({
-    baseUrl: follower2.baseUrl,
-    ...groupArgs(cluster2, fromId),
-    epoch: 1,
-    leaderPeerId: fromId,
-    priority: 0,
-  });
-  const smaller = await heartbeat2('peer-b0');
-  assert.equal(smaller.ok, true);
-  await waitFor(() => roleOf(follower2).leaderPeerId === 'peer-b0');
+  const [incumbent2, follower2, voter2] = cluster2.nodes;
+  // 投票端是 incumbent2（peer-m0 自己），候选是 peer-b0：心跳那个形状先被拒
   await assert.rejects(
-    () => heartbeat2(incumbent2.peerId),
+    () => sendGroupHeartbeat({
+      baseUrl: follower2.baseUrl,
+      ...groupArgs(cluster2, 'peer-b0'),
+      epoch: 1,
+      leaderPeerId: 'peer-b0',
+      priority: 0,
+    }),
     (error) => {
       assert.equal(error.code, 'leader-conflict');
+      assert.equal(error.body.leaderPeerId, incumbent2.peerId);
       return true;
     },
   );
+  // 同优先级下 peerId 字典序小者（'peer-b0' < 'peer-m0'）能拿到票（第三台当投票人）
+  const smaller = await requestGroupVote({
+    baseUrl: voter2.baseUrl,
+    ...groupArgs(cluster2, 'peer-b0'),
+    epoch: 1,
+    candidate: 'peer-b0',
+    priority: 0,
+  });
+  assert.equal(smaller.vote, true, JSON.stringify(smaller));
+  await waitFor(() => roleOf(voter2).leaderPeerId === 'peer-b0');
+  assert.equal(roleOf(voter2).epoch, 1, '同 epoch 裁决不抬 epoch');
+  // 反向（字典序更大者）拿不到票
+  const reverse = await requestGroupVote({
+    baseUrl: voter2.baseUrl,
+    ...groupArgs(cluster2, incumbent2.peerId),
+    epoch: 1,
+    candidate: incumbent2.peerId,
+    priority: 0,
+  });
+  assert.equal(reverse.vote, false);
+  assert.equal(reverse.reason, 'lower-priority');
 });
 
-test('S3 更高 epoch 一律服从：心跳抬 epoch，低 epoch 的心跳/投票回 409 stale-epoch', async (t) => {
+test('S3 更高 epoch 一律服从（走票数）；心跳不得抬 epoch', async (t) => {
   const cluster = await startCluster(t, { count: 3, heartbeatMs: 5_000, tickMs: 60_000 });
   const [a, b, c] = cluster.nodes;
   assert.equal(roleOf(a).role, 'leader');
 
-  // C 宣告 epoch 5：A 必须服从并降级
-  const accepted = await sendGroupHeartbeat({
+  // S2：C 用一条 epoch=5 的心跳宣告自己是 leader —— 漏洞形状，现在 409 stale-epoch，
+  // A 既不被降级、也不抬 epoch（epoch 只能由 election 的票数推进）
+  await assert.rejects(
+    () => sendGroupHeartbeat({
+      baseUrl: a.baseUrl,
+      ...groupArgs(cluster, c.peerId),
+      epoch: 5,
+      leaderPeerId: c.peerId,
+      lastSeq: 0,
+      commitSeq: 0,
+    }),
+    (error) => {
+      assert.equal(error.status, 409);
+      assert.equal(error.code, 'stale-epoch');
+      assert.equal(error.body.epoch, 1, '本机 epoch 不能被子虚的告警心跳改写');
+      return true;
+    },
+  );
+  const kept = roleOf(a);
+  assert.equal(kept.role, 'leader');
+  assert.equal(kept.epoch, 1);
+  assert.equal(kept.leaderPeerId, a.peerId);
+  assert.equal(readRoleFile(a).epoch, 1);
+
+  // C 改走正路：拉票（epoch 5 更高，一律服从）→ A 投票并降级
+  const granted = await requestGroupVote({
     baseUrl: a.baseUrl,
     ...groupArgs(cluster, c.peerId),
     epoch: 5,
-    leaderPeerId: c.peerId,
-    lastSeq: 0,
-    commitSeq: 0,
+    candidate: c.peerId,
   });
-  assert.equal(accepted.ok, true, JSON.stringify(accepted));
-  assert.equal(accepted.epoch, 5);
+  assert.equal(granted.vote, true, JSON.stringify(granted));
   const demoted = roleOf(a);
   assert.equal(demoted.role, 'follower');
   assert.equal(demoted.epoch, 5);
@@ -424,6 +489,15 @@ test('S3 N=3：两台可达能当选（2 ≥ 2），只剩一台不能（1 < 2�
 test('S3 成员表未同步时：选举/心跳自愈入表（真机 not-a-member 的回归）', async (t) => {
   const cluster = await startCluster(t, { count: 3, heartbeatMs: 5_000, tickMs: 60_000 });
   const [a, b, c] = cluster.nodes;
+  // H3 之后自愈只认「最近一次权威快照」：先让 c 真的 pull 一轮，拿到 hub 的 memberIds
+  // （快照里 b 在群里）—— 这一步就是真机上成员启动后的第一轮 pull。
+  let pulled = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    pulled = await c.server.group.pull();
+    if (pulled?.reason !== 'skipped') break;
+    await sleep(25);
+  }
+  assert.equal(pulled.ok, true, JSON.stringify(pulled));
   // 造「c 的成员表来自一份不完整的快照」：把 b 从 c 的 group-key.json 里删掉
   const keyFile = readGroupKeyFile(c.dir);
   delete keyFile.members[b.peerId];
