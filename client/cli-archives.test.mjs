@@ -12,6 +12,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempStateDir } from '../host/test/helpers.mjs';
 
+process.env.DSH_LAN_PEERS_LANG = 'zh';   // 语言钉死：断言写的是中文文案，不随机器 locale 漂移
+
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), 'cli.mjs');
 const MB = 1024 * 1024;
 

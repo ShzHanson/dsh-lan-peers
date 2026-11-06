@@ -466,7 +466,8 @@ test('v0.8.2-α lan_group_ask：与 lan_peer_ask 同形，先把 progress/result
   assert.ok(names.includes('lan_peer_ask'), '既有 1:1 工具不能消失');
 
   const groupAsk = tools.find((tool) => tool.name === 'lan_group_ask');
-  assert.deepEqual(Object.keys(groupAsk.parameters).sort(), ['peer', 'prompt', 'timeout_sec']);
+  // 0.8.5-α 追加两个**可选**入参：workspace / permission（不传 = 用对方默认）
+  assert.deepEqual(Object.keys(groupAsk.parameters).sort(), ['peer', 'permission', 'prompt', 'timeout_sec', 'workspace']);
 
   const out = await groupAsk.execute({ peer: b.name, prompt: 'tool ' + MARKER, timeout_sec: 30 });
   assert.equal(out.status, 'done');

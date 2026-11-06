@@ -14,11 +14,13 @@
  *   GET  /v1/answer?sessionId=<id>[&waitMs=] 签名（waitMs>0 时服务端 hold 成长轮询）
  *   GET  /v1/events?sessionId=<id>           签名 + SSE（每条事件独立加密）
  *   GET  /v1/peers                           签名
+ *   POST /v1/dm/sync                         签名 + 信封（私聊两端对齐；不进群）
  *
  * 执行侧（DSH 会话）与协议完全解耦：本文件只依赖一个 runner 接口
  *
  *   createRunner({ workspace, preset, permission })
- *     -> { ask(prompt) -> sessionId | Promise<sessionId>, poll(sessionId) -> { status, reply?, error? } }
+ *     -> { ask(prompt, { sessionId }?) -> sessionId | { sessionId, reused } (均允许 Promise),
+ *          poll(sessionId) -> { status, reply?, error? } }
  *
  * 本轮提供内存假实现 MemoryRunner（1 秒后完成，回复 "OK <prompt 前 20 字>"）。
  * 下一轮接真 DSH 适配器时，只需替换 createRunner，server 其余部分不动。
@@ -42,6 +44,28 @@ import {
 } from 'node:crypto';
 import fs from 'node:fs';
 import { ENC_HEADER, ENC_VERSION, decryptBytes, encryptBytes } from '../lib/wire-crypto.mjs';
+import {
+  DM_SYNC_MAX_ITEMS,
+  DM_TEXT_MAX_BYTES,
+  DmStore,
+  shortPeer,
+} from '../lib/dm-store.mjs';
+import {
+  DISPATCH_PENDING_TTL_MS,
+  DispatchPending,
+  DispatchPrefs,
+  isPermission,
+  permissionRank,
+} from '../lib/dispatch-prefs.mjs';
+import {
+  FILE_CHUNK_HARD_MAX,
+  FILE_DEFAULT_CHUNK_BYTES,
+  FILE_DEFAULT_INBOX_BYTES,
+  FILE_DEFAULT_MAX_BYTES,
+  FILE_DEFAULT_PENDING_TTL_MS,
+  FileStore,
+  hashFile,
+} from '../lib/file-store.mjs';
 import {
   PAIR_CURVE,
   PAIR_PROTOCOL_VERSION,
@@ -68,6 +92,7 @@ import {
   GROUP_DEFAULT_HEARTBEAT_MS,
   GROUP_DEFAULT_HUB_PRIORITY,
   GROUP_DEFAULT_REPLICA_PULL_MS,
+  GROUP_DISPATCH_SCOPE_FIELDS,
   GROUP_ELECTION_JITTER_MS,
   GROUP_ID_HEADER,
   GROUP_LASTSEQ_HEADER,
@@ -82,13 +107,16 @@ import {
   createGroupDispatcher,
   decryptGroupBody,
   deriveGroupKeys,
+  dispatchOptionsView,
   encryptGroupBody,
+  fetchDispatchOptions,
   fetchGroupState,
   groupCall,
   groupDispatchSummary,
   joinGroup,
   normalizeGroupName,
   parseAcceptFlag,
+  parseGroupDispatch,
   postGroup,
   postGroupWithGroupKey,
   proposeGroupMessage,
@@ -120,7 +148,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.8.4';
+export const PLUGIN_VERSION = '0.8.5-α';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -188,6 +216,31 @@ export const GROUP_PEER_V1_PATHS = Object.freeze([
   '/v1/group/apply-status',
 ]);
 
+/**
+ * 0.8.5-α 契约 §1：文件互传四条（per-peer 签名 + X-Peer-Enc 加密体，走既有鉴权）。
+ * 与群开关无关 —— 只要配对过就能传；status 是 GET（无 body，信封头照样带）。
+ */
+export const FILE_V1_PATHS = Object.freeze([
+  '/v1/file/offer',
+  '/v1/file/chunk',
+  '/v1/file/complete',
+  '/v1/file/status',
+]);
+
+/** 0.8.5-α 契约 §3：私聊两端对齐（per-peer 签名 + 信封，与文件互传同一套） */
+export const DM_V1_PATHS = Object.freeze([
+  '/v1/dm/sync',
+]);
+
+/**
+ * 0.8.5-α 契约 §2：派单工作区/权限（per-peer 签名 + 信封）。
+ * options 是 GET（无 body，信封头照样带），approval 同样是 GET。
+ */
+export const DISPATCH_V1_PATHS = Object.freeze([
+  '/v1/dispatch/options',
+  '/v1/dispatch/approval',
+]);
+
 /** 已知 /v1 路径（用错方法 → 405，而不是 404） */
 const KNOWN_V1_PATHS = Object.freeze([
   '/v1/health',
@@ -199,6 +252,9 @@ const KNOWN_V1_PATHS = Object.freeze([
   '/v1/peers',
   '/v1/unpair',
   ...GROUP_V1_PATHS,
+  ...FILE_V1_PATHS,
+  ...DM_V1_PATHS,
+  ...DISPATCH_V1_PATHS,
 ]);
 
 /** §5 ask 默认超时（秒） */
@@ -281,6 +337,9 @@ export const GROUP_META_FIELDS = Object.freeze([
   'target',
   'by',
   'reason',
+  // 0.8.5-α 契约 §1：派单帖可以点名目标的工作区与权限档。白名单只放
+  // 「id / 名字 / 档位」三种标量 —— 任何像 path 的键都进不了群历史。
+  ...GROUP_DISPATCH_SCOPE_FIELDS,
 ]);
 
 /** meta 里的字符串字段上限（防止有人用 meta 夹带大块数据） */
@@ -552,6 +611,9 @@ export function resolveConfig(overrides = {}) {
     requireEncryption: overrides.requireEncryption !== false,
     agentPreset: String(overrides.agentPreset ?? 'standard'),
     permission: String(overrides.permission ?? 'read-only'),
+    // 0.8.5-α §0.7b 中英双语：lang 只透传（auto / zh / en，非法值回落 auto）；
+    // 怎么用由使用侧决定（lib/i18n.mjs 的 resolveLang），这里不读环境、不改输出。
+    lang: ['zh', 'en'].includes(overrides.lang) ? String(overrides.lang) : 'auto',
     // null = 使用 DEFAULT_TRUSTED_CIDRS（仅回环 + 私网）；显式数组 = 严格按数组
     trustedCidrs,
     now: typeof overrides.now === 'function' ? overrides.now : Date.now,
@@ -570,6 +632,19 @@ export function resolveConfig(overrides = {}) {
     maxConcurrentSessions: normalizeCount(overrides.maxConcurrentSessions, DEFAULT_MAX_CONCURRENT_SESSIONS),
     // §2 v0.5.0 群：默认关闭，hub 留空表示本机是 hub
     group: normalizeGroupConfig(overrides.group),
+    // 0.8.5-α §5 文件互传旋钮：默认值就是契约值；非法值回落默认（老配置里没有这些键）
+    fileAutoAccept: overrides.fileAutoAccept === true,
+    fileMaxBytes: normalizeCount(overrides.fileMaxBytes, FILE_DEFAULT_MAX_BYTES, { max: 2 ** 40 }),
+    fileInboxBytes: normalizeCount(overrides.fileInboxBytes, FILE_DEFAULT_INBOX_BYTES, { max: 2 ** 42 }),
+    // 块大小硬上限 = 512KiB：base64 + JSON 之后必须留在 MAX_BODY_BYTES(1MiB) 以内
+    fileChunkBytes: normalizeCount(overrides.fileChunkBytes, FILE_DEFAULT_CHUNK_BYTES, { max: FILE_CHUNK_HARD_MAX }),
+    filePendingTtlMs: normalizeCount(overrides.filePendingTtlMs, FILE_DEFAULT_PENDING_TTL_MS, {
+      max: 7 * 24 * 3600 * 1000,
+    }),
+    // 0.8.5-α §3 派单待批准 TTL：契约值 10 分钟；非法值回落默认（老配置里没有这个键）
+    dispatchPendingTtlMs: normalizeCount(overrides.dispatchPendingTtlMs, DISPATCH_PENDING_TTL_MS, {
+      max: 24 * 3600 * 1000,
+    }),
   };
 }
 
@@ -2015,17 +2090,56 @@ export class MemoryRunner {
     this.sequence = 0;
   }
 
-  async ask(prompt) {
+  /**
+   * 契约 §1 的 runner 接口：
+   *   ask(prompt)                    -> sessionId（字符串，与旧接口一致）
+   *   ask(prompt, { sessionId })     -> { sessionId, reused }
+   * 给了 sessionId 且它还在就续聊（reused:true），失效则回退新建（reused:false）。
+   * 无参调用保留字符串返回，是这个假 runner 既有的对外形状（api.test.mjs 依赖）。
+   */
+  async ask(prompt, options = undefined) {
+    const wanted = typeof options?.sessionId === 'string' ? options.sessionId.trim() : '';
+    // 0.8.5-α 契约 §2：派单可以点名工作区/权限 —— 每个会话自己记住实际生效的那一组
+    const scoped = {
+      workspace: typeof options?.workspace === 'string' && options.workspace !== '' ? options.workspace : this.workspace,
+      permission: typeof options?.permission === 'string' && options.permission !== '' ? options.permission : this.permission,
+    };
+    // 契约 §2 的权限回报：这个假 runner **真的**按点名的档位记账（没有沙箱降级），
+    // 所以「实际生效 = 请求值」；真 runner 读到别的档位时同样按实值回报。
+    const stated = typeof options?.permission === 'string' ? options.permission : '';
+    const reported = stated === ''
+      ? {}
+      : {
+        appliedPermission: String(scoped.permission ?? ''),
+        permissionHonored: String(scoped.permission ?? '') === stated,
+      };
+    if (wanted !== '' && this.sessions.has(wanted)) {
+      const session = this.sessions.get(wanted);
+      const startedAt = this.now();
+      // 续聊：同一会话的第 n 轮（reply 口吻仍与单轮一致，便于断言 reused 而不是靠文案）
+      session.prompt = String(prompt);
+      session.workspace = scoped.workspace;
+      session.permission = scoped.permission;
+      session.startedAt = startedAt;
+      session.completesAt = startedAt + this.delayMs;
+      session.reply = `OK ${firstChars(prompt, 20)}`;
+      session.turns = (session.turns ?? 1) + 1;
+      return { sessionId: wanted, reused: true, ...reported };
+    }
     this.sequence += 1;
     const sessionId = `mem-${this.sequence}-${randomBytes(4).toString('hex')}`;
     const startedAt = this.now();
     this.sessions.set(sessionId, {
       prompt: String(prompt),
+      workspace: scoped.workspace,
+      permission: scoped.permission,
       startedAt,
       completesAt: startedAt + this.delayMs,
       reply: `OK ${firstChars(prompt, 20)}`,
+      turns: 1,
     });
-    return sessionId;
+    if (options === undefined) return sessionId;
+    return { sessionId, reused: false, ...reported };
   }
 
   poll(sessionId) {
@@ -2166,6 +2280,56 @@ export function createPeerServer(overrides = {}) {
     throw new TypeError('runner must implement ask(prompt) and poll(sessionId)');
   }
 
+  /**
+   * 0.8.5-α 契约 §2：入站文件三区存储（inbox / .pending / .incoming）。
+   * 落盘位置只由这里决定 —— 对端给的名字在 store 里过 sanitizeFileName()。
+   * 定时清理在 listen() 里起（unref）、close() 里停。
+   */
+  const fileStore = new FileStore({
+    stateDir: config.stateDir,
+    now: config.now,
+    maxBytes: config.fileMaxBytes,
+    inboxBytes: config.fileInboxBytes,
+    chunkBytes: config.fileChunkBytes,
+    pendingTtlMs: config.filePendingTtlMs,
+    autoAccept: config.fileAutoAccept,
+    logger: config.logger,
+  });
+
+  /**
+   * 0.8.5-α 契约 §2：私聊存储（<stateDir>/dm/<peerId>.jsonl，0600 追加写）。
+   * 私聊**不进群历史、不进群日志**；本模块只在 [dm] 前缀下记 peerId 前 8 位与条数。
+   */
+  const dmStore = new DmStore({
+    stateDir: config.stateDir,
+    now: config.now,
+    logger: config.logger,
+  });
+
+  /**
+   * 0.8.5-α 契约 §1/§3：派单设置（<stateDir>/dispatch-prefs.json）与待批准队列
+   * （<stateDir>/dispatch-pending.json）。两者都是 0600 原子写，由本模块独占读写。
+   * 缺省工作区路径取 config.workspace —— 与「不指定工作区」时的执行目录完全一致。
+   */
+  const dispatchPrefs = new DispatchPrefs({
+    stateDir: config.stateDir,
+    workspace: config.workspace,
+    now: config.now,
+    logger: config.logger,
+  });
+  const dispatchPending = new DispatchPending({
+    stateDir: config.stateDir,
+    now: config.now,
+    ttlMs: config.dispatchPendingTtlMs,
+    logger: config.logger,
+  });
+  /**
+   * approvalId -> { prompt, requestId, timeoutSec, dmSessionId }。
+   * **只在内存**：待批准记录的正文永不落盘（契约 §3），重启后这条记录只能作废。
+   * 键上限沿用 MAX_SESSIONS，避免对端狂发把内存堆爆。
+   */
+  const dispatchPrompts = new Map();
+
   /** sessionId -> 会话记录 */
   /**
    * §3 群事件流的节奏：默认 200ms 轮询 / 10s ping。
@@ -2181,6 +2345,20 @@ export function createPeerServer(overrides = {}) {
   const sessions = new Map();
   /** `${peerId}\0${requestId}` -> sessionId（幂等） */
   const requestIds = new Map();
+  /**
+   * DSH 连续会话 id -> 拥有它的 peerId（契约 §1）。
+   * 只有发起过该会话的对端才允许续聊：别人的 id 一律当失效（否则就是会话劫持）。
+   */
+  const dmSessionOwners = new Map();
+
+  function rememberDmSessionOwner(runnerSessionId, peerId) {
+    if (typeof runnerSessionId !== 'string' || runnerSessionId === '') return;
+    dmSessionOwners.delete(runnerSessionId);
+    dmSessionOwners.set(runnerSessionId, peerId);
+    while (dmSessionOwners.size > MAX_SESSIONS) {
+      dmSessionOwners.delete(dmSessionOwners.keys().next().value);
+    }
+  }
   /** nonce -> 过期时间 */
   const nonces = new Map();
   let lastNoncePrune = 0;
@@ -2652,14 +2830,112 @@ export function createPeerServer(overrides = {}) {
     }
   }
 
-  async function createAskSession({ peerId, requestId, prompt, timeoutSec }) {
+  /**
+   * runner 的 ask 有两种合法返回：旧形状（裸 sessionId 字符串）与契约 §1 的
+   * { sessionId, reused }。请求方（旧客户端/旧 runner）不被新形状强绑，这里统一收敛。
+   *
+   * 权限三键（appliedPermission / permissionHonored / permissionReason）**如实收敛**：
+   * runner 没回报就取中性值（''/false/''）。绝不能把「没回报」读成 honored:true ——
+   * 那正是发送方界面显示「权限已生效」而实际是 workspace-write 的那种谎。
+   *
+   * 权限档位不是 session/create 的字段，它是会话事件（permission/preset +
+   * sandbox/mode + approval/policy）折叠出的 permissions 投影。写这条事件的入口分三层：
+   *
+   *   - 写入口在**进程内**：permissionPresets / sessions / sandboxPolicy 三个服务都能从
+   *     ctx.get() 拿到，permissionPresets.set(session, presetName) 能真的把会话切到某个预设，
+   *     所以这条路径上 applied === requested 是可能的，permissionHonored:true 也就**可以**
+   *     成立（是否成立由 runner 实际读回来的值决定，不由本文件猜）。
+   *   - 「read-only 是不是预设名」**取决于部署**，两种都要认：
+   *       1. **本部署（装了 @deepseek-ai/dsh-base）三档齐全**：该 bundle 层的
+   *          cordis.patch.yml 显式配了 read-only / workspace-write / danger-full-access
+   *          （每档一组 sandbox + approval），所以 permissionPresets.set(session, 'read-only')
+   *          是成立的，会话投影 permissions.preset 字面就是 read-only（真机 via=preset 为证）；
+   *       2. **未装该 bundle 的部署出厂表只有两档**（workspace-write / danger-full-access），
+   *          此时 read-only 不是预设名，靠追加 canonical 事件 sandbox/mode + approval/policy
+   *          兜底 —— lib/runner-ctx.mjs 的 writePermission() 里 preset / tier 两条路并存，
+   *          返回 'preset' 还是 'tier' 就是这两种部署的差别。
+   *   - 远端 RPC 路径**不可达**：RPC 侧只暴露 permissionPresets.catalog（见 typert.host.js），
+   *     set 不在 RPC 面上；另一条路 /permission 命令会在对端会话里插一条命令记录，代价
+   *     不可接受。所以 lib/runner-dsh.mjs 只能如实降级。
+   *
+   * 因此：permissionHonored === false 是**正常的诚实结果，不是错误**，也不是「功能不存在」的
+   * 证据（in-process 路径上它能是 true，RPC 路径上它只能如实为 false）。本文件只做一件事：
+   * 把 runner 读回来的实值原样回告，绝不把请求值伪装成生效值。
+   */
+  function normalizeRunnerAnswer(asked) {
+    if (typeof asked === 'string') {
+      return { sessionId: asked, reused: false, appliedPermission: '', permissionHonored: false, permissionReason: '' };
+    }
+    const sessionId = typeof asked?.sessionId === 'string' ? asked.sessionId : '';
+    return {
+      sessionId,
+      reused: asked?.reused === true,
+      appliedPermission: typeof asked?.appliedPermission === 'string' ? asked.appliedPermission : '',
+      permissionHonored: asked?.permissionHonored === true,
+      permissionReason: typeof asked?.permissionReason === 'string' ? asked.permissionReason : '',
+    };
+  }
+
+  /**
+   * @param {object} input
+   *   workspace      —— 派单点名的工作区**绝对路径**（只交给 runner，不落记录、不进日志）
+   *   workspaceId / workspaceName —— 会话记录里的对外标识（id + 名字，永不含 path）
+   *   permission     —— **请求**的权限档（实际生效档由 runner 回报，见 appliedPermission）
+   */
+  async function createAskSession({
+    peerId,
+    requestId,
+    prompt,
+    timeoutSec,
+    dmSessionId = '',
+    workspace = '',
+    workspaceId = '',
+    workspaceName = '',
+    permission = '',
+  }) {
     const key = `${peerId}\u0000${requestId}`;
     const existingId = requestIds.get(key);
     if (existingId && sessions.has(existingId)) {
-      return { sessionId: existingId, reused: true };
+      const existing = sessions.get(existingId);
+      // 幂等重放：会话与它的连续会话 id 一起回给对方，别让重试丢掉续聊锚点
+      return {
+        sessionId: existingId,
+        idempotent: true,
+        continued: existing.continued === true,
+        dmSessionId: String(existing.dmSessionId ?? ''),
+        // 重放不重新执行：把第一次执行时如实记下的「实际生效档」原样再回一次
+        appliedPermission: String(existing.appliedPermission ?? ''),
+        permissionHonored: existing.permissionHonored === true,
+      };
     }
-    // 真 DSH 适配器可能是异步的，这里 await 兼容 string 与 Promise
-    const runnerSessionId = await runner.ask(prompt);
+    // 契约 §1：只允许继续**自己**的 DSH 会话。别人的 id 一律按失效处理 ——
+    // 否则一个已配对的对端就能接管另一对的会话，连续会话会变成会话劫持。
+    const wanted = typeof dmSessionId === 'string' && dmSessionId !== ''
+      && dmSessionOwners.get(dmSessionId) === peerId
+      ? dmSessionId
+      : '';
+    // 真 DSH 适配器可能是异步的，这里 await 兼容 string/Promise/新对象形状。
+    // 契约 §2：没点名工作区/权限时**调用形状与以前一模一样**（连 options 都不传），
+    // 旧 runner 与旧断言不受影响；点名的两个键对不认识的 runner 是未知键，忽略即可。
+    const askOptions = {};
+    if (wanted !== '') askOptions.sessionId = wanted;
+    if (typeof workspace === 'string' && workspace !== '') askOptions.workspace = workspace;
+    if (typeof permission === 'string' && permission !== '') askOptions.permission = permission;
+    const asked = normalizeRunnerAnswer(
+      await runner.ask(prompt, Object.keys(askOptions).length === 0 ? undefined : askOptions),
+    );
+    const runnerSessionId = asked.sessionId;
+    if (runnerSessionId === '') throw new Error('runner returned no sessionId');
+    // 点名权限时如实记一行：请求档 / 实际生效档（读不到就空）/ 是否一致 / 短码原因。
+    // 不记 path，也不替 runner 编造原因 —— runner 没给就留空。
+    if (permission !== '' && config.logger) {
+      config.logger(
+        'perm requested=' + permission
+        + ' applied=' + asked.appliedPermission
+        + ' honored=' + asked.permissionHonored
+        + ' reason=' + asked.permissionReason,
+      );
+    }
     const sessionId = randomUUID();
     const startedAt = config.now();
     sessions.set(sessionId, {
@@ -2668,6 +2944,16 @@ export function createPeerServer(overrides = {}) {
       requestId,
       prompt,
       runnerSessionId,
+      // 连续会话锚点：回给调用方，下一轮原样带回来（契约 §1）
+      dmSessionId: runnerSessionId,
+      continued: asked.reused === true,
+      // 派单语义（只存 id/名字/权限；path 只出现在传给 runner 的那一次调用里）
+      workspaceId,
+      workspaceName,
+      // permission 是**请求档**；实际生效档另存两键（读不到就是 ''，不给 honored 造假）
+      permission,
+      appliedPermission: asked.appliedPermission,
+      permissionHonored: asked.permissionHonored,
       startedAt,
       timeoutSec,
       deadline: startedAt + timeoutSec * 1000,
@@ -2675,8 +2961,20 @@ export function createPeerServer(overrides = {}) {
       settled: false,
     });
     requestIds.set(key, sessionId);
+    rememberDmSessionOwner(runnerSessionId, peerId);
     pruneSessions();
-    return { sessionId, reused: false };
+    return {
+      sessionId,
+      idempotent: false,
+      continued: asked.reused === true,
+      dmSessionId: runnerSessionId,
+      workspaceId,
+      workspaceName,
+      permission,
+      // 只透传 runner 的实值：读不到就是 ''，honored 只在它为 true 时为 true
+      appliedPermission: asked.appliedPermission,
+      permissionHonored: asked.permissionHonored === true,
+    };
   }
 
   /** 观测一次会话；done/error 即视为结算并释放 H4 的并发名额 */
@@ -2921,9 +3219,53 @@ export function createPeerServer(overrides = {}) {
     if (!nonEmptyString(requestId, 200) || !nonEmptyString(prompt, MAX_BODY_BYTES)) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
     }
+    // 契约 §1：sessionId 可选 —— 旧客户端不发，行为与以前完全一致（每次新会话）
+    const wantedSession = body.sessionId;
+    if (wantedSession !== undefined && wantedSession !== null && wantedSession !== ''
+      && !nonEmptyString(wantedSession, 200)) {
+      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const dmSessionId = typeof wantedSession === 'string' ? wantedSession : '';
     const timeoutSec = normalizeTimeoutSec(body.timeoutSec);
     if (timeoutSec == null) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    // ---- 0.8.5-α 契约 §2：可选 workspaceId / permission ----------------------
+    // 两个都不传 → 接收方默认工作区 + 默认档，下面这一段一行都不多执行（旧客户端行为不变）。
+    // 校验顺序照契约写死：未知 workspaceId(409) → 非法 permission(400) → 超上限(403)。
+    const wantsDispatch = body.workspaceId !== undefined || body.permission !== undefined;
+    let dispatchScope = null;
+    if (wantsDispatch) {
+      // 设置每次现读现用：设置页改完立刻生效（契约 §7 第 5 条），不需要重启
+      const prefs = dispatchPrefs.get();
+      const wantedWorkspace = body.workspaceId;
+      let entry;
+      if (wantedWorkspace === undefined || wantedWorkspace === null || wantedWorkspace === '') {
+        // 只点了权限、没点工作区：用接收方默认工作区（与「不传」时同一个目录）
+        entry = prefs.workspaces.find((item) => item.id === prefs.defaultWorkspaceId) ?? prefs.workspaces[0];
+      } else {
+        entry = prefs.workspaces.find((item) => item.id === String(wantedWorkspace)) ?? null;
+        // 未知 id 一律 409，且不区分「不存在」与「不可见」——不做目录结构探测
+        if (!entry) return { status: 409, body: { error: 'unknown-workspace' }, peerId: auth.peerId };
+      }
+      const wantedPermission = body.permission;
+      const named = wantedPermission !== undefined && wantedPermission !== null && wantedPermission !== '';
+      // 非法档位只可能是显式传错：400，不落到「未知」分支
+      if (named && !isPermission(wantedPermission)) {
+        return { status: 400, body: { error: 'bad-permission' }, peerId: auth.peerId };
+      }
+      // 不点名权限 = 接收方默认档（永远不会触发确认流程）
+      const permission = named ? String(wantedPermission) : config.permission;
+      if (permissionRank(permission) > permissionRank(prefs.maxPermission)) {
+        return { status: 403, body: { error: 'permission-denied' }, peerId: auth.peerId };
+      }
+      dispatchScope = {
+        entry,
+        permission,
+        // 超过接收方默认档但没超过上限 → 必须人工确认（契约 §0 铁律第 2/3 条）。
+        // 默认档就是本机 config.permission：不点名时执行侧本来就用它。
+        needsApproval: permissionRank(permission) > permissionRank(config.permission),
+      };
     }
     // H4：同一 requestId 的重复请求不建新会话、也不应该白扣配额（幂等语义优先）
     const reuseKey = `${auth.peerId}\u0000${requestId}`;
@@ -2950,13 +3292,83 @@ export function createPeerServer(overrides = {}) {
         return { status: 429, body: { error: 'rate-limited', retryAfterMs: token.retryAfterMs }, peerId: auth.peerId };
       }
     }
+    // 契约 §2：请求档 > 默认档但 ≤ 上限 → **不执行**，登记待批准并 202 返回 approvalId。
+    // 正文只留在内存（dispatchPrompts），落盘的记录里只有字节数。
+    if (dispatchScope?.needsApproval === true) {
+      const replay = pendingApprovalFor(auth.peerId, requestId);
+      if (replay) {
+        return {
+          status: 202,
+          body: { state: 'pending-approval', approvalId: replay.approvalId, expiresAt: replay.expiresAt },
+          peerId: auth.peerId,
+        };
+      }
+      const record = dispatchPending.create({
+        from: auth.peerId,
+        workspaceId: dispatchScope.entry.id,
+        workspaceName: dispatchScope.entry.name,
+        permission: dispatchScope.permission,
+        promptBytes: Buffer.byteLength(prompt, 'utf8'),
+      });
+      dispatchPrompts.set(record.approvalId, { prompt, requestId, timeoutSec, dmSessionId, peerId: auth.peerId });
+      while (dispatchPrompts.size > MAX_SESSIONS) {
+        dispatchPrompts.delete(dispatchPrompts.keys().next().value);
+      }
+      if (config.logger) {
+        // 只记 id/名字/权限/字节数：正文与路径都不进日志
+        config.logger(
+          '[dispatch] pending from=' + shortPeer(auth.peerId)
+          + ' ws=' + record.workspaceId
+          + ' perm=' + record.permission
+          + ' bytes=' + record.promptBytes,
+        );
+      }
+      return {
+        status: 202,
+        body: { state: 'pending-approval', approvalId: record.approvalId, expiresAt: record.expiresAt },
+        peerId: auth.peerId,
+      };
+    }
     let created;
     try {
-      created = await createAskSession({ peerId: auth.peerId, requestId, prompt, timeoutSec });
+      created = await createAskSession({
+        peerId: auth.peerId,
+        requestId,
+        prompt,
+        timeoutSec,
+        dmSessionId,
+        // 没点名派单范围时传空串：createAskSession 走与以前完全一样的调用形状
+        workspace: dispatchScope ? dispatchScope.entry.path : '',
+        workspaceId: dispatchScope ? dispatchScope.entry.id : '',
+        workspaceName: dispatchScope ? dispatchScope.entry.name : '',
+        permission: dispatchScope ? dispatchScope.permission : '',
+      });
     } catch {
       return { status: 500, body: { error: 'runner-error' }, peerId: auth.peerId };
     }
-    return { status: 202, body: { sessionId: created.sessionId }, peerId: auth.peerId };
+    // sessionId 仍是 /v1/answer 的协议会话 id（旧客户端行为不变）；
+    // dmSessionId 是 DSH 连续会话锚点，下一轮原样带回（契约 §1 的「连续会话」）。
+    return {
+      status: 202,
+      body: {
+        sessionId: created.sessionId,
+        reused: created.continued === true,
+        dmSessionId: created.dmSessionId,
+        // 契约 §4：点名的派单要把「实际生效的那一组」回给发送方（只有 id + 名字）。
+        // permission 的语义是**实际生效档**（读不到就是空串）：绝不把请求值当生效值回给
+        // 发送方，那会让界面显示「权限已生效」而执行侧其实是别的档。请求值走
+        // requestedPermission，两者是否一致看 permissionHonored。
+        ...(dispatchScope
+          ? {
+            workspace: { id: dispatchScope.entry.id, name: dispatchScope.entry.name },
+            permission: created.appliedPermission ?? '',
+            requestedPermission: dispatchScope.permission,
+            permissionHonored: created.permissionHonored === true,
+          }
+          : {}),
+      },
+      peerId: auth.peerId,
+    };
   }
 
   /** §4：没有 waitMs（或 <=0）→ 0，立即返回，语义与 0.3.1 完全一致 */
@@ -3307,7 +3719,27 @@ export function createPeerServer(overrides = {}) {
     if (Array.from(text).length > GROUP_TEXT_MAX_CHARS) {
       return { status: 413, body: { error: 'payload-too-large' }, peerId };
     }
-    return { body: { kind, text, meta: body.meta } };
+    return { body: { kind, text, meta: postMetaOf(body) } };
+  }
+
+  /**
+   * 0.8.5-α 契约 §1：dispatch 帖可以在**顶层**带 workspaceId / permission / workspaceName，
+   * 它们随帖子进群历史（只存 id、名字、档位）。
+   *
+   * 三条口径：
+   *   1. 一个都没带 → 原样返回 body.meta（0.8.4 行为，连对象都不复制）；
+   *   2. 带了 → 并进 meta 的副本，不覆盖调用方显式写进 meta 的同名字段；
+   *   3. 值可以是任意类型：非标量的会被 sanitizeGroupMeta 丢弃（旧成员读到未知字段也只是忽略，
+   *      绝不抛错——这是「未知字段忽略」那条契约的实现位置）。
+   */
+  function postMetaOf(body) {
+    const scoped = GROUP_DISPATCH_SCOPE_FIELDS.some((field) => body[field] !== undefined);
+    if (!scoped) return body.meta;
+    const meta = body.meta && typeof body.meta === 'object' && !Array.isArray(body.meta) ? { ...body.meta } : {};
+    for (const field of GROUP_DISPATCH_SCOPE_FIELDS) {
+      if (body[field] !== undefined && meta[field] === undefined) meta[field] = body[field];
+    }
+    return meta;
   }
 
   /** S3 §5：写路径串行化（两种鉴权共用）—— 一次只让一条消息走 propose→commit */
@@ -6136,6 +6568,766 @@ export function createPeerServer(overrides = {}) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 0.8.5-α 契约 §1/§3：文件互传（1:1、per-peer 签名 + 逐块 AES-256-GCM）
+  //
+  // 日志只记 size / sha256 前 8 位 / 状态 —— 文件名与内容一律不落日志（§0 铁律）。
+  // -------------------------------------------------------------------------
+
+  /** 一次性 per-peer 调用：签名覆盖明文 JSON，线上只走密文信封（与 client 同格式） */
+  async function fileCall({ baseUrl, secret, senderId, method, apiPath, body, timeoutMs = 120_000 }) {
+    const plain = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body), 'utf8');
+    const ts = config.now();
+    const nonce = randomBytes(16).toString('hex');
+    const canonical = buildCanonical({ method, path: apiPath, ts, nonce, rawBody: plain });
+    const signature = signCanonical({ secret, canonical, keyEncoding: config.secretKeyEncoding });
+    const wire = plain.length > 0 ? Buffer.from(encryptBytes(secret, plain), 'utf8') : Buffer.alloc(0);
+    const target = new URL(apiPath, baseUrl).toString();
+    const response = await fetch(target, {
+      method,
+      headers: {
+        'x-peer-id': String(senderId),
+        'x-peer-ts': String(ts),
+        'x-peer-nonce': nonce,
+        'x-peer-sign': signature,
+        [ENC_HEADER]: ENC_VERSION,
+        'content-type': 'application/json',
+      },
+      body: method === 'GET' || method === 'HEAD' ? undefined : wire,
+      signal: AbortSignal.timeout(Math.max(1000, Number(timeoutMs) || 120_000)),
+    });
+    const text = await response.text();
+    let json = null;
+    try {
+      const parsed = JSON.parse(text);
+      json = parsed && parsed.enc === ENC_VERSION && typeof parsed.data === 'string'
+        ? JSON.parse(decryptBytes(secret, parsed.data).toString('utf8'))
+        : parsed;
+    } catch {
+      json = null;
+    }
+    return { status: response.status, json };
+  }
+
+  /** POST /v1/file/offer —— 决定收不收；resumeFrom 让被 kill 过的发送端接着推 */
+  function fileOffer(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const body = readPeerJsonBody(rawBody);
+    if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    const transferId = String(body.transferId ?? '');
+    const size = Number(body.size);
+    const sha256 = String(body.sha256 ?? '').toLowerCase();
+    if (transferId === '' || transferId.length > 200
+      || typeof body.name !== 'string' || body.name.length > 512
+      || !Number.isFinite(size) || size < 0 || Math.floor(size) !== size
+      || !/^[0-9a-f]{64}$/.test(sha256)) {
+      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const out = fileStore.offer({
+      transferId,
+      name: body.name,
+      size,
+      sha256,
+      chunkBytes: body.chunkBytes,
+      from: { peerId: auth.peerId, name: String(auth.peer?.name ?? '') },
+    });
+    if (out.accept !== true) {
+      // 契约只要求 4xx + { accept:false, reason }；具体码按语义给（F2 只应读 reason）
+      const status = out.reason === 'bad-name' || out.reason === 'bad-request'
+        ? 400
+        : (out.reason === 'too-large' ? 413 : (out.reason === 'busy' ? 429 : 409));
+      return { status, body: { accept: false, reason: out.reason }, peerId: auth.peerId };
+    }
+    return { status: 200, body: { accept: true, resumeFrom: out.resumeFrom, dedupe: out.dedupe }, peerId: auth.peerId };
+  }
+
+  /** POST /v1/file/chunk —— data 是明文块 base64，信封由传输层解密后才是它 */
+  function fileChunk(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const body = readPeerJsonBody(rawBody);
+    if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    const transferId = String(body.transferId ?? '');
+    const offset = Number(body.offset);
+    if (transferId === '' || typeof body.data !== 'string'
+      || !Number.isFinite(offset) || offset < 0 || Math.floor(offset) !== offset) {
+      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const out = fileStore.writeChunk({
+      transferId,
+      offset,
+      data: Buffer.from(body.data, 'base64'),
+    });
+    if (out.error === 'bad-offset') {
+      return { status: 409, body: { error: 'bad-offset', expected: out.expected }, peerId: auth.peerId };
+    }
+    if (out.error === 'too-large') {
+      return { status: 413, body: { error: 'too-large' }, peerId: auth.peerId };
+    }
+    if (out.error === 'unknown-transfer') {
+      return { status: 404, body: { error: 'unknown-transfer' }, peerId: auth.peerId };
+    }
+    if (out.error) {
+      return { status: 500, body: { error: 'internal' }, peerId: auth.peerId };
+    }
+    return { status: 200, body: { received: out.received }, peerId: auth.peerId };
+  }
+
+  /** POST /v1/file/complete —— 整体 sha256 对齐后才进待确认区 */
+  async function fileComplete(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const body = readPeerJsonBody(rawBody);
+    if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    const transferId = String(body.transferId ?? '');
+    if (transferId === '') return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    const out = await fileStore.complete({ transferId });
+    if (out.ok === true) {
+      return { status: 200, body: { ok: true, id: out.id, needConfirm: out.needConfirm }, peerId: auth.peerId };
+    }
+    if (out.error === 'checksum-mismatch') {
+      return { status: 422, body: { error: 'checksum-mismatch' }, peerId: auth.peerId };
+    }
+    if (out.error === 'incomplete') {
+      return { status: 409, body: { error: 'incomplete', received: out.received }, peerId: auth.peerId };
+    }
+    if (out.error === 'unknown-transfer') {
+      return { status: 404, body: { error: 'unknown-transfer' }, peerId: auth.peerId };
+    }
+    if (config.logger) config.logger('[file] complete state=rejected err=' + String(out.error ?? 'unknown'));
+    return { status: 500, body: { error: 'internal' }, peerId: auth.peerId };
+  }
+
+  /** GET /v1/file/status?transferId=… */
+  function fileStatus(req, rawBody, url) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const transferId = String(url.searchParams.get('transferId') ?? '');
+    const out = fileStore.status(transferId);
+    if (!out) return { status: 404, body: { error: 'unknown-transfer' }, peerId: auth.peerId };
+    return { status: 200, body: out, peerId: auth.peerId };
+  }
+
+  async function fileDispatch(req, rawBody, url) {
+    const method = String(req.method ?? 'GET').toUpperCase();
+    if (method === 'POST' && url.pathname === '/v1/file/offer') return fileOffer(req, rawBody);
+    if (method === 'POST' && url.pathname === '/v1/file/chunk') return fileChunk(req, rawBody);
+    if (method === 'POST' && url.pathname === '/v1/file/complete') return fileComplete(req, rawBody);
+    if (method === 'GET' && url.pathname === '/v1/file/status') return fileStatus(req, rawBody, url);
+    if (FILE_V1_PATHS.includes(url.pathname)) {
+      return { status: 405, body: { error: 'method-not-allowed' } };
+    }
+    return { status: 404, body: { error: 'not-found' } };
+  }
+
+  /**
+   * 契约 §3 send：发送方按块推送，返回 { ok, id, bytes, sha256, ms }。
+   * 失败一律 { ok:false, reason }（不抛）：面板与 CLI 只需要一个可判定的结果。
+   * 注：这里读的 path 是**本机**操作者给的文件（发送端自己的选择），
+   * 对端永远不能指定接收端路径 —— 落盘路径只由 fileStore 拼。
+   */
+  async function sendFileToPeer(input = {}) {
+    const startedAt = config.now();
+    const elapsed = () => Math.max(0, config.now() - startedAt);
+    const peerId = String(input?.peerId ?? '');
+    const filePath = String(input?.path ?? '');
+    if (peerId === '') return { ok: false, reason: 'bad-peer' };
+    if (filePath === '') return { ok: false, reason: 'bad-path' };
+    const peer = store.getPeer(peerId);
+    if (!peer) return { ok: false, reason: 'unknown-peer' };
+    const baseUrl = baseUrlOf(peerId);
+    if (baseUrl === '') return { ok: false, reason: 'no-base-url' };
+    const secret = String(peer.secret ?? '');
+    if (secret === '') return { ok: false, reason: 'no-secret' };
+
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch {
+      return { ok: false, reason: 'not-found', ms: elapsed() };
+    }
+    if (!stat.isFile()) return { ok: false, reason: 'not-a-file', ms: elapsed() };
+    const size = stat.size;
+    if (size > config.fileMaxBytes) return { ok: false, reason: 'too-large', bytes: size, ms: elapsed() };
+
+    const name = path.basename(filePath);
+    const sha256 = await hashFile(filePath);
+    const chunkBytes = config.fileChunkBytes;
+    const transferId = randomUUID();
+    const peerCtx = { baseUrl, secret, senderId: store.instanceId };
+
+    let replied;
+    try {
+      replied = await fileCall({
+        ...peerCtx,
+        method: 'POST',
+        apiPath: '/v1/file/offer',
+        body: { transferId, name, size, sha256, chunkBytes },
+      });
+    } catch (error) {
+      return { ok: false, reason: 'unreachable', detail: String(error?.message ?? error), ms: elapsed() };
+    }
+    if (replied.status !== 200) {
+      return {
+        ok: false,
+        reason: String(replied.json?.reason ?? replied.json?.error ?? 'offer-rejected'),
+        status: replied.status,
+        bytes: size,
+        sha256,
+        ms: elapsed(),
+      };
+    }
+    if (replied.json?.dedupe === true) {
+      // 对端已有同一 sha256：一个字节都不重传（契约 §2 去重）
+      return { ok: true, id: '', bytes: size, sha256, ms: elapsed(), dedupe: true, sent: 0 };
+    }
+    const resumeFrom = Math.max(0, Math.min(size, Math.floor(Number(replied.json?.resumeFrom) || 0)));
+
+    try {
+      const handle = await fs.promises.open(filePath, 'r');
+      let offset = resumeFrom;
+      try {
+        while (offset < size) {
+          const want = Math.min(chunkBytes, size - offset);
+          const buffer = Buffer.allocUnsafe(want);
+          const read = await handle.read(buffer, 0, want, offset);
+          if (read.bytesRead <= 0) throw new Error('short-read');
+          const data = buffer.subarray(0, read.bytesRead).toString('base64');
+          const reply = await fileCall({
+            ...peerCtx,
+            method: 'POST',
+            apiPath: '/v1/file/chunk',
+            body: { transferId, offset, data },
+          });
+          if (reply.status !== 200) {
+            return {
+              ok: false,
+              reason: String(reply.json?.error ?? 'chunk-failed'),
+              expected: reply.json?.expected,
+              sent: offset - resumeFrom,
+              bytes: size,
+              sha256,
+              ms: elapsed(),
+            };
+          }
+          offset += read.bytesRead;
+        }
+      } finally {
+        await handle.close().catch(() => {});
+      }
+      const done = await fileCall({
+        ...peerCtx,
+        method: 'POST',
+        apiPath: '/v1/file/complete',
+        body: { transferId },
+      });
+      if (done.status !== 200) {
+        return {
+          ok: false,
+          reason: String(done.json?.error ?? 'complete-failed'),
+          bytes: size,
+          sha256,
+          ms: elapsed(),
+        };
+      }
+      return {
+        ok: true,
+        id: String(done.json?.id ?? ''),
+        bytes: size,
+        sha256,
+        ms: elapsed(),
+        resumeFrom,
+        needConfirm: done.json?.needConfirm === true,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: 'transport',
+        detail: String(error?.message ?? error),
+        bytes: size,
+        sha256,
+        ms: elapsed(),
+      };
+    }
+  }
+
+  /**
+   * 契约 §3 冻结门面（Lane F2 依赖）：list/accept/reject/send/progress 签名一字不改。
+   * sweep()/dirs() 是给测试与 CLI 的辅助，不属于冻结面。
+   */
+  const filesFacade = {
+    list: () => fileStore.list(),
+    accept: (id) => fileStore.accept(id),
+    reject: (id) => fileStore.reject(id),
+    send: (input = {}) => sendFileToPeer(input),
+    progress: (id) => fileStore.progress(id),
+    sweep: (nowMs) => fileStore.sweep(nowMs),
+    dirs: () => ({
+      inbox: fileStore.inboxDir,
+      pending: fileStore.pendingDir,
+      incoming: fileStore.incomingDir,
+    }),
+  };
+
+  // -------------------------------------------------------------------------
+  // 0.8.5-α 契约 §3/§4：私聊（连续会话 + 两端对齐 + 门面）
+  //
+  // 铁律：私聊**不进群历史、不进群日志**；正文只落 <stateDir>/dm/*.jsonl，
+  // 日志只记 [dm] peer 前 8 位 / 条数 / 字节数 / 状态。传输沿用文件互传那套
+  // per-peer 签名 + AES-256-GCM 信封（§0：不新增传输层、不新增依赖）。
+  // -------------------------------------------------------------------------
+
+  /** 私聊的一条 outbound 调用：与文件互传共用同一套签名与信封 */
+  async function dmCall({ baseUrl, secret, method, apiPath, body, timeoutMs }) {
+    return fileCall({ baseUrl, secret, senderId: store.instanceId, method, apiPath, body, timeoutMs });
+  }
+
+  /** 私聊也走「ask + 等 answer」两条既有端点，不新增远程语义 */
+  async function dmAwaitAnswer({ baseUrl, secret, sessionId, timeoutMs }) {
+    const deadline = config.now() + Math.max(1000, Number(timeoutMs) || 1000);
+    // 轮次上限：注入冻结时钟时 deadline 永不推进，靠这一条兜底（正常路径远用不到）
+    for (let round = 0; round < 200; round += 1) {
+      if (config.now() >= deadline) break;
+      const holdMs = Math.max(500, Math.min(config.answerWaitMs, deadline - config.now()));
+      let replied;
+      try {
+        replied = await dmCall({
+          baseUrl,
+          secret,
+          method: 'GET',
+          apiPath: `/v1/answer?sessionId=${encodeURIComponent(sessionId)}&waitMs=${holdMs}`,
+          timeoutMs: holdMs + 10_000,
+        });
+      } catch (error) {
+        return { status: 'error', error: 'unreachable', detail: String(error?.message ?? error) };
+      }
+      if (replied.status !== 200) {
+        return { status: 'error', error: String(replied.json?.error ?? 'answer-failed') };
+      }
+      if (replied.json?.status === 'done') return { status: 'done', reply: String(replied.json.reply ?? '') };
+      if (replied.json?.status === 'error') {
+        return { status: 'error', error: String(replied.json.error ?? 'peer-error') };
+      }
+    }
+    return { status: 'timeout', error: 'timeout' };
+  }
+
+  /** 收到的条目：只认五个字段，别的字段一概不落盘（对端给什么都不能进本机文件） */
+  function readDmMessages(value) {
+    const rows = Array.isArray(value) ? value.slice(0, DM_SYNC_MAX_ITEMS) : [];
+    return rows.map((entry) => ({
+      id: typeof entry?.id === 'string' ? entry.id : '',
+      ts: Number(entry?.ts),
+      from: entry?.from,
+      text: typeof entry?.text === 'string' ? entry.text : '',
+      sessionId: typeof entry?.sessionId === 'string' ? entry.sessionId : null,
+      state: 'sent',
+    }));
+  }
+
+  /** POST /v1/dm/sync —— 交换双方缺失的 id（append-only，不删不改） */
+  function dmSyncEndpoint(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const body = readPeerJsonBody(rawBody);
+    if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    if (body.messages !== undefined && !Array.isArray(body.messages)) {
+      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const incoming = readDmMessages(body.messages);
+    // 用签名里的 peerId 定位这一对 —— body.peerId 是对端自报，不作数
+    const merged = dmStore.merge(auth.peerId, incoming);
+    const theirIds = new Set(incoming.map((entry) => entry.id));
+    const missing = dmStore.list(auth.peerId)
+      .filter((entry) => !theirIds.has(entry.id))
+      .slice(-DM_SYNC_MAX_ITEMS)
+      .map((entry) => ({
+        id: entry.id,
+        ts: entry.ts,
+        from: entry.from,
+        text: entry.text,
+        sessionId: entry.sessionId,
+        state: entry.state,
+      }));
+    if (config.logger) {
+      config.logger(
+        '[dm] sync peer=' + shortPeer(auth.peerId)
+        + ' recv=' + incoming.length + ' added=' + merged.added
+        + ' reply=' + missing.length + ' skipped=' + merged.skipped,
+      );
+    }
+    return {
+      status: 200,
+      body: { ok: true, messages: missing, have: dmStore.newestTs(auth.peerId) },
+      peerId: auth.peerId,
+    };
+  }
+
+  async function dmDispatch(req, rawBody, url) {
+    const method = String(req.method ?? 'GET').toUpperCase();
+    if (method === 'POST' && url.pathname === '/v1/dm/sync') return dmSyncEndpoint(req, rawBody);
+    if (DM_V1_PATHS.includes(url.pathname)) {
+      return { status: 405, body: { error: 'method-not-allowed' } };
+    }
+    return { status: 404, body: { error: 'not-found' } };
+  }
+
+  /** 契约 §4 冻结门面：list(peerId) / send({peerId,text}) / sync(peerId) */
+  async function dmSend(input = {}) {
+    const startedAt = config.now();
+    const elapsed = () => Math.max(0, config.now() - startedAt);
+    const peerId = String(input?.peerId ?? '');
+    const text = String(input?.text ?? '');
+    if (peerId === '') return { ok: false, reason: 'bad-peer' };
+    if (text.trim() === '') return { ok: false, reason: 'empty-text' };
+    if (Buffer.byteLength(text, 'utf8') > DM_TEXT_MAX_BYTES) return { ok: false, reason: 'text-too-long' };
+    // 契约 §4：可选的派单范围。两个都不给 → 请求体与以前一字不差（旧面板/CLI 完全不受影响）
+    const workspaceId = typeof input?.workspaceId === 'string' ? input.workspaceId.trim() : '';
+    const permission = typeof input?.permission === 'string' ? input.permission.trim() : '';
+    const scoped = workspaceId !== '' || permission !== '';
+    const peer = store.getPeer(peerId);
+    if (!peer) return { ok: false, reason: 'unpaired' };
+    const baseUrl = baseUrlOf(peerId);
+    if (baseUrl === '') return { ok: false, reason: 'no-base-url' };
+    const secret = String(peer.secret ?? '');
+    if (secret === '') return { ok: false, reason: 'no-secret' };
+    const timeoutSec = Math.max(1, Math.min(MAX_TIMEOUT_SEC, Math.floor(Number(input?.timeoutSec) || DEFAULT_TIMEOUT_SEC)));
+
+    // 1) 先落本地（pending）——发不出去也要留痕，面板据此显示「发送中/失败」
+    const id = randomUUID();
+    const previousSessionId = dmStore.lastSessionId(peerId);
+    dmStore.append(peerId, {
+      id,
+      ts: config.now(),
+      from: 'self',
+      text,
+      sessionId: previousSessionId === '' ? null : previousSessionId,
+      state: 'pending',
+    });
+
+    // 2) 1:1 ask（带上该伙伴上次的连续会话 id）
+    let accepted;
+    try {
+      accepted = await dmCall({
+        baseUrl,
+        secret,
+        method: 'POST',
+        apiPath: '/v1/ask',
+        body: {
+          requestId: 'dm-' + id,
+          prompt: text,
+          timeoutSec,
+          ...(previousSessionId === '' ? {} : { sessionId: previousSessionId }),
+          // 只在点名时才带上这两个键：老对端收到的请求体与以前一模一样
+          ...(workspaceId === '' ? {} : { workspaceId }),
+          ...(permission === '' ? {} : { permission }),
+        },
+        timeoutMs: 30_000,
+      });
+    } catch (error) {
+      dmStore.update(peerId, id, { state: 'failed' });
+      if (config.logger) {
+        config.logger('[dm] send peer=' + shortPeer(peerId) + ' bytes=' + Buffer.byteLength(text, 'utf8') + ' state=failed reason=unreachable');
+      }
+      return { ok: false, reason: 'unreachable', id, elapsedMs: elapsed(), detail: String(error?.message ?? error) };
+    }
+    if (accepted.status !== 202) {
+      dmStore.update(peerId, id, { state: 'failed' });
+      const reason = String(accepted.json?.error ?? 'ask-rejected');
+      if (config.logger) {
+        config.logger('[dm] send peer=' + shortPeer(peerId) + ' bytes=' + Buffer.byteLength(text, 'utf8') + ' state=failed status=' + accepted.status + ' reason=' + reason);
+      }
+      return { ok: false, reason, id, status: accepted.status, elapsedMs: elapsed() };
+    }
+    // 契约 §2/§4：超默认档要人工确认 —— 对方没执行、也就没有回复可等。
+    // 返回冻结形状 { ok, pendingApproval, approvalId, expiresAt }；本地那条继续是 pending。
+    if (accepted.json?.state === 'pending-approval') {
+      const approvalId = String(accepted.json?.approvalId ?? '');
+      const expiresAt = Number(accepted.json?.expiresAt);
+      dmStore.update(peerId, id, { state: 'pending' });
+      if (config.logger) {
+        config.logger('[dm] send peer=' + shortPeer(peerId) + ' state=pending-approval approval=' + approvalId);
+      }
+      return { ok: true, pendingApproval: true, approvalId, expiresAt };
+    }
+    const protocolSessionId = String(accepted.json?.sessionId ?? '');
+    const dmSessionId = String(accepted.json?.dmSessionId ?? '') || previousSessionId;
+    const reused = accepted.json?.reused === true;
+
+    // 3) 等回复（复用 /v1/answer 的长轮询，不新增远程语义）
+    const settled = await dmAwaitAnswer({
+      baseUrl,
+      secret,
+      sessionId: protocolSessionId,
+      timeoutMs: timeoutSec * 1000,
+    });
+    if (settled.status !== 'done') {
+      dmStore.update(peerId, id, { state: 'failed', ...(dmSessionId === '' ? {} : { sessionId: dmSessionId }) });
+      if (config.logger) {
+        config.logger('[dm] send peer=' + shortPeer(peerId) + ' state=failed reason=' + String(settled.status ?? 'error'));
+      }
+      return { ok: false, reason: String(settled.status ?? 'error'), id, sessionId: dmSessionId, reused, elapsedMs: elapsed() };
+    }
+
+    // 4) 回复落本地（from:'peer'，与发出那条挂在同一个连续会话上）
+    const reply = String(settled.reply ?? '');
+    dmStore.update(peerId, id, { state: 'sent', ...(dmSessionId === '' ? {} : { sessionId: dmSessionId }) });
+    dmStore.append(peerId, {
+      id: randomUUID(),
+      ts: config.now(),
+      from: 'peer',
+      text: reply,
+      sessionId: dmSessionId === '' ? null : dmSessionId,
+      state: 'sent',
+    });
+    if (config.logger) {
+      config.logger(
+        '[dm] send peer=' + shortPeer(peerId)
+        + ' bytes=' + Buffer.byteLength(text, 'utf8')
+        + ' replyBytes=' + Buffer.byteLength(reply, 'utf8')
+        + ' state=sent reused=' + reused,
+      );
+    }
+    return {
+      ok: true,
+      id,
+      sessionId: dmSessionId,
+      reply,
+      elapsedMs: elapsed(),
+      reused,
+      // 点名的派单把对端回告的「实际生效」那一组带回来（只有 id + 名字，没有 path）。
+      // permission 与 /v1/ask 同义：对端回告的**实际生效档**（读不到就是 null）；
+      // requestedPermission 是本地确实发出去的请求档（对端没回告时就用它）；
+      // permissionHonored 只在对端明确说 true 时才是 true —— 不猜。
+      ...(scoped
+        ? {
+          workspace: accepted.json?.workspace ?? null,
+          permission: accepted.json?.permission ?? null,
+          requestedPermission: accepted.json?.requestedPermission ?? (permission === '' ? null : permission),
+          permissionHonored: accepted.json?.permissionHonored === true,
+        }
+        : {}),
+    };
+  }
+
+  async function dmSync(peerIdRaw) {
+    const peerId = String(peerIdRaw ?? '');
+    if (peerId === '') return { ok: false, reason: 'bad-peer' };
+    const peer = store.getPeer(peerId);
+    if (!peer) return { ok: false, reason: 'unpaired' };
+    const baseUrl = baseUrlOf(peerId);
+    if (baseUrl === '') return { ok: false, reason: 'no-base-url' };
+    const secret = String(peer.secret ?? '');
+    if (secret === '') return { ok: false, reason: 'no-secret' };
+    const outgoing = dmStore.list(peerId).slice(-DM_SYNC_MAX_ITEMS).map((entry) => ({
+      id: entry.id,
+      ts: entry.ts,
+      from: entry.from,
+      text: entry.text,
+      sessionId: entry.sessionId,
+      state: entry.state,
+    }));
+    let replied;
+    try {
+      replied = await dmCall({
+        baseUrl,
+        secret,
+        method: 'POST',
+        apiPath: '/v1/dm/sync',
+        body: { peerId: store.instanceId, messages: outgoing },
+        timeoutMs: 30_000,
+      });
+    } catch (error) {
+      return { ok: false, reason: 'unreachable', detail: String(error?.message ?? error) };
+    }
+    if (replied.status !== 200) {
+      return { ok: false, reason: String(replied.json?.error ?? 'sync-rejected'), status: replied.status };
+    }
+    const merged = dmStore.merge(peerId, Array.isArray(replied.json?.messages) ? replied.json.messages : []);
+    if (config.logger) {
+      config.logger(
+        '[dm] sync peer=' + shortPeer(peerId)
+        + ' sent=' + outgoing.length + ' added=' + merged.added + ' total=' + merged.total,
+      );
+    }
+    return { ok: true, added: merged.added, total: merged.total };
+  }
+
+  const dmFacade = {
+    list: (peerId) => dmStore.list(String(peerId ?? '')),
+    send: (input = {}) => dmSend(input),
+    sync: (peerId) => dmSync(peerId),
+    /** 给测试/CLI 的辅助，不属于冻结面 */
+    store: () => dmStore,
+    file: (peerId) => dmStore.file(String(peerId ?? '')),
+  };
+
+  // -------------------------------------------------------------------------
+  // 0.8.5-α 契约 §1/§2/§4：派单工作区与权限（协议 + 待批准队列 + 门面）
+  //
+  // 铁律：工作区只以 id + 名字过协议（path 只在 options() 之外的本机视图里出现）；
+  // 权限只降不升：超上限直接 403，超默认档必须人工确认（202 + approvalId）。
+  // 待批准记录的正文只在内存（dispatchPrompts），落盘只有 promptBytes。
+  // -------------------------------------------------------------------------
+
+  /** 同一 (peerId, requestId) 已经排着队时复用它：重试不该排第二条 */
+  function pendingApprovalFor(peerId, requestId) {
+    for (const [approvalId, entry] of dispatchPrompts) {
+      if (entry.peerId !== peerId || entry.requestId !== requestId) continue;
+      const record = dispatchPending.peek(approvalId);
+      if (record && record.state === 'pending' && record.from === peerId) return record;
+    }
+    return null;
+  }
+
+  /** GET /v1/dispatch/options —— 发送方能看到的**全部**信息：只有 id 与 name */
+  function dispatchOptions(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    // 与 /v1/ask 同一道门：连 ask 都不收的节点不该先把工作区清单交出去
+    if (!config.allowRemotePrompts) {
+      return { status: 403, body: { error: 'disabled' }, peerId: auth.peerId };
+    }
+    return { status: 200, body: dispatchPrefs.options(), peerId: auth.peerId };
+  }
+
+  /** GET /v1/dispatch/approval?id= —— 只有发起方本人能读自己那条 */
+  function dispatchApproval(req, rawBody, url) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const approvalId = url.searchParams.get('id');
+    if (!nonEmptyString(approvalId, 200)) {
+      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const record = dispatchPending.peek(approvalId);
+    // 「不存在」与「不是你的」回同一个 404：不给 approvalId 留探测面
+    if (!record || record.from !== auth.peerId) {
+      return { status: 404, body: { error: 'unknown-approval' }, peerId: auth.peerId };
+    }
+    return {
+      status: 200,
+      body: record.state === 'approved' && typeof record.sessionId === 'string' && record.sessionId !== ''
+        ? { state: 'approved', sessionId: record.sessionId }
+        : { state: record.state },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * 契约 §3：批准后按**请求里点名的** workspace/permission 真正执行一次 ask，
+   * 并把 sessionId 写回记录（发送方据此接上 /v1/answer）。
+   *
+   * 这里不走令牌桶：这条请求在 /v1/ask 那一步已经过闸，人工批准只是让它继续。
+   */
+  async function approveDispatch(approvalIdRaw) {
+    const approvalId = String(approvalIdRaw ?? '');
+    if (approvalId === '') return { ok: false, state: 'unknown', reason: 'bad-approval' };
+    const record = dispatchPending.peek(approvalId);
+    if (!record) return { ok: false, state: 'unknown', reason: 'unknown-approval' };
+    // 幂等：已决的条目不再执行第二次，原样回结论
+    if (record.state !== 'pending') {
+      return record.state === 'approved'
+        ? { ok: true, state: 'approved', sessionId: record.sessionId ?? null }
+        : { ok: false, state: record.state };
+    }
+    const queued = dispatchPrompts.get(approvalId);
+    if (!queued || typeof queued.prompt !== 'string' || queued.prompt === '') {
+      // 进程重启过：正文本来就没落盘，这条只能作废（不编造执行）
+      dispatchPending.settle(approvalId, 'expired');
+      if (config.logger) config.logger('[dispatch] approve state=expired reason=prompt-lost');
+      return { ok: false, state: 'expired', reason: 'prompt-lost' };
+    }
+    const entry = dispatchPrefs.workspace(record.workspaceId);
+    if (!entry) {
+      // 排队期间工作区被改名/删掉：按拒绝处理，绝不退回某个「猜的对目录」
+      dispatchPending.settle(approvalId, 'rejected');
+      dispatchPrompts.delete(approvalId);
+      if (config.logger) config.logger('[dispatch] approve state=rejected reason=unknown-workspace');
+      return { ok: false, state: 'rejected', reason: 'unknown-workspace' };
+    }
+    let created;
+    try {
+      created = await createAskSession({
+        peerId: record.from,
+        requestId: queued.requestId,
+        prompt: queued.prompt,
+        timeoutSec: queued.timeoutSec,
+        dmSessionId: queued.dmSessionId,
+        workspace: entry.path,
+        workspaceId: entry.id,
+        workspaceName: entry.name,
+        permission: record.permission,
+      });
+    } catch {
+      // 执行侧失败：记录留在 pending，用户可以再点一次批准
+      if (config.logger) config.logger('[dispatch] approve state=pending reason=runner-error');
+      return { ok: false, state: 'pending', reason: 'runner-error' };
+    }
+    dispatchPrompts.delete(approvalId);
+    dispatchPending.settle(approvalId, 'approved', { sessionId: created.sessionId });
+    if (config.logger) {
+      config.logger(
+        '[dispatch] approve ws=' + record.workspaceId
+        + ' perm=' + record.permission
+        + ' bytes=' + record.promptBytes
+        + ' state=approved',
+      );
+    }
+    return { ok: true, state: 'approved', sessionId: created.sessionId };
+  }
+
+  /** 契约 §4：拒绝 = 只结算，不执行（正文当场丢掉） */
+  function rejectDispatch(approvalIdRaw) {
+    const approvalId = String(approvalIdRaw ?? '');
+    if (approvalId === '') return { ok: false, state: 'unknown', reason: 'bad-approval' };
+    const record = dispatchPending.peek(approvalId);
+    if (!record) return { ok: false, state: 'unknown', reason: 'unknown-approval' };
+    if (record.state !== 'pending') {
+      return record.state === 'approved'
+        ? { ok: false, state: 'approved' }
+        : { ok: true, state: record.state };
+    }
+    dispatchPrompts.delete(approvalId);
+    dispatchPending.settle(approvalId, 'rejected');
+    if (config.logger) {
+      config.logger('[dispatch] reject ws=' + record.workspaceId + ' perm=' + record.permission + ' state=rejected');
+    }
+    return { ok: true, state: 'rejected' };
+  }
+
+  /** 契约 §2 的路由（未知 /v1/dispatch/* → 404，已知路径用错方法 → 405） */
+  function dispatchSubRouter(req, rawBody, url) {
+    const method = String(req.method ?? 'GET').toUpperCase();
+    if (method === 'GET' && url.pathname === '/v1/dispatch/options') return dispatchOptions(req, rawBody);
+    if (method === 'GET' && url.pathname === '/v1/dispatch/approval') return dispatchApproval(req, rawBody, url);
+    if (DISPATCH_V1_PATHS.includes(url.pathname)) {
+      return { status: 405, body: { error: 'method-not-allowed' } };
+    }
+    return { status: 404, body: { error: 'not-found' } };
+  }
+
+  /**
+   * 契约 §4 冻结门面：
+   *   prefs()          本机视角（含 path）
+   *   savePrefs(patch) 保存并校验，返回同形状
+   *   options()        对外视图（无 path）
+   *   pending()        待批准列表
+   *   approve(id) / reject(id)
+   */
+  const dispatchWorkspaceFacade = {
+    prefs: () => dispatchPrefs.get(),
+    savePrefs: (patch) => dispatchPrefs.save(patch),
+    options: () => dispatchPrefs.options(),
+    pending: () => dispatchPending.list(),
+    approve: (approvalId) => approveDispatch(approvalId),
+    reject: (approvalId) => rejectDispatch(approvalId),
+    /** 给测试/CLI 用的辅助，不属于冻结面 */
+    file: () => dispatchPrefs.file,
+    pendingFile: () => dispatchPending.file,
+    state: (approvalId) => dispatchPending.state(approvalId),
+  };
+
   /** hub 把自己那条成员的地址也写进群状态（面板要显示「我看到的你的地址」） */
   function refreshSelfBaseUrl() {
     if (!groupStore) return;
@@ -6159,6 +7351,12 @@ export function createPeerServer(overrides = {}) {
     if (method === 'POST' && url.pathname === '/v1/unpair') return unpair(req, rawBody);
     // v0.5.0 群：未知的 /v1/group/* 也走这里（404 而不是落到通用 405）
     if (url.pathname.startsWith('/v1/group/')) return groupDispatch(req, rawBody, url, res);
+    // 0.8.5-α：文件互传四条（未知的 /v1/file/* 404，已知路径用错方法 405）
+    if (url.pathname.startsWith('/v1/file/')) return fileDispatch(req, rawBody, url);
+    // 0.8.5-α 契约 §3：私聊对齐（未知的 /v1/dm/* 404，已知路径用错方法 405）
+    if (url.pathname.startsWith('/v1/dm/')) return dmDispatch(req, rawBody, url);
+    // 0.8.5-α 契约 §2：派单工作区/权限（同上：未知 404、用错方法 405）
+    if (url.pathname.startsWith('/v1/dispatch/')) return dispatchSubRouter(req, rawBody, url);
     if (KNOWN_V1_PATHS.includes(url.pathname)) {
       return { status: 405, body: { error: 'method-not-allowed' } };
     }
@@ -6197,7 +7395,14 @@ export function createPeerServer(overrides = {}) {
             // **与群开关无关** —— 任何已配对节点都要先按对端密钥解信封再验签。
             || GROUP_PEER_V1_PATHS.includes(url.pathname)
             // S3：成员当上 leader 时也收 post，同样要先按发送方密钥解密/验签
-            || (groupStore === null && url.pathname === '/v1/group/post' && isLocalLeader()));
+            || (groupStore === null && url.pathname === '/v1/group/post' && isLocalLeader())
+            // 0.8.5-α 契约 §1：文件四条是 per-peer 路径 —— 未配对对端先在这里 401，
+            // 与群开关无关（status 是 GET，无 body，但信封头照样带）
+            || FILE_V1_PATHS.includes(url.pathname)
+            // 0.8.5-α 契约 §3：私聊对齐同样是 per-peer 路径（未配对 → 401）
+            || DM_V1_PATHS.includes(url.pathname)
+            // 0.8.5-α 契约 §2：派单两条也是 per-peer 路径（未配对 → 401；GET 无 body，信封头照样带）
+            || DISPATCH_V1_PATHS.includes(url.pathname));
         if (groupAuthRequest) {
           const groupCtx = localGroupContext();
           if (groupCtx?.groupKey) {
@@ -6528,6 +7733,176 @@ export function createPeerServer(overrides = {}) {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 0.8.5-α 契约 §4：群派单的工作区/权限门面（代理 options + 带范围的 post）
+  // -------------------------------------------------------------------------
+
+  /** 本机 peers.json 里的对端（peerId 优先，其次名字）：派单与代理都要真密钥 */
+  function peerForCall(wanted) {
+    const value = String(wanted ?? '').trim();
+    if (value === '') return null;
+    const list = groupPeersFull();
+    return list.find((peer) => String(peer?.peerId ?? '') === value)
+      ?? list.find((peer) => String(peer?.name ?? '') === value)
+      ?? null;
+  }
+
+  /** 目标写法（peerId / 名字 / 短 id）→ peerId；解析不到返回空串（只用于回填名字） */
+  function resolvePeerIdOf(wanted) {
+    const value = String(wanted ?? '').trim();
+    if (value === '') return '';
+    const peer = peerForCall(value);
+    if (peer) return String(peer.peerId ?? '');
+    const members = groupMembersMap() ?? {};
+    for (const peerId of Object.keys(members)) {
+      if (peerId === value || peerId.slice(0, 8) === value) return peerId;
+    }
+    for (const [peerId, member] of Object.entries(members)) {
+      if (String(member?.name ?? '') === value) return peerId;
+    }
+    return '';
+  }
+
+  /** 目标侧错误 → 协议 token（"403 permission-denied" → "permission-denied"）：绝不带地址 */
+  function shortPeerReason(error) {
+    const text = String(error?.message ?? error ?? '');
+    const match = /^(\d{3})\s*(\S*)/.exec(text);
+    if (!match) return 'unreachable';
+    return String(match[2] ?? '') || ('http-' + match[1]);
+  }
+
+  /**
+   * 契约 §4 冻结门面：server.group.dispatchOptions(peerId)
+   *
+   * 代理**目标**的 /v1/dispatch/options（per-peer 签名，既有通道，没有新信任面），
+   * 返回值再过一次 dispatchOptionsView：只留 id 与名字 —— path 在这一层被丢掉，
+   * 本机永远不知道（也不需要知道）成员的目录。
+   */
+  async function groupDispatchOptions(peerIdRaw) {
+    const peerId = String(peerIdRaw ?? '').trim();
+    const empty = { workspaces: [], defaultWorkspaceId: '', maxPermission: '' };
+    if (peerId === '') return { ok: false, error: 'bad-peer', ...empty };
+    const peer = peerForCall(peerId);
+    const baseUrl = String(peer?.baseUrl ?? '').trim().replace(TRAILING_SLASHES, '');
+    if (!peer || String(peer.secret ?? '') === '' || baseUrl === '') {
+      if (config.logger) config.logger('[group] dispatch options peer=' + shortPeerId(peerId) + ' state=unknown-peer');
+      return { ok: false, error: 'unknown-peer', ...empty };
+    }
+    try {
+      const raw = await fetchDispatchOptions({
+        baseUrl,
+        secret: String(peer.secret),
+        senderId: store.instanceId,
+        timeoutMs: 5_000,
+      });
+      const view = dispatchOptionsView(raw);
+      if (config.logger) {
+        config.logger('[group] dispatch options peer=' + shortPeerId(peerId)
+          + ' state=ok workspaces=' + view.workspaces.length
+          + ' max=' + (view.maxPermission === '' ? 'default' : view.maxPermission));
+      }
+      return { ok: true, ...view };
+    } catch (error) {
+      const reason = shortPeerReason(error);
+      if (config.logger) {
+        config.logger('[group] dispatch options peer=' + shortPeerId(peerId) + ' state=error reason=' + reason);
+      }
+      return { ok: false, error: reason, ...empty };
+    }
+  }
+
+  /**
+   * 工作区**名字**只能问目标本人（hub 也不知道成员的目录）。
+   * 取不到（离线/未接线/未知 id）就返回空串：回执回落显示 id，绝不阻塞派单。
+   */
+  async function workspaceNameOf(peerId, workspaceId) {
+    if (peerId === '' || workspaceId === '') return '';
+    const options = await groupDispatchOptions(peerId);
+    const hit = (options.workspaces ?? []).find((entry) => entry.id === workspaceId);
+    return hit ? String(hit.name ?? '') : '';
+  }
+
+  /**
+   * 契约 §4 冻结门面：server.group.post({ text, target?, workspaceId?, permission? })
+   *
+   * 关键向后兼容：**不带** target/workspaceId/permission 时逐字是 0.8.4 的行为 ——
+   * hub 直接 groupStore.append(input) 并原样返回那条消息（同步）；既有调用方零改动。
+   * 带新字段才进「发帖 + 派单」链路，帖子与两条回执的 meta 都只带 id/名字/档位。
+   */
+  function groupPostFacade(input = {}) {
+    const value = input && typeof input === 'object' ? input : {};
+    const wantsDispatch = value.target !== undefined
+      || value.workspaceId !== undefined
+      || value.permission !== undefined;
+    if (!wantsDispatch) {
+      if (groupStore) return groupStore.append(value);
+      return postGroupReceipt({
+        peerId: store.instanceId,
+        name: config.name,
+        kind: String(value.kind ?? 'chat') || 'chat',
+        text: String(value.text ?? ''),
+        meta: value.meta ?? null,
+      });
+    }
+    return groupPostWithScope(value);
+  }
+
+  async function groupPostWithScope(input = {}) {
+    if (groupRole === 'off') {
+      return {
+        ...dispatchFacadeOff(),
+        seq: null,
+        workspace: null,
+        permission: null,
+        appliedPermission: null,
+        permissionHonored: false,
+        approvalId: null,
+      };
+    }
+    const workspaceId = typeof input.workspaceId === 'string' ? input.workspaceId.trim() : '';
+    const permission = typeof input.permission === 'string' ? input.permission.trim() : '';
+    const wantedTarget = String(input.target ?? '').trim();
+    const kind = String(input.kind ?? 'chat') || 'chat';
+    const text = String(input.text ?? '');
+    const targetId = resolvePeerIdOf(wantedTarget);
+    // 名字只能来自目标本人：拿不到就留空（回执显示 id），也绝不写 path
+    const workspaceName = await workspaceNameOf(targetId, workspaceId);
+    // 1. 发帖：dispatch 帖把自己的范围写进群历史（只此一次，回执也一样只带三键）
+    let seq = null;
+    let postError = null;
+    try {
+      const posted = await postGroupReceipt({
+        kind,
+        text,
+        meta: {
+          ...(targetId === '' ? {} : { target: targetId }),
+          ...(workspaceId === '' ? {} : { workspaceId }),
+          ...(workspaceName === '' ? {} : { workspaceName }),
+          ...(permission === '' ? {} : { permission }),
+        },
+      });
+      seq = posted?.seq ?? null;
+    } catch (error) {
+      // 帖子没发出去也照常派单：回执通道与帖子通道是两条，别让一条拖死另一条
+      postError = shortPeerReason(error);
+      if (config.logger) config.logger('[group] post failed kind=' + kind + ' reason=' + postError);
+    }
+    // 2. 派单（前置检查、透传 /v1/ask、两条回执都在派单器里）。
+    // 调用方点名了目标时要把任务正文从「@!目标 任务」里切出来：派单器拿到显式 target 后
+    // 就不再自己解析 @!，正文原样传过去会把标记一起发走。
+    const parsed = parseGroupDispatch(text, []);
+    const task = parsed.matched ? parsed.task : text;
+    const full = await dispatchFacade.dispatchWithReply({
+      text,
+      ...(wantedTarget === '' ? {} : { target: wantedTarget, task }),
+      ...(workspaceId === '' ? {} : { workspaceId }),
+      ...(workspaceName === '' ? {} : { workspaceName }),
+      ...(permission === '' ? {} : { permission }),
+    });
+    const summary = groupDispatchSummary(full);
+    return { ...summary, seq, ...(postError === null ? {} : { postError }) };
+  }
+
   let groupDispatcher = null;
 
   /** 派单器单例：限流表与 dispatchState 必须全进程一份 */
@@ -6628,6 +8003,11 @@ export function createPeerServer(overrides = {}) {
     setAcceptDispatch: (value) => setAcceptDispatch(value),
     /** 本机接单开关（面板/群状态同一口径） */
     acceptDispatch: () => acceptDispatchNow(),
+    /**
+     * 契约 §4：代理**目标**的派单设置（只有 id 与名字，无 path）。
+     * 入参是 peerId 或名字；出参 { ok, workspaces, defaultWorkspaceId, maxPermission }。
+     */
+    dispatchOptions: (peerId) => groupDispatchOptions(peerId),
   };
 
   const discoveryFacade = {
@@ -6657,6 +8037,12 @@ export function createPeerServer(overrides = {}) {
     store,
     runner,
     httpServer,
+    /** 0.8.5-α 契约 §3 冻结门面：list/accept/reject/send/progress */
+    files: filesFacade,
+    // 0.8.5-α 契约 §4 冻结门面：私聊（导入/面板/CLI 共用这一份实现）
+    dm: dmFacade,
+    // 0.8.5-α 契约 §4 冻结门面：派单工作区/权限（prefs/savePrefs/options/pending/approve/reject）
+    dispatch: dispatchWorkspaceFacade,
     get sessions() {
       return sessions;
     },
@@ -6690,7 +8076,9 @@ export function createPeerServer(overrides = {}) {
             return removed;
           },
           rename: (nextName) => groupStore.renameGroup(nextName),
-          post: (input) => groupStore.append(input),
+          // 契约 §4：不带新字段时逐字是 0.8.4 的 append（同步、原样返回那条消息）；
+          // 带 workspaceId/permission/target 才进「发帖 + 派单」链路（返回 Promise）。
+          post: (input) => groupPostFacade(input),
           // 与 /v1/group/history 同一个渲染口径：同名成员在这里就已经带上短 id 后缀
           history: (options = {}) => decoratedMessages(options),
           // §18：归档索引 / 人工删除 / 游标落在归档区间的判定（管理接口与面板走这里）
@@ -6730,6 +8118,8 @@ export function createPeerServer(overrides = {}) {
             };
           },
           pull: () => memberTick(),
+          // 契约 §4 的门面在成员节点也要在：不带新字段时走既有回执通道（hub / 群级签名）
+          post: (input) => groupPostFacade(input),
           advertiseBaseUrl: () => localAdvertiseBaseUrl(),
           local: () => localGroupContext(),
           // §18.3：成员副本是可重建缓存，只剪枝不归档 —— 归档是 hub 侧权威日志的事
@@ -6771,6 +8161,10 @@ export function createPeerServer(overrides = {}) {
       if (groupStore) groupStore.state();
       // S3：心跳 / 租约检查。两个定时器都 unref()，close() 里清掉（热重载不留定时器）
       startRoleTimers();
+      // 0.8.5-α 契约 §2：未确认 10 分钟自动拒收删除（unref，不吊住进程）
+      fileStore.start();
+      // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
+      dispatchPending.start();
       // v0.8.0 契约 §2a：已入群节点启动后广播一次（延迟到地址已知；节流在广播里生效）
       scheduleStartupAdvertise();
       // v0.8.0：role=off 的节点观察「按名入群」的授权文件（拿到就原地变成员）
@@ -6796,6 +8190,11 @@ export function createPeerServer(overrides = {}) {
         clearInterval(memberTimer);
         memberTimer = null;
       }
+      // 0.8.5-α：待确认 TTL 定时器（unref 起来的，热重载时必须显式清掉）
+      fileStore.close();
+      // 0.8.5-α 契约 §3：待批准队列同样要收尾（并丢掉只存在内存里的正文）
+      dispatchPending.close();
+      dispatchPrompts.clear();
       if (replicaRetryTimer) {
         clearInterval(replicaRetryTimer);
         replicaRetryTimer = null;
@@ -6846,6 +8245,11 @@ Options:
   --group-commit-timeout-ms <ms>  propose→commit 超时（默认 3000）
   --group-hub-priority <n>    同 epoch 裁决优先级（数值小者优先，默认 0）
   --group-replica-pull-ms <ms>  成员向 leader 补差间隔（默认 10000）
+  --file-auto-accept          收到的文件不用人工确认，直接落 inbox（默认关闭）
+  --file-max-bytes <n>        单文件上限（默认 536870912 = 512MiB）
+  --file-inbox-bytes <n>      inbox 总占用上限（默认 2147483648 = 2GiB）
+  --file-chunk-bytes <n>      单块字节数（默认 524288 = 512KiB，硬上限同值）
+  --file-pending-ttl-ms <ms>  待确认超时，超时自动拒收删除（默认 600000）
   --code                      只生成并打印一次性配对码，然后退出
   -h, --help                  显示帮助
 `);
@@ -6878,6 +8282,11 @@ async function main(argv) {
       'group-commit-timeout-ms': { type: 'string' },
       'group-hub-priority': { type: 'string' },
       'group-replica-pull-ms': { type: 'string' },
+      'file-auto-accept': { type: 'boolean', default: false },
+      'file-max-bytes': { type: 'string' },
+      'file-inbox-bytes': { type: 'string' },
+      'file-chunk-bytes': { type: 'string' },
+      'file-pending-ttl-ms': { type: 'string' },
       code: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -6900,6 +8309,14 @@ async function main(argv) {
     trustedCidrs: values['trusted-cidr'],
     pairingMode: values['pairing-mode'],
     answerWaitMs: values['answer-wait-ms'] == null ? undefined : Number(values['answer-wait-ms']),
+    // 0.8.5-α §5 文件互传旋钮（给了才覆盖，否则走契约默认值）
+    fileAutoAccept: values['file-auto-accept'] === true ? true : undefined,
+    fileMaxBytes: values['file-max-bytes'] == null ? undefined : Number(values['file-max-bytes']),
+    fileInboxBytes: values['file-inbox-bytes'] == null ? undefined : Number(values['file-inbox-bytes']),
+    fileChunkBytes: values['file-chunk-bytes'] == null ? undefined : Number(values['file-chunk-bytes']),
+    filePendingTtlMs: values['file-pending-ttl-ms'] == null
+      ? undefined
+      : Number(values['file-pending-ttl-ms']),
     // 群：给了任何 --group* 才覆盖 group 配置，否则保持默认（关闭）
     group: (values.group || values['group-hub'] != null || values['group-name'] != null
       || values['group-auto-join'] || values['group-retention-days'] != null

@@ -21,6 +21,7 @@ import {
   probePeer,
 } from './peer-call.mjs';
 import { readPeerEvents } from './sse.mjs';
+import { resolveLang, t } from '../lib/i18n.mjs';
 // v0.8.2-α（契约 §1/§5）：@! 的解析口径与面板共用一份 —— 解析属于协议，不属于某一端。
 // 面板在管理接口里解析，CLI 在发完消息后解析，两边落在同一个函数上。
 import { parseGroupDispatchCommand } from '../lib/admin.mjs';
@@ -59,116 +60,18 @@ import {
 
 const DEFAULT_STATE_DIR = path.join(os.homedir(), '.dsh', 'lan-peers');
 
-const USAGE = [
-  'dsh-lan-peers — 局域网伙伴 CLI',
-  '',
-  '用法: dsh-lan-peers <子命令> [选项]',
-  '',
-  '子命令:',
-  '  code    生成一次性配对码（6 位，10 分钟，一次性）',
-  '  pair    用配对码与对端互认（ECDH 两轮，自动回退旧明文）',
-  '  peers   列出已配对伙伴',
-  '  ask     向伙伴派单并等待回复',
-  '  events  订阅伙伴 /v1/events 事件流（排障）',
-  '  unpair  解除与某个伙伴的配对（尽力通知对端）',
-  '  group   群聊：state / post / history / tail / join / probe / replica',
-  '  help    显示本帮助',
-  '',
-  '全局选项:',
-  '  --state-dir <路径>   状态目录（默认 ~/.dsh/lan-peers）',
-  '  --help               查看子命令用法',
-].join('\n');
+// v0.8.5-α §0.7b：输出语言。优先级 --lang > 配置 <stateDir>/config.json 的 lang > 自动探测
+// （环境变量 DSH_LAN_PEERS_LANG > 系统语言 > zh）。文案全在 lib/i18n.mjs，这里只取值。
+// 日志与协议字段不进词表：它们在任何语言下都是同样的稳定标识。
+let LANG = 'zh';
+const L = (key, params) => t(LANG, key, params);
 
-const CODE_USAGE = [
-  '用法: dsh-lan-peers code [--state-dir <目录>] [--url <本机管理接口>]',
-  '',
-  '请本机 host 生成一次性配对码（10 分钟有效，用后即焚）。',
-  'M6 起码只活在 host 进程内存里：本命令是独立进程，自己生成的码对正在跑的 host 无效，',
-  '所以必须先启动本机 host（或直接用界面面板的「生成配对码」）。',
-].join('\n');
-
-const PAIR_USAGE = [
-  '用法: dsh-lan-peers pair --url http://PEER:7788 --code 123456 [--name 本机名] [--peer-name 对端名] [--legacy-pair]',
-  '',
-  '默认自适应：对端 /v1/health 的 capability 含 "pair-ecdh" 时走 ECDH 两轮',
-  '（/v1/pair 交换临时公钥 → /v1/pair/confirm 用派生密钥包裹初始密钥），',
-  '否则回退 0.3.1 的明文 /v1/pair。',
-  '',
-  '  --legacy-pair   强制旧明文路径（对端 0.3.1 或排障用）',
-  '  --ecdh-pair     强制 ECDH，对端不支持则报错',
-  '  --base-url      本机对外的可达地址（默认自动探测私有 IPv4 + 7788；',
-  '                  会随配对请求发给对端，缺了它伙伴那边这条记录就没有地址）',
-  '  --port          自动探测地址时用的端口（默认 7788；只在没给 --base-url 时有效）',
-].join('\n');
-
-const PEERS_USAGE = [
-  '用法: dsh-lan-peers peers [--probe] [--state-dir <目录>]',
-  '',
-  '  --probe   逐个探活（GET /v1/health，2 秒超时）',
-].join('\n');
-
-const ASK_USAGE = [
-  '用法: dsh-lan-peers ask --peer <peerId|名字> "prompt" [--timeout 300] [--legacy-poll] [--wait-ms 25000]',
-  '',
-  '对端声明 "stream" 时走 /v1/events（SSE），否则 /v1/answer 长轮询；',
-  '--legacy-poll 强制 0.3.1 的 1.5 秒轮询（不带 waitMs）。',
-].join('\n');
-
-const EVENTS_USAGE = [
-  '用法: dsh-lan-peers events --peer <peerId|名字> --session <sessionId> [--duration 300] [--verbose]',
-  '',
-  '订阅对端 /v1/events：每条事件独立加密，此处解密后逐条打印。',
-  '对端 capability 不含 "stream" 时直接报错（0.3.1 没有该端点）。',
-  '',
-  '  --duration <秒>   最长订阅时间（默认 300）',
-  '  --verbose         同时打印 ping 心跳',
-].join('\n');
-
-const UNPAIR_USAGE = [
-  '用法: dsh-lan-peers unpair --peer <peerId|名字> [--local-only] [--timeout 10] [--state-dir <目录>]',
-  '',
-  '解除本端与某个伙伴的配对。默认先探活：对端声明 "unpair" 能力时发一次签名',
-  'POST /v1/unpair 让它也删掉本端；不可达/旧版本/失败都只记录原因，本地一定删除。',
-  '',
-  '  --local-only     跳过对端通知，只删本地记录',
-  '  --timeout <秒>   通知对端的超时（默认 10）',
-].join('\n');
-
-const GROUP_USAGE = [
-  '用法: dsh-lan-peers group <子命令> [--peer <hub 名字|peerId>] [--state-dir <目录>]',
-  '',
-  '子命令:',
-  '  state                     群信息 + 成员表（会拿到 groupKey，但不打印内容）',
-  '  post --text "..."         发一条消息 [--kind chat|progress|result|system]',
-  '                            正文含 @!名字 时作者侧自动派单（由本机 host 执行并打印回执摘要）',
-  '  dispatch <目标> <任务...>  等价发一条 "@!目标 任务" 并派单，打印回执摘要',
-  '  accept on|off             切换本机接单（写 profile 配置，热生效）',
-  '  history [--since N]       取历史消息 [--limit 1..200]',
-  '  tail [--since N]          跟随事件流并逐条打印 [--duration 秒]',
-  '  join [--name 显示名]      向 hub 自助加入（hub 开了 autoJoin 才成功）',
-  '  probe [--peer 名字|peerId] 群级探活：打印 peerId/epoch/lastSeq/可达地址',
-  '  replica                   打印本地群副本（groupId/epoch/leader/lastSeq/条数）',
-  '  leader [--peer X]         查看本机角色/epoch/租约（--peer 时改看对端 live 快照）',
-  '  claim [--url http://…]    手动接管：让本机立刻发起选举成为 leader',
-  '  find --name <群名>        按群名查找（先查本地已知群，再并发问所有伙伴，2 秒超时）',
-  '  apply --name <群名>       按群名申请入群：申请 → 轮询 → 拿到授权后落 group-key.json',
-  '  advertise                 把本机群名广播给我的伙伴（无节流，打印发送对象清单）',
-  '  archives                  列出 hub 侧归档文件（走本机回环管理接口，只读）',
-  '  archive-delete <file>     删除一个归档文件（不可撤销；seq 号不复用）',
-  '',
-  '  --peer        hub 的名字或 peerId；只有一个伙伴时可省略',
-  '  --name        join 时上报的本机显示名（不传则用 state.json 的名字 / hostname；',
-  '                同机跑多个节点时用它避免成员表撞名）',
-  '  --state-dir   状态目录（默认 ~/.dsh/lan-peers）',
-  '  --url         claim 的目标 / 归档接口要打的本机 host 地址（默认 http://127.0.0.1:7788）',
-  '  --hub-url     advertise 时对外公布的 hub 地址（默认取群成员表里 hub 自报的地址）',
-  '  --base-url    apply 时公布的申请者地址（默认留空，由介绍人按配对记录补）',
-  '  --timeout     apply 的等待秒数（默认 600 = 契约 §5.2 的 10 分钟上限）',
-  '  --interval    apply 的轮询毫秒数（默认 5000）',
-  '',
-  'group 端点只有 hub 提供；本机的伙伴列表里要先有 hub 的配对记录。',
-  'S3 起 leader 由选举产生：claim 打本机回环（群级签名，正文用本机实例 id）。',
-].join('\n');
+function applyLang(args) {
+  const config = readJson(path.join(stateDir(args), 'config.json'), {});
+  // --lang 是最高优先：给了就压过配置；非法值按 auto 处理，不抛错（与缺 key 回落同一口径）
+  const override = args.lang === undefined || args.lang === true ? undefined : String(args.lang);
+  LANG = resolveLang({ lang: override === undefined ? (config && config.lang) : override });
+}
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -219,7 +122,7 @@ function findPeer(dir, wanted) {
   const match = Object.entries(store.peers || {}).find(
     ([peerId, peer]) => peerId === wanted || peer.name === wanted,
   );
-  if (!match) throw new Error('未知对端: ' + wanted);
+  if (!match) throw new Error(L('cli.common.unknownPeer', { peer: wanted }));
   return { store, peerId: match[0], peer: match[1] };
 }
 
@@ -237,9 +140,10 @@ async function signedCall({ baseUrl, secret, senderId, method = 'GET', apiPath, 
  */
 async function cmdCode(args) {
   const dir = stateDir(args);
-  const url = String(args.url ?? '').trim() || ADMIN_DEFAULT_URL;
+  let url = '';
   let out;
   try {
+    url = resolveAdminUrl(dir, args);
     out = await adminCall(url, 'code', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -247,20 +151,19 @@ async function cmdCode(args) {
     }, dir);
   } catch (error) {
     const reason = String(error?.message ?? error);
-    process.stderr.write('生成配对码失败：本机 host 未接受 ' + url + '（' + reason + '）\n'
-      + '修法：请先启动本机 host（或用界面面板的「生成配对码」）—— 码只能在 host 进程里生成\n');
+    process.stderr.write(L('cli.code.hostRefused', { url: url || L('cli.common.localAdmin'), reason }) + '\n');
     process.exitCode = 2;
     return;
   }
   const code = String(out && out.code ? out.code : '').trim();
   if (!/^\d{6}$/.test(code)) {
-    process.stderr.write('生成配对码失败：本机 host 未按契约回 6 位码\n');
+    process.stderr.write(L('cli.code.badShape') + '\n');
     process.exitCode = 2;
     return;
   }
-  console.log('配对码: ' + code + '   有效期: 10 分钟，一次性');
-  console.log('对方把它填进「添加伙伴」里即可配对（地址填本机 http://<ip>:7788）');
-  console.log('提示: 这个码只在本机 host 进程里有效，重启 host 即失效');
+  console.log(L('cli.code.ok', { code }));
+  console.log(L('cli.code.hintFillPeer'));
+  console.log(L('cli.code.hintMemoryOnly'));
 }
 
 async function cmdPair(args) {
@@ -273,7 +176,7 @@ async function cmdPair(args) {
   //   label     — what we call the peer in our own list (--name / --peer-name)
   const selfName = String(me.name || os.hostname());
   const peerLabel = args.name || args['peer-name'];
-  if (!url || !code) throw new Error(PAIR_USAGE);
+  if (!url || !code) throw new Error(L('cli.help.pair'));
 
   const mode = args['legacy-pair'] ? 'legacy' : (args['ecdh-pair'] ? 'ecdh' : 'auto');
   // 把自己的可达地址一起发过去：接收方存进 peers.json 的该 peer 记录，
@@ -308,13 +211,11 @@ async function cmdPair(args) {
   writeJson(peersFile, store);
 
   const label = store.peers[paired.peerId].name;
-  const how = paired.transport === 'ecdh' ? 'ECDH 两轮' : '旧明文路径';
-  console.log('已配对: ' + label + ' (' + paired.peerId + ') · ' + how);
+  const transport = paired.transport === 'ecdh' ? L('cli.pair.transportEcdh') : L('cli.pair.transportLegacy');
+  console.log(L('cli.pair.ok', { label, peerId: paired.peerId, transport }));
   if (paired.transport === 'legacy') {
     const ecdhReady = await pairingEcdhAvailable();
-    console.log(ecdhReady
-      ? '提示: 对端未声明 pair-ecdh，已回退旧明文配对（初始密钥明文传输）'
-      : '提示: 本构建缺少 lib/pairing-ecdh.mjs，已回退旧明文配对（初始密钥明文传输）');
+    console.log(L(ecdhReady ? 'cli.pair.fallbackNoEcdh' : 'cli.pair.fallbackNoModule'));
   }
 }
 
@@ -323,7 +224,7 @@ async function cmdPeers(args) {
   const store = readJson(path.join(dir, 'peers.json'), { peers: {} });
   const entries = Object.entries(store.peers || {});
   if (entries.length === 0) {
-    console.log('（尚未配对任何对端）');
+    console.log(L('cli.peers.empty'));
     return;
   }
   for (const [peerId, peer] of entries) {
@@ -344,7 +245,7 @@ async function cmdAsk(args) {
   const dir = stateDir(args);
   const me = identity(dir);
   const prompt = args._.join(' ').trim();
-  if (!args.peer || !prompt) throw new Error(ASK_USAGE);
+  if (!args.peer || !prompt) throw new Error(L('cli.help.ask'));
   const { peer } = findPeer(dir, args.peer);
 
   const requestId = 'req-' + crypto.randomUUID();
@@ -357,7 +258,7 @@ async function cmdAsk(args) {
     body: { requestId, prompt, timeoutSec: Number(args.timeout || 300) },
   });
   const sessionId = accepted.sessionId;
-  process.stderr.write('已派单 → ' + peer.name + ' (session ' + sessionId + ')\n');
+  process.stderr.write(L('cli.ask.dispatched', { name: peer.name, sessionId }) + '\n');
 
   // Capability decides the wire shape: a 0.3.1 peer has no "stream", so it keeps
   // the old 1.5s answer polling (waitMs is never sent to it).
@@ -381,7 +282,7 @@ async function cmdAsk(args) {
     console.log(settled.reply);
     return;
   }
-  if (settled.status === 'error') throw new Error('对端返回错误: ' + settled.error);
+  if (settled.status === 'error') throw new Error(L('cli.ask.peerError', { error: settled.error }));
   console.log('timeout after ' + Math.round((settled.elapsedMs || 0) / 1000) + 's');
   process.exitCode = 2;
 }
@@ -391,18 +292,18 @@ async function cmdEvents(args) {
   const me = identity(dir);
   const sessionId = String(args.session || args['session-id'] || '');
   // Arguments first: a missing --session must not fall through to a peer lookup.
-  if (!args.peer || !sessionId) throw new Error(EVENTS_USAGE);
+  if (!args.peer || !sessionId) throw new Error(L('cli.help.events'));
   const { peer } = findPeer(dir, args.peer);
 
   const health = await probePeer({ baseUrl: peer.baseUrl, timeoutMs: 3000, fresh: true });
   if (!capabilityOf(health).includes('stream')) {
-    process.stderr.write('对端 /v1/health 未声明 "stream" 能力（0.3.1 无该端点），无法订阅事件\n');
+    process.stderr.write(L('cli.events.noStream') + '\n');
     process.exitCode = 2;
     return;
   }
 
   const durationMs = Math.max(1000, Number(args.duration || 300) * 1000);
-  process.stderr.write('订阅 ' + peer.name + ' 的 /v1/events (session ' + sessionId + ')\n');
+  process.stderr.write(L('cli.events.subscribed', { name: peer.name, sessionId }) + '\n');
   const out = await readPeerEvents({
     baseUrl: peer.baseUrl,
     secret: peer.secret,
@@ -419,11 +320,11 @@ async function cmdEvents(args) {
     },
   });
   if (!out.ok) {
-    process.stderr.write('订阅结束: ' + out.reason + '\n');
+    process.stderr.write(L('cli.events.ended', { reason: out.reason }) + '\n');
     process.exitCode = 1;
     return;
   }
-  process.stderr.write('终态: ' + out.status + '\n');
+  process.stderr.write(L('cli.events.finalStatus', { status: out.status }) + '\n');
 }
 
 /** 按 peerId 或名字精确解析；返回全部命中，交给调用方判歧义 */
@@ -442,12 +343,12 @@ function resolvePeers(dir, wanted) {
  */
 async function notifyUnpair({ peer, senderId, timeoutSec }) {
   const baseUrl = String(peer?.baseUrl ?? '').trim().replace(/\/+$/, '');
-  if (baseUrl === '') return { notified: false, reason: '未记录对端地址' };
-  if (!peer?.secret) return { notified: false, reason: '缺少对端密钥' };
+  if (baseUrl === '') return { notified: false, reason: L('cli.unpair.reasonNoAddress') };
+  if (!peer?.secret) return { notified: false, reason: L('cli.unpair.reasonNoSecret') };
   const probeMs = Math.max(500, Math.min(2000, timeoutSec * 1000));
   const health = await probePeer({ baseUrl, timeoutMs: probeMs, fresh: true });
-  if (!health?.online) return { notified: false, reason: '对端不可达' };
-  if (!capabilityOf(health).includes('unpair')) return { notified: false, reason: '对端不支持 unpair' };
+  if (!health?.online) return { notified: false, reason: L('cli.unpair.reasonOffline') };
+  if (!capabilityOf(health).includes('unpair')) return { notified: false, reason: L('cli.unpair.reasonNoCapability') };
   try {
     await callPeer({
       baseUrl,
@@ -466,17 +367,18 @@ async function notifyUnpair({ peer, senderId, timeoutSec }) {
 async function cmdUnpair(args) {
   const dir = stateDir(args);
   const wanted = String(args.peer ?? '').trim();
-  if (!wanted) throw new Error(UNPAIR_USAGE);
+  if (!wanted) throw new Error(L('cli.help.unpair'));
   const { matches } = resolvePeers(dir, wanted);
   if (matches.length === 0) {
-    process.stderr.write('未知对端: ' + wanted + '\n' + UNPAIR_USAGE + '\n');
+    process.stderr.write(L('cli.common.unknownPeer', { peer: wanted }) + '\n' + L('cli.help.unpair') + '\n');
     process.exitCode = 2;
     return;
   }
   if (matches.length > 1) {
-    process.stderr.write('对端名字有歧义: ' + wanted + ' 命中 ' + matches.length + ' 条，请改用 peerId\n');
+    process.stderr.write(L('cli.common.ambiguousPeer', { peer: wanted, count: matches.length }) + '\n');
     for (const [peerId, peer] of matches) {
-      process.stderr.write('  ' + (peer?.name || '(无名)') + '\t' + peerId + '\t' + (peer?.baseUrl || '(仅入站)') + '\n');
+      process.stderr.write('  ' + (peer?.name || L('cli.common.unnamed')) + '\t' + peerId + '\t'
+        + (peer?.baseUrl || L('cli.common.inboundOnly')) + '\n');
     }
     process.exitCode = 2;
     return;
@@ -485,7 +387,7 @@ async function cmdUnpair(args) {
   const label = peer?.name || peerId;
 
   const remote = args['local-only']
-    ? { notified: false, reason: '已跳过对端通知（--local-only）' }
+    ? { notified: false, reason: L('cli.unpair.skippedRemote') }
     : await notifyUnpair({
         peer,
         senderId: identity(dir).instanceId,
@@ -500,8 +402,8 @@ async function cmdUnpair(args) {
   }
 
   console.log(remote.notified
-    ? '已解除与 ' + label + ' 的配对（对端已同步删除）'
-    : '已解除与 ' + label + ' 的配对（仅本地；原因：' + (remote.reason || '未知') + '）');
+    ? L('cli.unpair.doneRemote', { label })
+    : L('cli.unpair.doneLocal', { label, reason: remote.reason || L('cli.common.unknown') }));
 }
 
 // ---------------------------------------------------------------------------
@@ -516,17 +418,17 @@ function resolveHubPeer(dir, wanted) {
     if (entries.length === 1) return { peerId: entries[0][0], peer: entries[0][1] };
     const candidates = entries.map(([, peer]) => String(peer?.name ?? '?')).join(' / ');
     throw new Error(
-      '需要一个 --peer（hub 的名字或 peerId）'
-        + (candidates ? '，候选: ' + candidates : '（本机还没有配对记录）')
-        + '\n' + GROUP_USAGE,
+      L('cli.group.needPeer')
+        + (candidates ? L('cli.group.needPeerCandidates', { list: candidates }) : L('cli.group.needPeerEmpty'))
+        + '\n' + L('cli.help.group'),
     );
   }
   const matches = entries.filter(([peerId, peer]) => peerId === target || String(peer?.name ?? '') === target);
-  if (matches.length === 0) throw new Error('未知对端: ' + target + '\n' + GROUP_USAGE);
+  if (matches.length === 0) throw new Error(L('cli.common.unknownPeer', { peer: target }) + '\n' + L('cli.help.group'));
   if (matches.length > 1) {
     throw new Error(
-      '对端名字有歧义: ' + target + ' 命中 ' + matches.length + ' 条，请改用 peerId\n'
-        + matches.map(([peerId, peer]) => '  ' + (peer?.name || '(无名)') + '\t' + peerId).join('\n'),
+      L('cli.common.ambiguousPeer', { peer: target, count: matches.length }) + '\n'
+        + matches.map(([peerId, peer]) => '  ' + (peer?.name || L('cli.common.unnamed')) + '\t' + peerId).join('\n'),
     );
   }
   return { peerId: matches[0][0], peer: matches[0][1] };
@@ -681,20 +583,23 @@ async function cmdGroupState(dir, args) {
   const { mode, peer, key } = resolveGroupConnection(dir, args);
   if (mode === 'peer') {
     const state = await fetchGroupState(peer);
-    console.log(
-      '群组: ' + state.name + ' (' + state.groupId + ')  epoch=' + state.epoch
-        + ' keyVersion=' + state.keyVersion + ' 成员=' + state.members.length,
-    );
+    console.log(L('cli.group.stateHeaderPeer', {
+      name: state.name,
+      groupId: state.groupId,
+      epoch: state.epoch,
+      keyVersion: state.keyVersion,
+      members: state.members.length,
+    }));
     for (const member of state.members) {
       console.log(
-        '  ' + (member.name || '(无名)') + '\t' + member.peerId
+        '  ' + (member.name || L('cli.common.unnamed')) + '\t' + member.peerId
           + '\t' + (member.online ? 'online' : 'offline')
           + '\tjoinedAt=' + (member.joinedAt ?? '?'),
       );
     }
     // 密钥本身永远不打印：只说「拿到了」
     const keyBytes = state.groupKey ? Buffer.from(String(state.groupKey), 'base64url').length : 0;
-    console.log('groupKey: ' + (keyBytes === 32 ? '已收到（32B，不显示）' : '未下发'));
+    console.log(L('cli.group.groupKeyLine', { value: keyBytes === 32 ? L('cli.group.groupKeyReceived') : L('cli.group.groupKeyNotSent') }));
     return;
   }
   // 只有群密钥（或 leader 没有配对记录）：probe 给世代/leader/lastSeq，pull 给成员表
@@ -715,18 +620,20 @@ async function cmdGroupState(dir, args) {
   const memberIds = Array.isArray(page?.memberIds) && page.memberIds.length > 0
     ? page.memberIds
     : Object.keys(key.members);
-  console.log(
-    '群组: ' + (key.groupName || String(probe?.name ?? key.hubName ?? ''))
-      + ' (' + String(probe?.groupId ?? key.groupId) + ')'
-      + '  epoch=' + (probe?.epoch ?? 0) + ' 成员=' + memberIds.length
-      + '（群级签名直连 ' + key.baseUrl + '，leader=' + (key.hubName || key.hubId.slice(0, 8)) + '）',
-  );
+  console.log(L('cli.group.stateHeaderKey', {
+    name: key.groupName || String(probe?.name ?? key.hubName ?? ''),
+    groupId: String(probe?.groupId ?? key.groupId),
+    epoch: probe?.epoch ?? 0,
+    members: memberIds.length,
+    baseUrl: key.baseUrl,
+    leader: key.hubName || key.hubId.slice(0, 8),
+  }));
   for (const peerId of memberIds) {
     const name = String(key.members?.[peerId]?.name ?? '');
-    console.log('  ' + (name || '(无名)') + '\t' + peerId
-      + '\t' + (peerId === key.senderId ? 'online(本机)' : ''));
+    console.log('  ' + (name || L('cli.common.unnamed')) + '\t' + peerId
+      + '\t' + (peerId === key.senderId ? L('cli.group.memberSelf') : ''));
   }
-  console.log('groupKey: 已在 group-key.json（32B，不显示）');
+  console.log(L('cli.group.groupKeyLine', { value: L('cli.group.groupKeyOnDisk') }));
 }
 
 /**
@@ -737,10 +644,10 @@ function formatDispatchLine(dispatch) {
   const data = dispatch && typeof dispatch === 'object' ? dispatch : {};
   const status = String(data.status ?? '');
   const who = String(data.targetName ?? '') || String(data.target ?? '') || '—';
-  if (status === 'skipped') return '未派单（消息里没有 @! 目标）: ' + String(data.reason ?? 'no-target');
+  if (status === 'skipped') return L('cli.group.dispatchSkipped', { reason: String(data.reason ?? 'no-target') });
   // M1：同名歧义是「用户得先选一个」，不是网络错误 —— 给出可操作的重发语法。
   if (status === 'failed' && String(data.reason ?? '') === 'ambiguous') {
-    return '派单 → ' + who + '：有多个同名成员，请用 @!名字 (短id) 重发';
+    return L('cli.group.dispatchAmbiguous', { who });
   }
   const parts = [];
   // done 也可能带 reason（契约 §1：多个 @! 只取第一个，reason=multi-target-ignored）。
@@ -750,9 +657,12 @@ function formatDispatchLine(dispatch) {
   const elapsed = Number(data.elapsedMs);
   if (Number.isFinite(elapsed) && elapsed >= 0) parts.push(Math.round(elapsed) + 'ms');
   const chars = Number(data.replyChars);
-  if (Number.isFinite(chars) && chars >= 0) parts.push(Math.round(chars) + '字');
-  return '派单 → ' + who + '：' + (status === 'done' ? 'done' : 'failed')
-    + (parts.length ? '（' + parts.join(' / ') + '）' : '');
+  if (Number.isFinite(chars) && chars >= 0) parts.push(L('cli.group.dispatchChars', { chars: Math.round(chars) }));
+  return L('cli.group.dispatchLine', {
+    who,
+    status: status === 'done' ? 'done' : 'failed',
+    detail: parts.length ? L('cli.group.dispatchDetail', { parts: parts.join(' / ') }) : '',
+  });
 }
 
 /**
@@ -764,9 +674,10 @@ function formatDispatchLine(dispatch) {
  * 静默把 "@!X 任务" 当成一条普普通通的群消息发出去，是最坏的一种失败。
  */
 async function triggerDispatch(args, command) {
-  const url = String(args.url ?? '').trim() || ADMIN_DEFAULT_URL;
+  let url = '';
   let out;
   try {
+    url = resolveAdminUrl(stateDir(args), args);
     out = await adminCall(url, 'group/dispatch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -778,14 +689,16 @@ async function triggerDispatch(args, command) {
     }, stateDir(args));
   } catch (error) {
     const reason = String(error?.message ?? error);
-    process.stderr.write('消息已发出，但派单未触发：本机 host 未响应 ' + url + '（' + reason + '）\n'
-      + '修法：先起本机 host（或对 --url 指向的管理接口重试 group dispatch）\n');
+    process.stderr.write(L('cli.group.dispatchNotTriggered', {
+      url: url || L('cli.common.localAdmin'),
+      reason,
+    }) + '\n');
     process.exitCode = 2;
     return;
   }
   const dispatch = out && out.dispatch && typeof out.dispatch === 'object' ? out.dispatch : null;
   if (!dispatch) {
-    process.stderr.write('派单未返回结果：本机 host 未按契约回 dispatch 摘要\n');
+    process.stderr.write(L('cli.group.dispatchNoSummary') + '\n');
     process.exitCode = 2;
     return;
   }
@@ -795,12 +708,12 @@ async function triggerDispatch(args, command) {
 
 /** 发一条群消息（post 与 dispatch 共用）；作者侧在 POST 之后按契约 §1 解析 @! 并派单。 */
 async function postGroupText(dir, args, text) {
-  if (!text) throw new Error(GROUP_USAGE);
+  if (!text) throw new Error(L('cli.help.group'));
   if (Array.from(text).length > GROUP_TEXT_MAX_CHARS) {
-    throw new Error('text 超过 ' + GROUP_TEXT_MAX_CHARS + ' 字符上限（hub 会回 413 payload-too-large）');
+    throw new Error(L('cli.group.textTooLong', { max: GROUP_TEXT_MAX_CHARS }));
   }
   const kind = String(args.kind ?? 'chat');
-  if (!GROUP_KINDS.includes(kind)) throw new Error('--kind 必须是 ' + GROUP_KINDS.join(' / '));
+  if (!GROUP_KINDS.includes(kind)) throw new Error(L('cli.group.badKind', { kinds: GROUP_KINDS.join(' / ') }));
   const channel = resolvePostChannel(dir, args);
   const sent = channel.mode === 'peer'
     ? await postGroup({ ...channel.peer, kind, text })
@@ -812,10 +725,11 @@ async function postGroupText(dir, args, text) {
       kind,
       text,
     });
-  console.log(
-    '已发送 seq=' + sent.seq + ' ts=' + new Date(Number(sent.ts)).toISOString()
-      + (channel.mode === 'group' ? '（群级签名直连 ' + channel.key.baseUrl + '）' : ''),
-  );
+  console.log(L('cli.group.sent', {
+    seq: sent.seq,
+    ts: new Date(Number(sent.ts)).toISOString(),
+    channel: channel.mode === 'group' ? L('cli.group.sentViaGroupKey', { baseUrl: channel.key.baseUrl }) : '',
+  }));
   // 只有 chat 参与解析：progress/result 本身就是回执，再解析一遍等于自己派自己。
   if (kind !== 'chat') return;
   const command = parseGroupDispatchCommand(text);
@@ -833,7 +747,7 @@ async function cmdGroupDispatch(dir, args) {
   const target = String(args._[1] ?? '').trim();
   const task = args._.slice(2).join(' ').trim() || String(args.text ?? '').trim();
   if (target === '' || task === '') {
-    throw new Error('用法: dsh-lan-peers group dispatch <目标> <任务...>\n' + GROUP_USAGE);
+    throw new Error(L('cli.group.dispatchUsage') + '\n' + L('cli.help.group'));
   }
   await postGroupText(dir, args, '@!' + target + ' ' + task);
 }
@@ -843,11 +757,12 @@ async function cmdGroupAccept(dir, args) {
   const wanted = String(args._[1] ?? '').trim().toLowerCase();
   const value = wanted === 'on' ? true : (wanted === 'off' ? false : null);
   if (value === null) {
-    throw new Error('用法: dsh-lan-peers group accept on|off\n' + GROUP_USAGE);
+    throw new Error(L('cli.group.acceptUsage') + '\n' + L('cli.help.group'));
   }
-  const url = String(args.url ?? '').trim() || ADMIN_DEFAULT_URL;
+  let url = '';
   let out;
   try {
+    url = resolveAdminUrl(dir, args);
     out = await adminCall(url, 'group/accept', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -855,14 +770,18 @@ async function cmdGroupAccept(dir, args) {
     }, dir);
   } catch (error) {
     const reason = String(error?.message ?? error);
-    process.stderr.write('切换接单失败：本机 host 未接受 ' + url + '（' + reason + '）\n'
-      + '修法：确认本机 host 在跑且群功能已启用（' + reason + ' 为 501 表示 host 还没接线）\n');
+    process.stderr.write(L('cli.group.acceptFailed', {
+      url: url || L('cli.common.localAdmin'),
+      reason,
+    }) + '\n');
     process.exitCode = /^(40[39]|501)\b/.test(reason) ? 2 : 1;
     return;
   }
   const applied = !(out && out.acceptDispatch === false);
-  console.log('本机接单：' + (applied ? '接单中' : '已关闭')
-    + (out && out.persisted === false ? '（仅本进程生效，重启后回到配置值）' : ''));
+  console.log(L('cli.group.acceptLine', {
+    state: applied ? L('cli.group.acceptOn') : L('cli.group.acceptOff'),
+    extra: out && out.persisted === false ? L('cli.group.acceptEphemeral') : '',
+  }));
 }
 
 async function cmdGroupHistory(dir, args) {
@@ -872,9 +791,11 @@ async function cmdGroupHistory(dir, args) {
   if (mode === 'peer') {
     const page = await fetchGroupHistory({ ...peer, sinceSeq: since, limit });
     for (const message of page.messages) console.log(formatGroupMessage(message));
-    process.stderr.write(
-      '群 ' + page.groupId + ' · ' + page.messages.length + ' 条 · lastSeq=' + page.lastSeq + '\n',
-    );
+    process.stderr.write(L('cli.group.historyPeer', {
+      groupId: page.groupId,
+      count: page.messages.length,
+      lastSeq: page.lastSeq,
+    }) + '\n');
     return;
   }
   // 只有群密钥：/v1/group/pull 是群级白名单里的读路径，语义与 history 一致（按 seq 补差）
@@ -888,10 +809,12 @@ async function cmdGroupHistory(dir, args) {
   });
   const messages = Array.isArray(page?.messages) ? page.messages : [];
   for (const message of messages) console.log(formatGroupMessage(message));
-  process.stderr.write(
-    '群 ' + String(page?.groupId ?? key.groupId) + ' · ' + messages.length + ' 条 · lastSeq='
-      + (page?.lastSeq ?? 0) + '（群级签名直连 ' + key.baseUrl + '）\n',
-  );
+  process.stderr.write(L('cli.group.historyKey', {
+    groupId: String(page?.groupId ?? key.groupId),
+    count: messages.length,
+    lastSeq: page?.lastSeq ?? 0,
+    baseUrl: key.baseUrl,
+  }) + '\n');
 }
 
 async function cmdGroupTail(dir, args) {
@@ -900,7 +823,7 @@ async function cmdGroupTail(dir, args) {
   const durationMs = Math.max(1000, Number(args.duration ?? 60) * 1000);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('duration-reached')), durationMs);
-  process.stderr.write('订阅群事件 sinceSeq=' + since + ' (' + Math.round(durationMs / 1000) + 's)\n');
+  process.stderr.write(L('cli.group.tailSubscribed', { since, seconds: Math.round(durationMs / 1000) }) + '\n');
   const out = await readGroupEvents({
     ...target,
     sinceSeq: since,
@@ -910,28 +833,29 @@ async function cmdGroupTail(dir, args) {
   });
   clearTimeout(timer);
   if (!out.ok && !out.aborted && out.reason !== 'stream-ended') {
-    process.stderr.write('订阅结束: ' + out.reason + '\n');
+    process.stderr.write(L('cli.events.ended', { reason: out.reason }) + '\n');
     process.exitCode = 1;
     return;
   }
-  process.stderr.write('订阅结束 lastSeq=' + out.lastSeq + '\n');
+  process.stderr.write(L('cli.group.tailEnded', { lastSeq: out.lastSeq }) + '\n');
 }
 
 async function cmdGroupJoin(dir, args) {
   const target = groupTarget(dir, args);
   // --name 只改本机在群里的显示名（hub 侧只允许写自己那一条）
   const name = typeof args.name === 'string' ? args.name.trim() : '';
-  if (args.name != null && name === '') throw new Error('--name 不能为空\n' + GROUP_USAGE);
+  if (args.name != null && name === '') throw new Error(L('cli.group.joinNameEmpty') + '\n' + L('cli.help.group'));
   try {
     const joined = await joinGroup({ ...target, name });
-    console.log(
-      '已加入群 ' + joined.groupId + ' epoch=' + joined.epoch
-        + (joined.name ? ' 显示名=' + joined.name : ''),
-    );
+    console.log(L('cli.group.joined', {
+      groupId: joined.groupId,
+      epoch: joined.epoch,
+      name: joined.name ? L('cli.group.joinedName', { name: joined.name }) : '',
+    }));
   } catch (error) {
     const text = String(error?.message ?? error);
     if (text.includes('403')) {
-      process.stderr.write('加入失败: hub 未允许自助加入（403 not-a-member），请让 hub 管理接口添加本机\n');
+      process.stderr.write(L('cli.group.joinForbidden') + '\n');
       process.exitCode = 2;
       return;
     }
@@ -946,20 +870,23 @@ async function cmdGroupJoin(dir, args) {
 async function cmdGroupProbe(dir, args) {
   const { peer } = resolveHubPeer(dir, args.peer);
   const baseUrl = String(peer.baseUrl ?? '').replace(/\/+$/, '');
-  if (baseUrl === '') throw new Error('对端没有记录地址，无法探测');
+  if (baseUrl === '') throw new Error(L('cli.group.probeNoAddress'));
   const senderId = identity(dir).instanceId;
   const localKey = readGroupKeyFile(dir);
   const info = localKey
     ? await probeGroupPeer({ baseUrl, groupKey: localKey.key, groupId: localKey.groupId, senderId })
     : await signedCall({ baseUrl, secret: peer.secret, senderId, method: 'GET', apiPath: '/v1/group/probe' });
-  console.log(
-    '探测: ' + (info?.name || peer.name || '?')
-      + ' peerId=' + (info?.peerId || '?')
-      + ' epoch=' + (info?.epoch ?? 0)
-      + ' lastSeq=' + (info?.lastSeq ?? 0),
-  );
-  console.log('  地址: ' + (info?.advertiseBaseUrl || '(未探测到私有地址)'));
-  console.log('  groupId=' + (info?.groupId || '-') + ' leader=' + (info?.leaderPeerId || '-'));
+  console.log(L('cli.group.probeLine', {
+    name: info?.name || peer.name || '?',
+    peerId: info?.peerId || '?',
+    epoch: info?.epoch ?? 0,
+    lastSeq: info?.lastSeq ?? 0,
+  }));
+  console.log(L('cli.group.probeAddress', { url: info?.advertiseBaseUrl || L('cli.group.probeNoPrivate') }));
+  console.log(L('cli.group.probeGroup', {
+    groupId: info?.groupId || '-',
+    leader: info?.leaderPeerId || '-',
+  }));
 }
 
 /** group replica：只读本地 <stateDir>/group-replica.json，不联网 */
@@ -967,18 +894,18 @@ function cmdGroupReplica(dir) {
   const file = path.join(dir, GROUP_REPLICA_FILE);
   const replica = readJson(file, null);
   if (!replica) {
-    console.log('本地没有群副本（' + file + '；成员启动并成功拉取后生成）');
+    console.log(L('cli.group.replicaMissing', { file }));
     return;
   }
   const messages = Array.isArray(replica.messages) ? replica.messages : [];
-  console.log(
-    '副本: groupId=' + (replica.groupId || '-')
-      + ' epoch=' + (replica.epoch ?? 0)
-      + ' leader=' + (replica.leaderPeerId || '-')
-      + ' lastSeq=' + (replica.lastSeq ?? 0)
-      + ' 条数=' + messages.length,
-  );
-  console.log('  文件: ' + file);
+  console.log(L('cli.group.replicaLine', {
+    groupId: replica.groupId || '-',
+    epoch: replica.epoch ?? 0,
+    leader: replica.leaderPeerId || '-',
+    lastSeq: replica.lastSeq ?? 0,
+    count: messages.length,
+  }));
+  console.log(L('cli.group.replicaFile', { file }));
 }
 
 /**
@@ -988,25 +915,24 @@ function cmdGroupReplica(dir) {
 async function cmdGroupLeader(dir, args) {
   const role = readGroupRoleFile(dir);
   if (!role) {
-    console.log('本机还没有角色状态（' + path.join(dir, GROUP_ROLE_FILE) + '）；'
-      + 'host 启动并启用群之后生成');
+    console.log(L('cli.group.roleMissing', { file: path.join(dir, GROUP_ROLE_FILE) }));
   } else {
     const remaining = role.leaseUntil > 0 ? Math.max(0, role.leaseUntil - Date.now()) : 0;
     const degraded = role.leaderPeerId === '' || Date.now() > role.leaseUntil;
-    console.log(
-      '角色: ' + role.role
-        + ' epoch=' + role.epoch
-        + ' leader=' + (role.leaderPeerId || '-')
-        + ' commitSeq=' + role.commitSeq
-        + ' 租约剩余=' + remaining + 'ms'
-        + (degraded ? '  [degraded]' : ''),
-    );
+    console.log(L('cli.group.roleLine', {
+      role: role.role,
+      epoch: role.epoch,
+      leader: role.leaderPeerId || '-',
+      commitSeq: role.commitSeq,
+      remaining,
+      degraded: degraded ? L('cli.group.degraded') : '',
+    }));
   }
   if (args.peer == null) return;
   const { peer } = resolveHubPeer(dir, args.peer);
   const baseUrl = String(peer.baseUrl ?? '').replace(/\/+$/, '');
   const localKey = readLocalGroupKey(dir);
-  if (!localKey) throw new Error('本机没有群密钥（group-key.json / group.json），无法用群级签名查询对端');
+  if (!localKey) throw new Error(L('cli.group.noGroupKeyLease'));
   const senderId = identity(dir).instanceId;
   const remote = await fetchGroupLease({
     baseUrl,
@@ -1014,16 +940,16 @@ async function cmdGroupLeader(dir, args) {
     groupId: localKey.groupId,
     senderId,
   });
-  console.log(
-    '对端: ' + (peer.name || peer.peerId)
-      + ' role=' + (remote?.role ?? '?')
-      + ' epoch=' + (remote?.epoch ?? '?')
-      + ' leader=' + (remote?.leaderPeerId || '-')
-      + ' commitSeq=' + (remote?.commitSeq ?? '?')
-      + ' pending=' + (remote?.pendingCount ?? '?')
-      + ' quorum=' + (remote?.quorum ?? '?')
-      + (remote?.degraded ? '  [degraded]' : ''),
-  );
+  console.log(L('cli.group.leaseLine', {
+    name: peer.name || peer.peerId,
+    role: remote?.role ?? '?',
+    epoch: remote?.epoch ?? '?',
+    leader: remote?.leaderPeerId || '-',
+    commitSeq: remote?.commitSeq ?? '?',
+    pending: remote?.pendingCount ?? '?',
+    quorum: remote?.quorum ?? '?',
+    degraded: remote?.degraded ? L('cli.group.degraded') : '',
+  }));
 }
 
 /**
@@ -1034,7 +960,7 @@ async function cmdGroupLeader(dir, args) {
 async function cmdGroupClaim(dir, args) {
   const baseUrl = String(args.url ?? 'http://127.0.0.1:7788').replace(/\/+$/, '');
   const localKey = readLocalGroupKey(dir);
-  if (!localKey) throw new Error('本机没有群密钥（group-key.json / group.json），先让 host 启用群');
+  if (!localKey) throw new Error(L('cli.group.noGroupKeyClaim'));
   const senderId = identity(dir).instanceId;
   const local = readGroupRoleFile(dir);
   const epoch = Math.max(1, (local?.epoch ?? 0) + 1);
@@ -1047,23 +973,20 @@ async function cmdGroupClaim(dir, args) {
     candidate: senderId,
   });
   if (reply?.vote === true && String(reply?.role ?? '') === 'leader') {
-    console.log(
-      '已接管为 leader: epoch=' + (reply.epoch ?? epoch)
-        + ' 本机=' + senderId,
-    );
+    console.log(L('cli.group.claimOk', { epoch: reply.epoch ?? epoch, senderId }));
     return;
   }
-  process.stderr.write(
-    '接管未成功: ' + (reply?.reason || 'vote-refused')
-      + ' 票数=' + (reply?.votes ?? '?') + '/' + (reply?.needed ?? '?')
-      + '（成员表 ' + (reply?.memberCount ?? '?') + ' 人；多数派分母是成员表全集，不是可达成员数）\n',
-  );
+  process.stderr.write(L('cli.group.claimFailed', {
+    reason: reply?.reason || 'vote-refused',
+    votes: reply?.votes ?? '?',
+    needed: reply?.needed ?? '?',
+    memberCount: reply?.memberCount ?? '?',
+  }) + '\n');
   // 契约 §3：落败者回到 follower 并更新 epoch —— 运维要立刻知道本机已经降级
-  process.stderr.write(
-    '本机当前角色=' + (reply?.role || 'follower')
-      + ' epoch=' + (reply?.epoch ?? '?')
-      + '（落败即降级；等对端回来后会由租约过期重新选举）\n',
-  );
+  process.stderr.write(L('cli.group.claimDemoted', {
+    role: reply?.role || 'follower',
+    epoch: reply?.epoch ?? '?',
+  }) + '\n');
   process.exitCode = 2;
 }
 
@@ -1074,11 +997,14 @@ async function cmdGroupClaim(dir, args) {
 // CLI 自己不去碰 stateDir 下的归档文件（那里只有 host 知道怎么读怎么写）。
 // ---------------------------------------------------------------------------
 
-const ADMIN_DEFAULT_URL = 'http://127.0.0.1:7788';
 const ADMIN_TIMEOUT_MS = 10000;
 // S3：管理接口要 X-Lan-Peers-Token。host 启动时把它写到 <stateDir>/admin-token（0600），
 // CLI 只读不写；token 本身绝不出现在 URL、日志或错误消息里（只说去哪读）。
 const ADMIN_TOKEN_FILE = 'admin-token';
+// 真机缺陷修复：管理接口挂在 **DSH web 端口**（NAS 3080、桌面每次重启还会变），而 7788 是
+// peer 端口 —— 不带 --url 时打 7788 必然 404 not-found。所以地址由 admin 侧在收到回环管理
+// 请求时记进 <stateDir>/admin-url（0600），CLI 只读不写；**这不是安全边界**，token 才是。
+const ADMIN_URL_FILE = 'admin-url';
 
 function readAdminToken(dir) {
   try {
@@ -1088,23 +1014,55 @@ function readAdminToken(dir) {
   }
 }
 
+function readAdminUrl(dir) {
+  try {
+    return fs.readFileSync(path.join(String(dir || DEFAULT_STATE_DIR), ADMIN_URL_FILE), 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 管理接口地址：`--url` → `<stateDir>/admin-url` → 报错。
+ * 绝不静默回落到 peer 端口（那是一条必然 404 的路，比报错更难查）。
+ */
+function resolveAdminUrl(dir, args = {}) {
+  const explicit = String(args.url ?? '').trim();
+  if (explicit !== '') return explicit.replace(/\/+$/, '');
+  const saved = readAdminUrl(dir);
+  if (saved !== '') return saved.replace(/\/+$/, '');
+  throw new Error(L('cli.admin.noUrl', {
+    file: path.join(String(dir || DEFAULT_STATE_DIR), ADMIN_URL_FILE),
+  }));
+}
+
 /** 打本机回环管理接口；非 2xx 抛 `<status> <error>` 形式的 Error（与 group-client 同款）。 */
 async function adminCall(baseUrl, apiPath, init, dir) {
-  const base = String(baseUrl || ADMIN_DEFAULT_URL).replace(/\/+$/, '');
+  const base = resolveAdminUrl(dir || DEFAULT_STATE_DIR, { url: baseUrl });
   const token = readAdminToken(dir);
   const headers = { ...(init && init.headers ? init.headers : {}) };
   if (token !== '') headers['X-Lan-Peers-Token'] = token;
-  const reply = await fetch(base + '/api/lan-peers/' + apiPath, {
-    ...init,
-    headers,
-    signal: AbortSignal.timeout(ADMIN_TIMEOUT_MS),
-  });
+  let reply;
+  try {
+    reply = await fetch(base + '/api/lan-peers/' + apiPath, {
+      ...init,
+      headers,
+      signal: AbortSignal.timeout(ADMIN_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // 桌面每次重启 web 端口都会变：admin-url 里的地址可能已经过期，这里必须说清怎么刷新。
+    throw new Error(L('cli.admin.unreachable', {
+      base,
+      reason: String(error?.message ?? error),
+      file: path.join(String(dir || DEFAULT_STATE_DIR), ADMIN_URL_FILE),
+    }));
+  }
   const body = await reply.json().catch(() => ({}));
   if (!reply.ok) {
     const status = reply.status;
     const where = path.join(String(dir || DEFAULT_STATE_DIR), ADMIN_TOKEN_FILE);
     // 401 一定是 token 缺失/不匹配：直接指路（host 启动时写入，权限 0600）。
-    const hint = status === 401 ? '（管理接口需要 token：确认本机 host 在跑，且 ' + where + ' 可读）' : '';
+    const hint = status === 401 ? L('cli.admin.tokenHint', { file: where }) : '';
     throw new Error(status + ' ' + String(body.error || 'admin-call-failed') + hint);
   }
   return body;
@@ -1113,7 +1071,7 @@ async function adminCall(baseUrl, apiPath, init, dir) {
 /** 归档接口的失败口径：403/409 是「本机现在做不了这件事」（exit 2），其余算失败（exit 1）。 */
 function reportArchiveError(error) {
   const text = String(error && error.message ? error.message : error);
-  process.stderr.write('归档操作失败: ' + text + '\n');
+  process.stderr.write(L('cli.group.archiveFailed', { text }) + '\n');
   process.exitCode = /^40[39]\b/.test(text) ? 2 : 1;
 }
 
@@ -1127,7 +1085,7 @@ async function cmdGroupArchives(dir, args) {
   }
   const list = Array.isArray(out?.archives) ? out.archives : [];
   if (list.length === 0) {
-    console.log('没有归档（hub 侧还没有归档文件）');
+    console.log(L('cli.group.archiveEmpty'));
     return;
   }
   const sum = list.reduce((total, item) => total + (Number(item?.bytes) || 0), 0);
@@ -1136,20 +1094,21 @@ async function cmdGroupArchives(dir, args) {
     const from = item?.fromSeq == null ? '—' : item.fromSeq;
     const to = item?.toSeq == null ? '—' : item.toSeq;
     const count = item?.count == null ? '?' : item.count;
-    console.log(
-      String(item?.file ?? '(未命名)')
-        + '\tseq ' + from + '-' + to
-        + '\t' + count + ' 条'
-        + '\t' + (Number(item?.bytes) || 0) + 'B'
-        + '\t' + String(item?.createdAt ?? '?'),
-    );
+    console.log(L('cli.group.archiveRow', {
+      file: String(item?.file ?? L('cli.group.archiveUnnamed')),
+      from,
+      to,
+      count,
+      bytes: Number(item?.bytes) || 0,
+      createdAt: String(item?.createdAt ?? '?'),
+    }));
   }
-  process.stderr.write('共 ' + list.length + ' 个归档 · ' + total + ' 字节\n');
+  process.stderr.write(L('cli.group.archivesTotal', { count: list.length, bytes: total }) + '\n');
 }
 
 async function cmdGroupArchiveDelete(dir, args) {
   const file = String(args._[1] ?? args.file ?? '').trim();
-  if (file === '') throw new Error('用法: dsh-lan-peers group archive-delete <file>\n' + GROUP_USAGE);
+  if (file === '') throw new Error(L('cli.group.archiveDeleteUsage') + '\n' + L('cli.help.group'));
   let out;
   try {
     out = await adminCall(args.url, 'group/archives', {
@@ -1162,8 +1121,10 @@ async function cmdGroupArchiveDelete(dir, args) {
     return;
   }
   const removed = Number(out?.removedBytes);
-  console.log('已删除归档 ' + file
-    + (Number.isFinite(removed) && removed > 0 ? '，释放 ' + removed + ' 字节' : ''));
+  console.log(L('cli.group.archiveDeleted', {
+    file,
+    released: Number.isFinite(removed) && removed > 0 ? L('cli.group.archiveReleased', { bytes: removed }) : '',
+  }));
 }
 
 
@@ -1277,7 +1238,7 @@ async function localMatches(dir, wanted, args = {}) {
  */
 async function findGroupMatches(dir, rawName, args = {}) {
   const wanted = normalizeGroupName(rawName);
-  if (wanted === '') throw new Error('需要 --name <群名>\n' + GROUP_USAGE);
+  if (wanted === '') throw new Error(L('cli.find.needName') + '\n' + L('cli.help.group'));
   const local = await localMatches(dir, wanted, args);
   if (local.length > 0) return { matches: local, source: 'local', failed: [] };
   const peers = peerEntries(dir).filter((peer) => peer.baseUrl !== '');
@@ -1305,43 +1266,42 @@ async function findGroupMatches(dir, rawName, args = {}) {
 
 function printMatches(matches) {
   for (const match of matches) {
-    process.stdout.write(
-      '· ' + (match.name || '(无名)')
-      + '  groupId=' + String(match.groupId ?? '').slice(0, 8) + '…'
-      + '  hub=' + (match.hub?.name || String(match.hub?.peerId ?? '').slice(0, 8) || '?')
-      + '  介绍人=' + (match.via?.name || String(match.via?.peerId ?? '').slice(0, 8) || '?')
-      + '\n',
-    );
+    process.stdout.write(L('cli.find.matchLine', {
+      name: match.name || L('cli.common.unnamed'),
+      groupId: String(match.groupId ?? '').slice(0, 8),
+      hub: match.hub?.name || String(match.hub?.peerId ?? '').slice(0, 8) || '?',
+      via: match.via?.name || String(match.via?.peerId ?? '').slice(0, 8) || '?',
+    }) + '\n');
   }
 }
 
 async function cmdGroupFind(dir, args) {
   const found = await findGroupMatches(dir, args.name, args);
   if (found.matches.length === 0) {
-    process.stderr.write(
-      '未发现群名「' + normalizeGroupName(args.name) + '」'
-        + '（本地 known-groups 为空，向 ' + (found.peers ?? 0) + ' 个伙伴查找均未命中）\n',
-    );
+    process.stderr.write(L('cli.find.notFound', {
+      name: normalizeGroupName(args.name),
+      peers: found.peers ?? 0,
+    }) + '\n');
     process.exitCode = 2;
     return;
   }
-  if (found.source === 'local') process.stderr.write('（本地命中，未联网）\n');
+  if (found.source === 'local') process.stderr.write(L('cli.find.localHit') + '\n');
   printMatches(found.matches);
   if (found.matches.length > 1) {
-    process.stderr.write('命中 ' + found.matches.length + ' 个同名群：apply 时用 --peer <介绍人> 或 --group <groupId> 指定\n');
+    process.stderr.write(L('cli.find.multiHit', { count: found.matches.length }) + '\n');
   }
   for (const failure of found.failed) {
-    process.stderr.write('（' + (failure.name || failure.peerId) + ' 查找失败: ' + failure.reason + '）\n');
+    process.stderr.write(L('cli.find.failure', { name: failure.name || failure.peerId, reason: failure.reason }) + '\n');
   }
 }
 
 async function cmdGroupApply(dir, args) {
   const wanted = normalizeGroupName(args.name);
-  if (wanted === '') throw new Error('需要 --name <群名>\n' + GROUP_USAGE);
+  if (wanted === '') throw new Error(L('cli.find.needName') + '\n' + L('cli.help.group'));
   const self = identity(dir);
   const found = await findGroupMatches(dir, wanted, args);
   if (found.matches.length === 0) {
-    process.stderr.write('未发现群「' + wanted + '」：先让群里的人把群名广播给你，或用 group find 确认\n');
+    process.stderr.write(L('cli.apply.notFound', { name: wanted }) + '\n');
     process.exitCode = 2;
     return;
   }
@@ -1355,7 +1315,7 @@ async function cmdGroupApply(dir, args) {
         || entry.groupId === wantedTarget
         || String(entry.groupId).slice(0, 8) === wantedTarget);
     if (!picked) {
-      process.stderr.write('命中 ' + found.matches.length + ' 个同名群，请用 --peer <介绍人> 或 --group <groupId> 指定：\n');
+      process.stderr.write(L('cli.apply.multiHit', { count: found.matches.length }) + '\n');
       printMatches(found.matches);
       process.exitCode = 2;
       return;
@@ -1364,7 +1324,7 @@ async function cmdGroupApply(dir, args) {
   }
   const introducer = peerEntries(dir).find((peer) => peer.peerId === match.via?.peerId) ?? null;
   if (!introducer) {
-    throw new Error('命中的介绍人不在伙伴列表里（' + String(match.via?.peerId ?? '').slice(0, 8) + '），无法签名申请');
+    throw new Error(L('cli.apply.introducerMissing', { peerId: String(match.via?.peerId ?? '').slice(0, 8) }));
   }
   const intervalMs = Math.max(200, Number(args.interval ?? GROUP_APPLY_POLL_INTERVAL_MS) || GROUP_APPLY_POLL_INTERVAL_MS);
   const budgetMs = Math.max(1, Number(args.timeout ?? 0) > 0
@@ -1383,15 +1343,16 @@ async function cmdGroupApply(dir, args) {
   };
   const applied = await applyToGroup({ ...target, applicant });
   if (applied.status === 'rejected') {
-    process.stderr.write('申请被拒绝：' + (applied.reason || 'rejected') + '\n');
+    process.stderr.write(L('cli.apply.rejected', { reason: applied.reason || 'rejected' }) + '\n');
     process.exitCode = 2;
     return;
   }
-  process.stdout.write(
-    '已向 ' + (match.via?.name || String(match.via?.peerId).slice(0, 8))
-    + ' 提交入群申请（群 ' + (match.name || wanted) + '，groupId ' + String(match.groupId).slice(0, 8) + '…）'
-    + '状态=' + applied.status + '\n',
-  );
+  process.stdout.write(L('cli.apply.submitted', {
+    via: match.via?.name || String(match.via?.peerId).slice(0, 8),
+    name: match.name || wanted,
+    groupId: String(match.groupId).slice(0, 8),
+    status: applied.status,
+  }) + '\n');
 
   const deadline = Date.now() + budgetMs;
   let polls = 0;
@@ -1409,53 +1370,53 @@ async function cmdGroupApply(dir, args) {
       // 轮询期间的网络抖动不该让申请作废：记一行、按节奏继续等（契约 §5.2 的 10 分钟窗口）
       failures += 1;
       if (failures <= 3) {
-        process.stderr.write('轮询失败（第 ' + failures + ' 次，继续等待）: '
-          + String(error?.message ?? error).slice(0, 80) + '\n');
+        process.stderr.write(L('cli.apply.pollFailed', {
+          attempt: failures,
+          reason: String(error?.message ?? error).slice(0, 80),
+        }) + '\n');
       }
       continue;
     }
     lastStatus = polled.status;
     if (polled.status === 'rejected') {
-      process.stderr.write('申请被拒绝：' + (polled.reason || 'rejected') + '\n');
+      process.stderr.write(L('cli.apply.rejected', { reason: polled.reason || 'rejected' }) + '\n');
       process.exitCode = 2;
       return;
     }
     if (polled.status === 'approved' && polled.grant) {
       const written = applyGroupGrant(dir, polled.grant);
       const memberCount = Object.keys(written.members || {}).length;
-      process.stdout.write(
-        '已入群：' + (normalizeGroupName(polled.grant.name) || match.name)
-        + '（groupId ' + String(written.groupId).slice(0, 8) + '…）'
-        + ' keyVersion=' + (Number(polled.grant.keyVersion ?? polled.grant.epoch) || written.epoch)
-        + ' 成员=' + memberCount
-        + '（群密钥已写入 group-key.json，不显示）\n',
-      );
+      process.stdout.write(L('cli.apply.granted', {
+        name: normalizeGroupName(polled.grant.name) || match.name,
+        groupId: String(written.groupId).slice(0, 8),
+        keyVersion: Number(polled.grant.keyVersion ?? polled.grant.epoch) || written.epoch,
+        members: memberCount,
+      }) + '\n');
       await broadcastOwnGroupName(dir, args, { quiet: true });
       return;
     }
     if (polled.status === 'approved') {
-      process.stdout.write('本机已经是该群成员（无需授权）\n');
+      process.stdout.write(L('cli.apply.alreadyMember') + '\n');
       return;
     }
   }
-  process.stderr.write(
-    '仍在待批准（已等 ' + Math.round(budgetMs / 1000) + ' 秒，最后状态=' + lastStatus + '），稍后重试: group apply --name ' + wanted + '\n',
-  );
+  process.stderr.write(L('cli.apply.pending', {
+    seconds: Math.round(budgetMs / 1000),
+    status: lastStatus,
+    name: wanted,
+  }) + '\n');
   process.exitCode = 2;
 }
 
 /** 手动广播：把本机群名发给所有非成员伙伴（无节流），返回并打印对象清单 */
 async function broadcastOwnGroupName(dir, args = {}, { quiet = false } = {}) {
   const own = await resolveLocalIdentity(dir, args);
-  if (!own) throw new Error('本机没有群（group.json / group-key.json 都没有），先当 hub 或先入群');
+  if (!own) throw new Error(L('cli.advertise.noGroup'));
   const override = normalizeGroupName(args.name);
   if (override !== '') own.name = override;
   if (own.name === '') {
     // 群名未知就不发：宁可什么都不广播，也不把配置默认值 'default' 当成真群名发给伙伴
-    throw new Error(
-      '本机群名未知（group-key.json 没有 groupName、也联系不上 hub 取权威群名）。'
-        + '先让 host 拉到群状态，或用 --name <群名> 明确指定要广播的名字',
-    );
+    throw new Error(L('cli.advertise.nameUnknown'));
   }
   const peers = peerEntries(dir).filter((peer) => peer.secret !== undefined);
   const out = await broadcastGroupAdvertisement({
@@ -1466,10 +1427,12 @@ async function broadcastOwnGroupName(dir, args = {}, { quiet = false } = {}) {
     stateDir: dir,
   });
   if (!quiet) {
-    process.stdout.write(
-      '广播群名「' + own.name + '」（groupId ' + own.groupId.slice(0, 8) + '…）'
-      + '：发出 ' + out.sent.length + ' 个，跳过 ' + out.skipped.length + ' 个\n',
-    );
+    process.stdout.write(L('cli.advertise.summary', {
+      name: own.name,
+      groupId: own.groupId.slice(0, 8),
+      sent: out.sent.length,
+      skipped: out.skipped.length,
+    }) + '\n');
     for (const entry of out.sent) {
       process.stdout.write('  → ' + (entry.name || entry.peerId.slice(0, 8)) + '  ' + entry.baseUrl + '\n');
     }
@@ -1479,7 +1442,7 @@ async function broadcastOwnGroupName(dir, args = {}, { quiet = false } = {}) {
       );
     }
   } else if (out.sent.length > 0) {
-    process.stdout.write('已把群名广播给 ' + out.sent.length + ' 个非成员伙伴\n');
+    process.stdout.write(L('cli.advertise.sentOnly', { count: out.sent.length }) + '\n');
   }
   return out;
 }
@@ -1491,7 +1454,7 @@ async function cmdGroupAdvertise(dir, args) {
 async function cmdGroup(args) {
   const sub = String(args._[0] ?? '');
   if (!sub || sub === 'help') {
-    console.log(GROUP_USAGE);
+    console.log(L('cli.help.group'));
     return;
   }
   const dir = stateDir(args);
@@ -1514,19 +1477,525 @@ async function cmdGroup(args) {
     'archive-delete': cmdGroupArchiveDelete,
   };
   const handler = handlers[sub];
-  if (!handler) throw new Error('未知 group 子命令: ' + sub + '\n' + GROUP_USAGE);
+  if (!handler) throw new Error(L('cli.group.unknownSub', { sub }) + '\n' + L('cli.help.group'));
   try {
     return await handler(dir, args);
   } catch (error) {
     const text = String(error?.message ?? error);
     // 权限类失败（非成员/未启用/不是 leader）单独给 exit 2：和 unpair「找不到对端」同一档
     if (/^40[34]\b/.test(text)) {
-      process.stderr.write('群操作被拒绝: ' + text + '\n');
+      process.stderr.write(L('cli.group.rejected', { text }) + '\n');
       process.exitCode = 2;
       return;
     }
     throw error;
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.5-α 文件互传（契约 §3/§4，Lane F2）
+//
+// 三条命令都只打本机回环管理接口（/api/lan-peers/files*）：CLI 是独立进程，
+// 伙伴密钥与分块加密都在 host 里，本进程不可能也不该自己推数据。
+// 日志/输出口径（契约 §0）：只报 size、sha256、状态与来源，不打印文件内容。
+// ---------------------------------------------------------------------------
+
+/** 403/409/501 = 本机现在做不了这件事（exit 2）；其余算失败（exit 1）。 */
+function reportFilesError(error) {
+  const text = String(error && error.message ? error.message : error);
+  process.stderr.write(L('cli.file.failed', { text }) + '\n');
+  process.exitCode = /^(40[39]|501)\b/.test(text) ? 2 : 1;
+}
+
+/**
+ * 发送期间的进度轮询（契约 §4 只读 GET /api/lan-peers/files/progress?id=…）。
+ *
+ * 每一拍先看有没有 id：有就查 progress 打「已发 X/Y 字节（Z%）」，没有就打「已用 Ns」。
+ * 唯一的坑是 id 的时机 —— 本机 send 的 transferId 由 host 内部生成、随结果一起返回
+ * （host/server.mjs:6371 生成、:6450 从接收方 complete 响应取回），也就是说发送期间
+ * 本机手上没有可查的 id，这一路必然先走「已用 Ns」。等 send 提前给 id（或面板在收件侧
+ * 拿到 id）时，同一个循环会直接用上字节数，不需要第二次发送。
+ * 查不到（404/501/401/超时）**静默降级**成已用时长：进度是锦上添花，绝不能让 send 失败。
+ * 非 TTY 不刷（管道里刷 \r 只会污染输出）；测试/排障用 DSH_LAN_PEERS_PROGRESS=1 强制开。
+ */
+function startFileProgress({ dir, url, size, idSource, intervalMs = 500 }) {
+  const forced = String(process.env.DSH_LAN_PEERS_PROGRESS ?? '').trim() === '1';
+  if (!forced && process.stderr.isTTY !== true) return { stop() {} };
+  const started = Date.now();
+  let stopped = false;
+  let painted = false;
+  let degraded = false;
+  const paint = (line) => {
+    if (stopped) return;
+    process.stderr.write('\r  ' + line + '   ');
+    painted = true;
+  };
+  const elapsedLine = () => paint(L('cli.file.progressElapsed', { seconds: Math.round((Date.now() - started) / 1000) }));
+  const timer = setInterval(() => {
+    const id = String(idSource() ?? '').trim();
+    if (id === '' || degraded) {
+      elapsedLine();
+      return;
+    }
+    adminCall(url, 'files/progress?id=' + encodeURIComponent(id), undefined, dir)
+      .then((out) => {
+        const received = Number(out?.received);
+        const total = Number(out?.size) > 0 ? Number(out.size) : size;
+        if (!Number.isFinite(received) || !(total > 0)) {
+          elapsedLine();
+          return;
+        }
+        const pct = Math.max(0, Math.min(100, Math.round((received / total) * 100)));
+        paint(L('cli.file.progressBytes', { received, total, pct }));
+      })
+      .catch(() => {
+        // 拿不到进度：这一趟就退回已用时长，既不重试也不把错误抛给 send。
+        degraded = true;
+        elapsedLine();
+      });
+  }, intervalMs);
+  timer.unref?.();
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+      if (painted) process.stderr.write('\r' + ' '.repeat(36) + '\r');
+    },
+  };
+}
+
+async function cmdSendFile(args) {
+  const dir = stateDir(args);
+  const wanted = String(args._[0] ?? '').trim();
+  const raw = String(args._[1] ?? '').trim();
+  if (wanted === '' || raw === '') {
+    throw new Error(L('cli.file.sendFileUsage') + '\n' + L('cli.help.sendFile'));
+  }
+  const { peerId, peer } = findPeer(dir, wanted);
+  const file = path.resolve(raw);
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    throw new Error(L('cli.file.notFound', { file: raw }));
+  }
+  if (!stat.isFile()) throw new Error(L('cli.file.notRegular', { file: raw }));
+  const peerLabel = String(peer?.name ?? peerId);
+  // 地址先解析好：未知地址要在「发送中」之前就报，而不是先喊一声再失败。
+  let adminUrl;
+  try {
+    adminUrl = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportFilesError(error);
+    return;
+  }
+  process.stderr.write(L('cli.common.sending', { label: peerLabel, bytes: stat.size }) + '\n');
+  // id 目前是 send 返回时才有的，所以这一趟先滚「已用 Ns」；一拿到 id 就填进 holder，
+  // 下一拍（如果还没结束）自动切成「已发 X/Y 字节」——同一条代码路径，不重发。
+  let transferId = '';
+  const progress = startFileProgress({ dir, url: adminUrl, size: stat.size, idSource: () => transferId });
+  let out;
+  try {
+    out = await adminCall(adminUrl, 'files/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peerId, path: file }),
+    }, dir);
+  } catch (error) {
+    progress.stop();
+    reportFilesError(error);
+    return;
+  }
+  transferId = String(out?.id ?? '');
+  progress.stop();
+  const bytes = Number.isFinite(Number(out?.bytes)) ? Number(out.bytes) : stat.size;
+  const sha256 = String(out?.sha256 ?? '');
+  const ms = Number.isFinite(Number(out?.ms)) ? Number(out.ms) : 0;
+  console.log(L('cli.file.sent', { id: String(out?.id ?? ''), bytes, sha256, ms }));
+}
+
+const inboxSha = (row) => {
+  const sha = String(row?.sha256 ?? '');
+  return sha === '' ? '-' : sha;
+};
+const inboxFrom = (row) => {
+  const from = row?.from;
+  return String(from?.name ?? from?.peerId ?? '-') || '-';
+};
+const inboxAt = (row) => {
+  const at = Number(row?.at);
+  return Number.isFinite(at) && at > 0 ? new Date(at).toISOString() : '-';
+};
+
+async function cmdInboxList(dir, args) {
+  let out;
+  try {
+    out = await adminCall(args.url, 'files', undefined, dir);
+  } catch (error) {
+    reportFilesError(error);
+    return;
+  }
+  const pending = Array.isArray(out?.pending) ? out.pending : [];
+  const inbox = Array.isArray(out?.inbox) ? out.inbox : [];
+  const line = (row, tag) => [
+    tag,
+    String(row?.id ?? '-'),
+    String(row?.name ?? '-'),
+    (Number.isFinite(Number(row?.size)) ? Number(row.size) : 0) + 'B',
+    'sha256 ' + inboxSha(row),
+    'from ' + inboxFrom(row),
+    inboxAt(row),
+  ].join('\t');
+  for (const row of pending) console.log(line(row, L('cli.inbox.tagPending')));
+  for (const row of inbox) console.log(line(row, L('cli.inbox.tagReceived')));
+  process.stderr.write(L('cli.inbox.summary', { pending: pending.length, inbox: inbox.length }) + '\n');
+}
+
+async function cmdInboxDecide(dir, args, action) {
+  const id = String(args._[1] ?? args.id ?? '').trim();
+  if (id === '') {
+    throw new Error(L('cli.inbox.usageDecide', { action }) + '\n' + L('cli.help.inbox'));
+  }
+  let out;
+  try {
+    out = await adminCall(args.url, 'files/' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    }, dir);
+  } catch (error) {
+    reportFilesError(error);
+    return;
+  }
+  if (action === 'accept') {
+    console.log(L('cli.inbox.accepted', { id, path: String(out?.path ?? '') }));
+    return;
+  }
+  console.log(L('cli.inbox.rejected', { id }));
+}
+
+async function cmdInbox(args) {
+  const sub = String(args._[0] ?? '');
+  if (sub === '' || sub === 'help') {
+    console.log(L('cli.help.inbox'));
+    return;
+  }
+  const dir = stateDir(args);
+  if (sub === 'list') return cmdInboxList(dir, args);
+  if (sub === 'accept' || sub === 'reject') return cmdInboxDecide(dir, args, sub);
+  throw new Error(L('cli.inbox.unknownSub', { sub }) + '\n' + L('cli.help.inbox'));
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.5-α 私聊（契约 §4/§5，Lane G2）
+//
+// 私聊是 1:1 连续会话：会话、per-peer 签名/加密与落盘全在 host 里，CLI 是独立进程，
+// 不可能也不该自己推数据 —— 三条命令都只打本机回环管理接口。
+// 输出口径（契约 §0）：stdout 里的正文是用户自己要看的，但正文绝不进群、不进日志；
+// 失败只报状态码与 reason。
+// ---------------------------------------------------------------------------
+
+// 契约 §1：权限三档（由低到高）。协议值，任何语言下都是英文原样。
+const DISPATCH_PERMISSIONS = ['read-only', 'workspace-write', 'danger-full-access'];
+
+/** 401/403/409/501 = 本机现在做不了（exit 2）；其余算失败（exit 1）。 */
+function reportDispatchError(error) {
+  const text = String(error && error.message ? error.message : error);
+  process.stderr.write(L('cli.dispatch.failed', { text }) + '\n');
+  process.exitCode = /^(401|403|409|501)\b/.test(text) ? 2 : 1;
+}
+
+/** 剩余秒数：过期时间缺失或已过都按 0（CLI 只做展示，判定在对端）。 */
+function dispatchRemaining(expiresAt) {
+  const left = Math.ceil((Number(expiresAt) - Date.now()) / 1000);
+  return Number.isFinite(left) && left > 0 ? left : 0;
+}
+
+/** dispatch pending：逐行 id / 来自 / 工作区 / 权限 / 剩余秒数（没有就一行说明）。 */
+async function cmdDispatchPending(dir, args) {
+  let url;
+  try {
+    url = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportDispatchError(error);
+    return;
+  }
+  let out;
+  try {
+    out = await adminCall(url, 'dispatch/pending', undefined, dir);
+  } catch (error) {
+    reportDispatchError(error);
+    return;
+  }
+  const items = Array.isArray(out && out.items) ? out.items : [];
+  if (items.length === 0) {
+    process.stderr.write(L('cli.dispatch.pendingEmpty') + '\n');
+    return;
+  }
+  for (const item of items) {
+    console.log(L('cli.dispatch.row', {
+      id: String(item?.approvalId ?? ''),
+      from: String(item?.from ?? '').slice(0, 8) || '-',
+      workspaceId: String(item?.workspaceId ?? ''),
+      workspaceName: String(item?.workspaceName ?? '') || '-',
+      permission: String(item?.permission ?? ''),
+      sec: dispatchRemaining(item?.expiresAt),
+    }));
+  }
+  process.stderr.write(L('cli.dispatch.summary', { count: items.length }) + '\n');
+}
+
+/** dispatch approve|reject <approvalId>：只转发结论，不在本地拍板。 */
+async function cmdDispatchDecide(dir, args, action) {
+  const approvalId = String(args._[1] ?? '').trim();
+  if (approvalId === '') throw new Error(L('cli.dispatch.idRequired') + '\n' + L('cli.dispatch.usage'));
+  let url;
+  try {
+    url = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportDispatchError(error);
+    return;
+  }
+  let out;
+  try {
+    out = await adminCall(url, 'dispatch/' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: approvalId }),
+    }, dir);
+  } catch (error) {
+    reportDispatchError(error);
+    return;
+  }
+  const key = action === 'approve' ? 'cli.dispatch.approved' : 'cli.dispatch.rejected';
+  console.log(L(key, { id: approvalId, state: String(out?.state ?? '-') }));
+}
+
+/** 打印本机派单设置（本机视角，含 path —— 与面板设置页同一份口径）。 */
+function printDispatchSettings(view) {
+  const workspaces = Array.isArray(view?.workspaces) ? view.workspaces : [];
+  console.log(L('cli.dispatch.settingsHead', {
+    default: String(view?.defaultWorkspaceId ?? '') || '-',
+    max: String(view?.maxPermission ?? '') || '-',
+    count: workspaces.length,
+  }));
+  for (const ws of workspaces) {
+    console.log(L('cli.dispatch.workspaceRow', {
+      id: String(ws?.id ?? ''),
+      name: String(ws?.name ?? '') || '-',
+      path: String(ws?.path ?? '') || '-',
+    }));
+  }
+}
+
+/** dispatch settings [--default <id>] [--max-perm <档>]：不带参数就是只读。 */
+async function cmdDispatchSettings(dir, args) {
+  const wantedDefault = args.default === undefined || args.default === true ? '' : String(args.default).trim();
+  const wantedMax = args['max-perm'] === undefined || args['max-perm'] === true ? '' : String(args['max-perm']).trim();
+  if (wantedMax !== '' && !DISPATCH_PERMISSIONS.includes(wantedMax)) {
+    throw new Error(L('cli.dispatch.badPerm') + '\n' + L('cli.dispatch.usage'));
+  }
+  const patch = {};
+  if (wantedDefault !== '') patch.defaultWorkspaceId = wantedDefault;
+  if (wantedMax !== '') patch.maxPermission = wantedMax;
+  const write = Object.keys(patch).length > 0;
+  let url;
+  try {
+    url = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportDispatchError(error);
+    return;
+  }
+  let out;
+  try {
+    out = await adminCall(url, 'dispatch/settings', write ? {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    } : undefined, dir);
+  } catch (error) {
+    reportDispatchError(error);
+    return;
+  }
+  if (write) {
+    console.log(L('cli.dispatch.saved', {
+      default: String(out?.defaultWorkspaceId ?? '') || '-',
+      max: String(out?.maxPermission ?? '') || '-',
+      count: Array.isArray(out?.workspaces) ? out.workspaces.length : 0,
+    }));
+    return;
+  }
+  printDispatchSettings(out);
+}
+
+async function cmdDispatch(args) {
+  const dir = stateDir(args);
+  const sub = String(args._[0] ?? '').trim();
+  if (sub === '' || sub === 'help') {
+    console.log(L('cli.dispatch.usage'));
+    return;
+  }
+  if (sub === 'pending') return cmdDispatchPending(dir, args);
+  if (sub === 'approve') return cmdDispatchDecide(dir, args, 'approve');
+  if (sub === 'reject') return cmdDispatchDecide(dir, args, 'reject');
+  if (sub === 'settings') return cmdDispatchSettings(dir, args);
+  throw new Error(L('cli.common.unknownSubcommand', { name: sub }) + '\n' + L('cli.dispatch.usage'));
+}
+
+const DM_LOG_DEFAULT_LIMIT = 20;
+
+/** 401/403/409/501 = 本机现在做不了这件事（exit 2）；其余算失败（exit 1）。 */
+function reportDmError(error) {
+  const text = String(error && error.message ? error.message : error);
+  process.stderr.write(L('cli.dm.failed', { text }) + '\n');
+  process.exitCode = /^(401|403|409|501)\b/.test(text) ? 2 : 1;
+}
+
+const dmWhen = (row) => {
+  const at = Number(row && row.ts);
+  return Number.isFinite(at) && at > 0 ? new Date(at).toISOString() : '-';
+};
+const dmFrom = (row) => (row && row.from === 'peer' ? L('cli.dm.fromPeer') : L('cli.dm.fromMe'));
+
+/** 发一条私聊：打印回复 + sessionId/reused（同一伙伴连续发就是同一会话）。 */
+async function cmdDmSend(dir, args) {
+  const wanted = String(args._[0] ?? '').trim();
+  const text = String(args._[1] ?? '');
+  if (wanted === '' || text.trim() === '') {
+    throw new Error(L('cli.dm.sendUsage') + '\n' + L('cli.help.dm'));
+  }
+  const { peerId, peer } = findPeer(dir, wanted);
+  const label = String(peer?.name ?? peerId);
+  // 契约 §2/§5：两个都可选；都不给就对端用它的默认工作区与默认档。
+  const workspaceId = args.workspace === undefined || args.workspace === true ? '' : String(args.workspace).trim();
+  const permission = args.perm === undefined || args.perm === true ? '' : String(args.perm).trim();
+  if (permission !== '' && !DISPATCH_PERMISSIONS.includes(permission)) throw new Error(L('cli.dispatch.badPerm'));
+  let url;
+  try {
+    url = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportDmError(error);
+    return;
+  }
+  // 先说「往哪发、多大」：正文本身只出现在下面打印的回复里，不进这一行。
+  process.stderr.write(L('cli.common.sending', { label, bytes: Buffer.byteLength(text, 'utf8') }) + '\n');
+  let out;
+  try {
+    out = await adminCall(url, 'dm/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        peerId,
+        text,
+        ...(workspaceId === '' ? {} : { workspaceId }),
+        ...(permission === '' ? {} : { permission }),
+      }),
+    }, dir);
+  } catch (error) {
+    reportDmError(error);
+    return;
+  }
+  // 契约 §2/§4：超过对端默认档时它还没执行 —— 只回 approvalId，这一条是真话，不能当成功。
+  if (out && out.pendingApproval === true) {
+    const approvalId = String(out.approvalId ?? '');
+    console.log(L('cli.dm.queued', {
+      label,
+      id: approvalId,
+      sec: dispatchRemaining(out.expiresAt),
+    }));
+    console.log('approvalId=' + approvalId + ' state=pending-approval');
+    return;
+  }
+  const reply = String(out && out.reply != null ? out.reply : '');
+  const elapsedMs = Number.isFinite(Number(out && out.elapsedMs)) ? Number(out.elapsedMs) : 0;
+  console.log(L('cli.dm.reply', { text: reply === '' ? L('cli.common.emptyReply') : reply }));
+  console.log('id=' + String(out?.id ?? '')
+    + ' sessionId=' + String(out?.sessionId ?? '')
+    + ' reused=' + (out?.reused === true ? 'true' : 'false')
+    + ' elapsedMs=' + elapsedMs
+    // 点名的派单把对端回告的「实际生效」那组也打出来（只有 id/name 与档位，没有 path）。
+    + (out?.workspace || out?.permission
+      ? ' workspace=' + String(out?.workspace?.id ?? '-') + ' perm=' + String(out?.permission ?? '-')
+      : ''));
+}
+
+/** 打印本机这一对的私聊历史（服务端是权威；--limit 只影响打印，不影响存储）。 */
+async function cmdDmLog(dir, args, wanted) {
+  if (wanted === '') throw new Error(L('cli.dm.logUsage') + '\n' + L('cli.help.dm'));
+  const { peerId } = findPeer(dir, wanted);
+  let url;
+  try {
+    url = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportDmError(error);
+    return;
+  }
+  let limit = DM_LOG_DEFAULT_LIMIT;
+  if (args.limit !== undefined && args.limit !== true) {
+    const parsed = Number(args.limit);
+    if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(L('cli.dm.limitInvalid') + '\n' + L('cli.help.dm'));
+    limit = Math.floor(parsed);
+  }
+  let out;
+  try {
+    out = await adminCall(url, 'dm?peer=' + encodeURIComponent(peerId), undefined, dir);
+  } catch (error) {
+    reportDmError(error);
+    return;
+  }
+  const rows = Array.isArray(out && out.messages) ? out.messages : [];
+  const shown = rows.length > limit ? rows.slice(rows.length - limit) : rows;
+  for (const row of shown) {
+    console.log([
+      dmWhen(row),
+      dmFrom(row),
+      String(row?.id ?? '-'),
+      String(row?.sessionId ?? '-'),
+    ].join('\t') + '\t' + String(row?.text ?? ''));
+  }
+  process.stderr.write(L('cli.dm.logSummary', {
+    total: rows.length,
+    shown: shown.length === rows.length ? '' : L('cli.dm.logSummaryShown', { count: shown.length }),
+  }) + '\n');
+}
+
+/** 与对端交换双方缺失的条目，打印 added/total。 */
+async function cmdDmSync(dir, args, wanted) {
+  if (wanted === '') throw new Error(L('cli.dm.syncUsage') + '\n' + L('cli.help.dm'));
+  const { peerId } = findPeer(dir, wanted);
+  let url;
+  try {
+    url = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportDmError(error);
+    return;
+  }
+  let out;
+  try {
+    out = await adminCall(url, 'dm/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peerId }),
+    }, dir);
+  } catch (error) {
+    reportDmError(error);
+    return;
+  }
+  const added = Number.isFinite(Number(out && out.added)) ? Number(out.added) : 0;
+  const total = Number.isFinite(Number(out && out.total)) ? Number(out.total) : 0;
+  console.log(L('cli.dm.synced', { added, total }));
+}
+
+async function cmdDm(args) {
+  const dir = stateDir(args);
+  const sub = String(args._[0] ?? '').trim();
+  if (sub === '' || sub === 'help') {
+    console.log(L('cli.help.dm'));
+    return;
+  }
+  if (sub === 'log') return cmdDmLog(dir, args, String(args._[1] ?? '').trim());
+  if (sub === 'sync') return cmdDmSync(dir, args, String(args._[1] ?? '').trim());
+  return cmdDmSend(dir, args);
 }
 
 const commands = {
@@ -1537,35 +2006,45 @@ const commands = {
   events: cmdEvents,
   unpair: cmdUnpair,
   group: cmdGroup,
+  dm: cmdDm,
+  dispatch: cmdDispatch,
+  'send-file': cmdSendFile,
+  inbox: cmdInbox,
 };
 const helpFor = {
-  code: CODE_USAGE,
-  pair: PAIR_USAGE,
-  peers: PEERS_USAGE,
-  ask: ASK_USAGE,
-  events: EVENTS_USAGE,
-  unpair: UNPAIR_USAGE,
-  group: GROUP_USAGE,
+  code: 'cli.help.code',
+  pair: 'cli.help.pair',
+  peers: 'cli.help.peers',
+  ask: 'cli.help.ask',
+  events: 'cli.help.events',
+  unpair: 'cli.help.unpair',
+  group: 'cli.help.group',
+  dm: 'cli.help.dm',
+  dispatch: 'cli.dispatch.usage',
+  'send-file': 'cli.help.sendFile',
+  inbox: 'cli.help.inbox',
 };
 
 const args = parseArgs(process.argv.slice(2));
+// 语言先定：后面每一条用户可见文案都取自词表
+applyLang(args);
 const name = args._[0];
 if (!name) {
-  console.log(USAGE);
+  console.log(L('cli.help.usage'));
   process.exit(args.help || args.h ? 0 : 1);
 }
 if (name === 'help') {
-  console.log(USAGE);
+  console.log(L('cli.help.usage'));
   process.exit(0);
 }
 const command = commands[name];
 if (!command) {
-  console.error('未知子命令: ' + name);
-  console.error(USAGE);
+  console.error(L('cli.common.unknownSubcommand', { name }));
+  console.error(L('cli.help.usage'));
   process.exit(1);
 }
 if (args.help || args.h) {
-  console.log(helpFor[name] || USAGE);
+  console.log(L(helpFor[name] || 'cli.help.usage'));
   process.exit(0);
 }
 args._ = args._.slice(1);
