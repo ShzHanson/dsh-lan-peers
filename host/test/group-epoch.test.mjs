@@ -8,6 +8,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -76,7 +77,7 @@ async function startIsolatedHub(t, { groupElection = {}, logger = null, heartbea
       ...groupElection,
     },
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   t.after(async () => { await server.close(); });
   return { server, stateDir, baseUrl: info.url };
 }
@@ -237,7 +238,7 @@ test('§A3 epoch 跳变告警：一次涨幅 499 记一行 suspicious（不含�
     group: { enabled: true, name: 'jump', autoJoin: false, retentionDays: 7, quorum: 'majority' },
     groupElection: { heartbeatMs: 5_000, tickMs: 600_000, jitterMs: 0 },
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   t.after(async () => { await server.close(); });
   const before = server.group.role();
   assert.equal(before.epoch, 1, 'hub 首次即 leader，epoch 取 keyVersion');

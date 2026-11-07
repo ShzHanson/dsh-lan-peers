@@ -5,6 +5,7 @@
 // stdout 文案与退出码：403/409/501 归「本机现在做不了」（exit 2），其余算失败（exit 1）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -51,9 +52,7 @@ async function startAdmin(t, handler, { token = TOKEN } = {}) {
       else send();
     });
   });
-  const port = await new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
-  });
+  const { port } = await listenOnRandomPort(server);
   t.after(() => new Promise((resolve) => { server.close(() => resolve()); }));
 
   const dir = makeTempStateDir('dsh-lan-peers-cli-files-');

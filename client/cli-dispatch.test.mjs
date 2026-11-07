@@ -4,6 +4,7 @@
 // 用一个小 HTTP 桩代替 —— 派单执行在 host 里（Lane X），CLI 只负责「发完消息再去触发」。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -35,7 +36,7 @@ async function startHub(t, overrides = {}) {
     group: { enabled: true, autoJoin: true, quorum: 'none' },
     ...overrides,
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   t.after(async () => {
     await server.close();
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -85,7 +86,7 @@ async function startAdminStub(t, handler) {
       res.end(JSON.stringify(answer.json ?? {}));
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(server);
   t.after(() => new Promise((resolve) => server.close(resolve)));
   return { requests, url: 'http://127.0.0.1:' + server.address().port };
 }

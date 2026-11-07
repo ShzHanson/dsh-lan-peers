@@ -7,6 +7,7 @@
 // green. Everything here runs the global fetch against a real node:http server.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import http from 'node:http';
 import { ENC_VERSION, decryptJson, encryptJson } from '../lib/wire-crypto.mjs';
 import { canonical, sameSignature, sign } from './protocol.mjs';
@@ -24,7 +25,7 @@ async function startPeer(handler) {
     const url = new URL(req.url, 'http://127.0.0.1');
     await handler({ req, res, url, raw });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(server);
   const { port } = server.address();
   return {
     baseUrl: 'http://127.0.0.1:' + port,

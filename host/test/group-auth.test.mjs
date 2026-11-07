@@ -10,6 +10,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -315,7 +316,7 @@ test('S1 成员服务器自己也提供 probe/pull/leader，数据来自 group-r
     requireEncryption: false,
     group: { enabled: true, hub: 'hub' },
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   t.after(async () => {
     await server.close();
     fs.rmSync(stateDir, { recursive: true, force: true });

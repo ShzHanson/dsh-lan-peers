@@ -9,6 +9,8 @@
  * 铁律断言：私聊正文不进日志、不进群历史（marker 口径）。
  */
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
+const PORTS_URL = new URL('../../test-support/ports.mjs', import.meta.url).href;
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -605,7 +607,8 @@ const CHILD_SCRIPT = [
   '  runner,',
   "  logger: (line) => process.stdout.write('LOG ' + line + NL),",
   '});',
-  "const info = await server.listen(0, '127.0.0.1');",
+  "const { listenOnRandomPort } = await import(" + JSON.stringify(PORTS_URL) + ");",
+  "const info = await listenOnRandomPort(server);",
   "process.stdout.write('READY ' + info.port + NL);",
   '',
   "if (role === 'A') {",

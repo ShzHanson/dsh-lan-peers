@@ -9,6 +9,8 @@
  * 铁律断言：options 响应不含任何绝对路径；待批准文件不含正文；日志里既没有正文也没有路径。
  */
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
+const PORTS_URL = new URL('../../test-support/ports.mjs', import.meta.url).href;
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -789,7 +791,8 @@ const server = createPeerServer({
   runner,
   logger: (line) => process.stdout.write('LOG ' + line + NL),
 });
-const info = await server.listen(0, '127.0.0.1');
+const { listenOnRandomPort } = await import(${JSON.stringify(PORTS_URL)});
+const info = await listenOnRandomPort(server);
 process.stdout.write('READY ' + info.port + NL);
 
 async function signedGet(apiPath) {

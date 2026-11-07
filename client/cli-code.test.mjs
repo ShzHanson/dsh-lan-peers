@@ -5,6 +5,7 @@
 // 本机没 host / 拿不到 token 时 exit 2 并说清怎么起 host，绝不本地造一个码。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -61,7 +62,7 @@ async function startAdmin(t, { dir, code = '246810' } = {}) {
       });
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(server);
   t.after(() => new Promise((resolve) => server.close(resolve)));
   return { admin, calls, state, url: 'http://127.0.0.1:' + server.address().port };
 }

@@ -4,6 +4,7 @@
 // 断言两端 peers.json 各少一条。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -121,7 +122,7 @@ test('端到端：通知临时 host 后，对端 peers.json 也少一条', async
   writeJson0600(path.join(dirMe, 'state.json'), meState);
 
   const peer = createPeerServer({ stateDir: dirPeer, name: 'peer-host', listenHost: '127.0.0.1' });
-  const info = await peer.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(peer);
   t.after(async () => {
     await peer.close();
     fs.rmSync(dirMe, { recursive: true, force: true });

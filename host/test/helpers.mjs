@@ -10,6 +10,7 @@ import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createPeerServer } from '../server.mjs';
 import { ENC_VERSION, decryptBytes, encryptBytes } from '../../lib/wire-crypto.mjs';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 
 /** 每次调用都新建一个独立的临时 stateDir */
 export function makeTempStateDir(prefix = 'dsh-lan-peers-test-') {
@@ -61,48 +62,11 @@ export function seedPeers(stateDir, peers) {
   writeJson0600(path.join(stateDir, 'peers.json'), { peers: map });
 }
 
-/**
- * fetch（undici）拒绝的端口 —— WHATWG 的 bad port 列表。
- * listen(0) 由操作系统发临时端口，偶尔会撞上其中一个（实测撞到 10080），
- * 那时所有 fetch 直接抛 "bad port"，测试就不明不白飘红。这里显式避开。
- */
-export const FETCH_BLOCKED_PORTS = new Set([
-  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95,
-  101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179,
-  389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601,
-  636, 989, 990, 993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566,
-  4190, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
-]);
-
-export function isFetchBlockedPort(port) {
-  return FETCH_BLOCKED_PORTS.has(Number(port));
-}
-
-/**
- * 这条端口能不能被 undici fetch？只关心 "bad port"，其它错误（连接拒绝等）都算可用。
- * 为什么不用静态列表兜底：手抄 WHATWG 列表会漏项（实测漏过 6679、4190），
- * 一旦漏项就是"不明原因的飘红"。这里直接问一次 fetch，免疫列表漂移。
- */
-async function fetchRejectsPort(host, port) {
-  try {
-    await fetch('http://' + host + ':' + port + '/v1/health', { signal: AbortSignal.timeout(2000) });
-    return false;
-  } catch (error) {
-    const text = String(error?.cause?.message ?? error?.message ?? error);
-    return /bad port/i.test(text);
-  }
-}
-
-/** listen(0) + 避开 fetch 黑名单端口：静态表快筛 + 真 fetch 自证，撞上就换一个（最多 5 次） */
-export async function listenOnRandomPort(server, host = '127.0.0.1', attempts = 5) {
-  let info = null;
-  for (let index = 0; index < attempts; index += 1) {
-    info = await server.listen(0, host);
-    if (!isFetchBlockedPort(info.port) && !(await fetchRejectsPort(host, info.port))) return info;
-    await server.close();
-  }
-  throw new Error('no fetch-safe ephemeral port after ' + attempts + ' attempts (last=' + info?.port + ')');
-}
+// 端口助手已搬到 test-support/ports.mjs（client / lib / host/test 三处共用同一份实现）。
+// 这里 re-export，是为了既有的 import { listenOnRandomPort } from './helpers.mjs' 不破。
+export {
+  FETCH_BLOCKED_PORTS, fetchRejectsPort, isFetchBlockedPort, listenOnRandomPort,
+} from '../../test-support/ports.mjs';
 
 /**
  * 起一个只在 127.0.0.1 上监听的测试服务，结束后自动 close + 删临时目录。

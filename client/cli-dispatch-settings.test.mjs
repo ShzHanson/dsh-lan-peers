@@ -7,6 +7,7 @@
 // 铁律（契约 §0）：跨机只走 id+name；日志只记 id 前 8 位、权限档、工作区 id、字节数。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -48,9 +49,7 @@ async function startAdmin(t, handler, { token = TOKEN } = {}) {
       res.end(JSON.stringify(reply.body ?? {}));
     });
   });
-  const port = await new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
-  });
+  const { port } = await listenOnRandomPort(server);
   t.after(() => new Promise((resolve) => { server.close(() => resolve()); }));
 
   const dir = makeTempStateDir('dsh-lan-peers-cli-dispatch-');

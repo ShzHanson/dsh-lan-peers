@@ -7,6 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -115,7 +116,7 @@ test('§8 state.json 的 instanceId/createdAt 跨重启保持不变', async (t) 
   const first = createPeerServer({ stateDir, listenHost: '127.0.0.1', name: 'nas-box' });
   let initial;
   try {
-    await first.listen(0, '127.0.0.1');
+    await listenOnRandomPort(first);
     initial = readJson(path.join(stateDir, 'state.json'));
   } finally {
     await first.close();
@@ -124,7 +125,7 @@ test('§8 state.json 的 instanceId/createdAt 跨重启保持不变', async (t) 
   const second = createPeerServer({ stateDir, listenHost: '127.0.0.1', name: 'nas-box' });
   let reloaded;
   try {
-    await second.listen(0, '127.0.0.1');
+    await listenOnRandomPort(second);
     reloaded = readJson(path.join(stateDir, 'state.json'));
   } finally {
     await second.close();

@@ -8,6 +8,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -33,7 +34,7 @@ async function startHub(t, { stateDir = makeTempStateDir(), group = {} } = {}) {
     // 这个文件测的是 S2 的复制语义，固定 quorum:「none」= 写本地即提交。
     group: { enabled: true, name: 'default', autoJoin: true, retentionDays: 7, quorum: 'none', ...group },
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   t.after(async () => { await server.close(); });
   return { server, baseUrl: info.url, stateDir };
 }
@@ -73,7 +74,7 @@ async function startMember(t, { hubBaseUrl, hubInstanceId, identity = MEMBER, gr
     // 测试自己驱动补差，不让后台定时器插进来
     groupReplica: { pullIntervalMs: 600_000 },
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   // 回环地址做「成员自报地址」：否则 hub 推到探测出的私网 IP，测试机上打不通
   server.config.group.advertiseBaseUrl = info.url;
   t.after(async () => { await server.close(); });
@@ -380,7 +381,7 @@ test('S2 重启 hub：seq 不回退、成员不重复收（复用同一个 state
     allowRemotePrompts: true,
     group: { enabled: true, name: 'default', autoJoin: true, retentionDays: 7 },
   });
-  const info = await restarted.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(restarted);
   t.after(async () => { await restarted.close(); });
   const hub2 = { server: restarted, baseUrl: info.url, stateDir };
   // 成员重新指向新地址（端口变了）

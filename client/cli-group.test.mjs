@@ -4,6 +4,7 @@
 // 同步 execFileSync 会卡住本进程的事件循环，hub 就没法应答）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -50,7 +51,7 @@ async function startHub(t, overrides = {}) {
     group: { enabled: true, autoJoin: true, quorum: 'none' },
     ...overrides,
   });
-  const info = await server.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(server);
   t.after(async () => {
     await server.close();
     fs.rmSync(stateDir, { recursive: true, force: true });

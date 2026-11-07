@@ -5,6 +5,7 @@
 // key, AES-256-GCM wrapped secret.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../test-support/ports.mjs';
 import http from 'node:http';
 import { deriveWrapKey, generateKeyPair, unwrapSecret, wrapSecret } from '../lib/pairing-ecdh.mjs';
 import { pairPeer } from './peer-call.mjs';
@@ -69,7 +70,7 @@ async function startPairingPeer({
     json(404, { error: 'not-found' });
   });
 
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(server);
   const { port } = server.address();
   return {
     url: 'http://127.0.0.1:' + port,
@@ -178,7 +179,7 @@ test('a bad pairing code reports the peer status', async () => {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end('{"error":"invalid-code"}');
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(server);
   const { port } = server.address();
   try {
     await assert.rejects(

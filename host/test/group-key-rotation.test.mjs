@@ -8,6 +8,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   fetchGroupLease,
@@ -220,7 +221,7 @@ test('⑥ 轮换后 epoch 不回退：重启（新的 server 实例读同一份�
     groupElection: { heartbeatMs: 5_000, tickMs: 60_000, peerTimeoutMs: 200 },
   });
   t.after(async () => { await restarted.close(); });
-  const info = await restarted.listen(0, '127.0.0.1');
+  const info = await listenOnRandomPort(restarted);
   assert.equal(info.port > 0, true);
   const role = restarted.group.role();
   assert.ok(role.epoch >= keyVersion, '角色 epoch 不得小于 keyVersion，实际 ' + role.epoch + ' vs ' + keyVersion);

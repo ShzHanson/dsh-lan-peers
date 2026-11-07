@@ -13,6 +13,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import net from 'node:net';
 import {
   commitGroupMessage,
@@ -102,7 +103,7 @@ test('S3 提交超时：对端接受连接但不响应 → 等到 commitTimeoutM
     socket.on('close', () => sockets.delete(socket));
     socket.on('error', () => sockets.delete(socket));
   });
-  await new Promise((resolve) => blackhole.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(blackhole);
   t.after(() => {
     for (const socket of sockets) socket.destroy();
     blackhole.close();
@@ -316,7 +317,7 @@ test('S3 取号闸门：pending 占着的号不会被单阶段写（面板/管�
     socket.on('close', () => sockets.delete(socket));
     socket.on('error', () => sockets.delete(socket));
   });
-  await new Promise((resolve) => blackhole.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(blackhole);
   t.after(() => {
     for (const socket of sockets) socket.destroy();
     blackhole.close();
