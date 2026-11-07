@@ -1208,6 +1208,8 @@ test('§8.3：TTL 可注入 —— 窗口过后必须重读身份（轮换/吊�
   let loads = 0;
   const hub = await startLeaderHub(t, {
     groupIdentityCacheMs: 5,
+    // 读不到 = 否定结果，走的是它自己的短窗口（默认 5 秒），这里一起压到 5ms
+    groupIdentityNegativeCacheMs: 5,
     groupIdentityLoader: () => {
       loads += 1;
       return { ok: false, code: 'identity-missing' };

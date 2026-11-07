@@ -332,6 +332,14 @@ export const MAX_PAIR_RATE_ENTRIES = 1_000;
 export const GROUP_IDENTITY_CACHE_MS = 60_000;
 
 /**
+ * 「**读不到**可用身份」这个否定结果的缓存窗口（5 秒）。
+ * 60 秒缓存只配上「读到了」才有意义：证书刚签发（对端时钟快几百毫秒）/ 刚轮换 /
+ * 文件刚补齐这几种情况都是秒级自愈，缓存一分钟会把 300ms 的抖动放大成一分钟的 v2 不可用，
+ * 而且外面看不出来（出站静默回落 v1）。0 = 否定结果不缓存（每次重读）。
+ */
+export const GROUP_IDENTITY_NEGATIVE_CACHE_MS = 5_000;
+
+/**
  * 契约 §8.2：pairProof 参与签名的 path。按 §7「共用常量各侧本地定义」写成本地字面量，
  * 不从客户端正在改的文件 import（重复三五个字符串好过两个人同时改一个文件）。
  */
@@ -669,6 +677,12 @@ export function resolveConfig(overrides = {}) {
       min: 0,
       max: 3_600_000,
     }),
+    // 否定结果（读不到可用身份）单独一个很短的窗口：秒级自愈，别被 60 秒放大
+    groupIdentityNegativeCacheMs: normalizeCount(
+      overrides.groupIdentityNegativeCacheMs,
+      GROUP_IDENTITY_NEGATIVE_CACHE_MS,
+      { min: 0, max: 3_600_000 },
+    ),
     // §6 v0.4.0：配对模式（auto 同时接受 ECDH 与旧明文）与长轮询 hold 上限
     pairingMode: normalizePairingMode(overrides.pairingMode),
     answerWaitMs: normalizeAnswerWaitMs(overrides.answerWaitMs),
@@ -2686,17 +2700,42 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 契约 §8.3：本机出站用的 v2 身份（证书 + 配对私钥 + 信任根），带 60 秒缓存。
+   * 契约 §8.3：本机出站用的 v2 身份（证书 + 配对私钥 + 信任根）。
    *
    * 返回 `loadGroupIdentity` 的原始结果（含 ok:false）或 null；缓存的是**已经归一化**的
    * 「可用身份 or null」，所以读不到身份时这段时间内不会反复解封/验签。
    * 读不到、文件坏、指纹变了 —— 一律返回 null，调用方据此走 v1，**不报错**（契约 §6）。
+   *
+   * 两个窗口（2026 真机挖出来的缺口）：读到可用身份按 config.groupIdentityCacheMs（60 秒）；
+   * 读到不可用时只按 config.groupIdentityNegativeCacheMs（5 秒）—— 对端时钟快几百毫秒导致的
+   * not-yet-valid、证书刚轮换、文件刚补齐都必须秒级自愈，被 60 秒放大就是「v2 静默不可用」。
    */
-  let outboundIdentityCache = { at: 0, primed: false, value: null };
+  let outboundIdentityCache = { at: 0, primed: false, value: null, ttl: 0 };
+  /** 上一次观测到的可用性（null = 还没观测过）；只为「状态切换才记一行」去重 */
+  let identityWasAvailable = null;
+
+  /**
+   * 降级可见（真机排障用）：可用性切换时记一行，恢复时再记一行。
+   * 隐私铁律：日志里**只许出现状态词与 reason code**。reason 来源不可控（可能被 loader
+   * 拼进路径/查询串），所以只认「小写短横线短码」这一种形状（本仓所有 code 都是这个形状），
+   * 形状不符一律写 unknown —— 宁可少一个字的排障信息，也不让路径/密钥有可能漏出去。
+   */
+  function logIdentityTransition(available, code) {
+    if (identityWasAvailable === available) return;
+    identityWasAvailable = available;
+    if (typeof config.logger !== 'function') return;
+    if (available) {
+      config.logger('[group] identity available');
+      return;
+    }
+    const raw = String(code ?? 'unknown').slice(0, 32);
+    const safe = /^[a-z0-9-]{1,32}$/.test(raw) ? raw : 'unknown';
+    config.logger('[group] identity unavailable reason=' + safe);
+  }
 
   function cachedGroupIdentity() {
     const nowMs = config.now();
-    if (outboundIdentityCache.primed && nowMs - outboundIdentityCache.at < config.groupIdentityCacheMs) {
+    if (outboundIdentityCache.primed && nowMs - outboundIdentityCache.at < outboundIdentityCache.ttl) {
       return outboundIdentityCache.value;
     }
     let loaded = null;
@@ -2705,11 +2744,16 @@ export function createPeerServer(overrides = {}) {
     } catch {
       loaded = null;
     }
+    const usable = loaded && loaded.ok === true ? loaded : null;
+    const code = usable ? null : String(loaded?.code ?? loaded?.reason ?? 'loader-error');
     outboundIdentityCache = {
       at: nowMs,
       primed: true,
-      value: loaded && loaded.ok === true ? loaded : null,
+      value: usable,
+      // ttl=0 → 下一个请求必然重读（`now - at < 0` 永假）
+      ttl: usable ? config.groupIdentityCacheMs : config.groupIdentityNegativeCacheMs,
     };
+    logIdentityTransition(usable !== null, code);
     return outboundIdentityCache.value;
   }
 
