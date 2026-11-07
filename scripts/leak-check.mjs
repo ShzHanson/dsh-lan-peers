@@ -35,6 +35,15 @@ const FORBIDDEN_FILES = [
   /(^|\/)\.env(\.|$)/,
 ];
 
+// 测试夹具里的「人类可读假凭据」只在 *.test.mjs / *.test.js 里豁免。
+// 形状一：<小写标识>-token|-secret|-key，标识只允许小写字母与连字符——天然排除含数字的高熵真凭据；
+// 形状二：should-not-leak 这类明确的占位语义。
+const TEST_FIXTURE_FILE = /\.test\.(mjs|js)$/i;
+function isTestFixtureValue(value, file) {
+  if (!TEST_FIXTURE_FILE.test(file || '')) return false;
+  return /^[a-z][a-z-]*-(token|secret|key)$/.test(value) || /should[-_]?not[-_]?(leak|be|exist|match)/i.test(value);
+}
+
 const SECRET_RULES = [
   { name: 'private-key', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
   { name: 'github-token', re: /\bgh[pousr]_[A-Za-z0-9]{20,}/ },
@@ -45,7 +54,8 @@ const SECRET_RULES = [
     name: 'password-assign',
     re: /\b(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*['"]([^'"\s]{8,})['"]/i,
     // 明显是测试占位符的值不算机密：wrong-*/not-*/whatever/test/dummy/fake/example/S-x 这类
-    ignore: (m) => /^(wrong|not-|whatever|redacted|dummy|fake|example|placeholder|changeme|test)/i.test(m[2]) || /-test-|^[ST]-|^sec-|^M2H$/.test(m[2]),
+    // 第二行只在测试文件里生效（第二个参数是命中所属文件路径）
+    ignore: (m, file) => /^(wrong|not-|whatever|redacted|dummy|fake|example|placeholder|changeme|test)/i.test(m[2]) || /-test-|^[ST]-|^sec-|^M2H$/.test(m[2]) || isTestFixtureValue(m[2], file),
   },
 ];
 
@@ -71,7 +81,21 @@ function loadLocalPatterns() {
   }
 }
 
-function scanText(text, rules) {
+// 历史扫描是整段 git show，某一行属于哪个文件只能靠 diff 头推断，所以这里按行解析归属文件。
+function historyFileOwner(text) {
+  const owners = [];
+  let current = '';
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const added = /^\+\+\+ b\/(.+)$/.exec(lines[index]);
+    if (added) current = added[1];
+    else if (/^\+\+\+ \/dev\/null$/.test(lines[index])) current = '';
+    owners[index] = current;
+  }
+  return owners;
+}
+
+function scanText(text, rules, owner) {
   const hits = [];
   const lines = text.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
@@ -79,7 +103,7 @@ function scanText(text, rules) {
       const match = rule.re.exec(lines[index]);
       rule.re.lastIndex = 0;
       if (!match) continue;
-      if (typeof rule.ignore === 'function' && rule.ignore(match)) continue;
+      if (typeof rule.ignore === 'function' && rule.ignore(match, owner(index))) continue;
       hits.push({ line: index + 1, rule: rule.name, text: lines[index].trim().slice(0, 120) });
     }
   }
@@ -107,7 +131,7 @@ for (const file of tracked) {
   const abs = path.join(ROOT, file);
   if (!fs.existsSync(abs)) continue;
   const text = fs.readFileSync(abs, 'utf8');
-  for (const hit of scanText(text, rules)) problems.push({ file, ...hit });
+  for (const hit of scanText(text, rules, () => file)) problems.push({ file, ...hit });
 }
 
 // 3) 历史扫描（可选）：只报命中，不改变工作树
@@ -125,7 +149,8 @@ if (args.has('--history')) {
   for (const commit of commits.slice(0, 200)) {
     let text = '';
     try { text = git(['show', commit]); } catch { continue; }
-    for (const hit of scanText(text, rules)) {
+    const owners = historyFileOwner(text);
+    for (const hit of scanText(text, rules, (index) => owners[index])) {
       problems.push({ file: 'history:' + commit.slice(0, 8), line: hit.line, rule: hit.rule, text: hit.text });
     }
   }
