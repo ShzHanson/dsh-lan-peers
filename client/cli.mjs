@@ -1518,7 +1518,7 @@ function reportFilesError(error) {
  * 查不到（404/501/401/超时）**静默降级**成已用时长：进度是锦上添花，绝不能让 send 失败。
  * 非 TTY 不刷（管道里刷 \r 只会污染输出）；测试/排障用 DSH_LAN_PEERS_PROGRESS=1 强制开。
  */
-function startFileProgress({ dir, url, size, idSource, intervalMs = 500 }) {
+function startFileProgress({ dir, url, size, idSource, pendingSend, intervalMs = 500 }) {
   const forced = String(process.env.DSH_LAN_PEERS_PROGRESS ?? '').trim() === '1';
   if (!forced && process.stderr.isTTY !== true) return { stop() {} };
   const started = Date.now();
@@ -1531,10 +1531,44 @@ function startFileProgress({ dir, url, size, idSource, intervalMs = 500 }) {
     painted = true;
   };
   const elapsedLine = () => paint(L('cli.file.progressElapsed', { seconds: Math.round((Date.now() - started) / 1000) }));
+  // send 期间本机还没有 transferId（那要等对端 complete 才回），所以先问**出站表**：
+  // GET files/outbound 里按 (peerId, size) 认出这一趟，读到 sent/size 就画字节进度。
+  // 表里没有（还没进分块循环）或接口不可用，就退回已用时长 —— 与以前完全一致。
+  const paintOutbound = (want) => adminCall(url, 'files/outbound', undefined, dir)
+    .then((rows) => {
+      const list = Array.isArray(rows) ? rows : [];
+      const row = list.find((item) => String(item?.peerId ?? '') === String(want.peerId ?? '')
+        && Number(item?.size) === Number(want.size));
+      if (!row) {
+        elapsedLine();
+        return;
+      }
+      const sent = Number(row.sent) || 0;
+      const total = Number(row.size) > 0 ? Number(row.size) : size;
+      if (!(total > 0)) {
+        elapsedLine();
+        return;
+      }
+      const pct = Math.max(0, Math.min(100, Math.round((sent / total) * 100)));
+      paint(L('cli.file.progressBytes', { received: sent, total, pct }));
+    })
+    .catch(() => {
+      // 出站表不可用（旧 host / 501 / 401）：这一趟退回已用时长，别把错误抛给 send。
+      degraded = true;
+      elapsedLine();
+    });
   const timer = setInterval(() => {
     const id = String(idSource() ?? '').trim();
-    if (id === '' || degraded) {
+    if (degraded) {
       elapsedLine();
+      return;
+    }
+    if (id === '') {
+      // 先按老规矩把「已用 Ns」画上（同步、不依赖任何接口）；
+      // 出站表回得够快就把同一行升级成字节进度，回晚了本来也已经看不到新东西。
+      elapsedLine();
+      const want = typeof pendingSend === 'function' ? pendingSend() : null;
+      if (want) paintOutbound(want);
       return;
     }
     adminCall(url, 'files/progress?id=' + encodeURIComponent(id), undefined, dir)
@@ -1593,7 +1627,15 @@ async function cmdSendFile(args) {
   // id 目前是 send 返回时才有的，所以这一趟先滚「已用 Ns」；一拿到 id 就填进 holder，
   // 下一拍（如果还没结束）自动切成「已发 X/Y 字节」——同一条代码路径，不重发。
   let transferId = '';
-  const progress = startFileProgress({ dir, url: adminUrl, size: stat.size, idSource: () => transferId });
+  // pendingSend：send 还没返回时用来自证「出站表里哪一条是我的」——
+  // 认 (peerId, size) 两项，够了；表在 send 结束那一拍就被清掉。
+  const progress = startFileProgress({
+    dir,
+    url: adminUrl,
+    size: stat.size,
+    idSource: () => transferId,
+    pendingSend: () => ({ peerId, size: stat.size }),
+  });
   let out;
   try {
     out = await adminCall(adminUrl, 'files/send', {
@@ -1637,6 +1679,7 @@ async function cmdInboxList(dir, args) {
   }
   const pending = Array.isArray(out?.pending) ? out.pending : [];
   const inbox = Array.isArray(out?.inbox) ? out.inbox : [];
+  const incoming = Array.isArray(out?.incoming) ? out.incoming : [];
   const line = (row, tag) => [
     tag,
     String(row?.id ?? '-'),
@@ -1648,6 +1691,15 @@ async function cmdInboxList(dir, args) {
   ].join('\t');
   for (const row of pending) console.log(line(row, L('cli.inbox.tagPending')));
   for (const row of inbox) console.log(line(row, L('cli.inbox.tagReceived')));
+  // 传输中的单独一行：id 前 8 位 + 名字 + 已收/总量（对端已经在推，只是还没收完）。
+  for (const row of incoming) {
+    console.log(L('cli.inbox.incomingLine', {
+      id: String(row?.id ?? '').slice(0, 8),
+      name: String(row?.name ?? '-') || '-',
+      received: Number.isFinite(Number(row?.received)) ? Number(row.received) : 0,
+      size: Number.isFinite(Number(row?.size)) ? Number(row.size) : 0,
+    }));
+  }
   process.stderr.write(L('cli.inbox.summary', { pending: pending.length, inbox: inbox.length }) + '\n');
 }
 

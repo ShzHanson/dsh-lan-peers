@@ -6727,6 +6727,19 @@ export function createPeerServer(overrides = {}) {
    * 注：这里读的 path 是**本机**操作者给的文件（发送端自己的选择），
    * 对端永远不能指定接收端路径 —— 落盘路径只由 fileStore 拼。
    */
+  // 出站进度（v0.8.5-α）：send 期间按 transferId 记「这一趟已经发出多少字节」，
+  // 完成/失败后立刻清掉。上限按「同时进行的发送数」兜一层，绝不会无界增长。
+  // 对外只经 filesFacade.outbound() 读，**不含 path**（文件路径绝不离开本机选择那一刻）。
+  const outboundTransfers = new Map();
+  const OUTBOUND_LIMIT = 32;
+  const trackOutbound = (row) => {
+    if (outboundTransfers.size >= OUTBOUND_LIMIT && !outboundTransfers.has(row.transferId)) {
+      const oldest = outboundTransfers.keys().next().value;
+      if (oldest !== undefined) outboundTransfers.delete(oldest);
+    }
+    outboundTransfers.set(row.transferId, row);
+  };
+
   async function sendFileToPeer(input = {}) {
     const startedAt = config.now();
     const elapsed = () => Math.max(0, config.now() - startedAt);
@@ -6784,6 +6797,7 @@ export function createPeerServer(overrides = {}) {
     }
     const resumeFrom = Math.max(0, Math.min(size, Math.floor(Number(replied.json?.resumeFrom) || 0)));
 
+    trackOutbound({ transferId, peerId, name, size, sent: resumeFrom });
     try {
       const handle = await fs.promises.open(filePath, 'r');
       let offset = resumeFrom;
@@ -6812,6 +6826,8 @@ export function createPeerServer(overrides = {}) {
             };
           }
           offset += read.bytesRead;
+          // 进度点：每成功投递一块就更新一次「已发字节」。
+          trackOutbound({ transferId, peerId, name, size, sent: offset });
         }
       } finally {
         await handle.close().catch(() => {});
@@ -6849,6 +6865,9 @@ export function createPeerServer(overrides = {}) {
         sha256,
         ms: elapsed(),
       };
+    } finally {
+      // 这一趟结束了（成功/失败/抛出都算）：进度条目立刻消失，绝不留残影。
+      outboundTransfers.delete(transferId);
     }
   }
 
@@ -6862,6 +6881,14 @@ export function createPeerServer(overrides = {}) {
     reject: (id) => fileStore.reject(id),
     send: (input = {}) => sendFileToPeer(input),
     progress: (id) => fileStore.progress(id),
+    // 出站进度：只回 transferId/peerId/name/size/sent —— **不含 path**。
+    outbound: () => [...outboundTransfers.values()].map((row) => ({
+      transferId: row.transferId,
+      peerId: row.peerId,
+      name: row.name,
+      size: row.size,
+      sent: row.sent,
+    })),
     sweep: (nowMs) => fileStore.sweep(nowMs),
     dirs: () => ({
       inbox: fileStore.inboxDir,
