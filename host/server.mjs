@@ -114,6 +114,9 @@ import {
   groupCall,
   groupDispatchSummary,
   joinGroup,
+  // §8.3 出站接线：identity 的读取实现归客户端侧（同一个文件里 loadGroupIdentity 与 groupCall
+  // 必须对同一份文件形状达成一致），服务端只调用它并缓存结果，不重写读盘逻辑。
+  loadGroupIdentity,
   normalizeGroupName,
   parseAcceptFlag,
   parseGroupDispatch,
@@ -137,6 +140,25 @@ import {
   writeAdvertiseState,
   writeGroupKeyFile,
 } from '../lib/group-client.mjs';
+// P2（0.9.0-α）群身份：密码学原语与 CA 都在 lib/ 里，协议层只调用不重写。
+// 契约 §7：'group-v2' / 'X-Peer-Cert' 这些字面量两侧各自定义，不从客户端正在改的文件 import。
+import {
+  GROUP_AUTH_V2_VALUE,
+  GROUP_IDENTITY_PATHS,
+  PEER_CERT_HEADER,
+  issueMemberCertificate,
+  ledgerAcceptsCertificate,
+  loadOrCreateHubCa,
+  readTrustedHubCaPubKey,
+  rotateMemberCertificate,
+} from '../lib/group-ca.mjs';
+import {
+  DEFAULT_GRACE_MS as GROUP_CERT_GRACE_MS,
+  buildGroupCanonicalV2,
+  publicKeyFromText,
+  verifyCertificate,
+  verifyMessage,
+} from '../lib/group-identity.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -148,7 +170,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.8.5-α';
+export const PLUGIN_VERSION = '0.9.0-α';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -300,6 +322,20 @@ export const PAIR_FAIL_LOCK_MS = 30_000;
 export const PAIR_FAIL_INVALIDATE_THRESHOLD = 20;
 /** 失败计数表上限（LRU 淘汰）：来源 IP 由外网决定，表不能无界 */
 export const MAX_PAIR_RATE_ENTRIES = 1_000;
+
+/**
+ * P2 契约 §8.3：出站 identity 的缓存 TTL（60 秒）。
+ * 每请求解封一次私钥（AES-256-GCM + HKDF）再验一次证书是纯浪费；60 秒对轮换（30 天）
+ * 与吊销（rotate 之后上一轮请求按既有错误路径重试）都足够及时。
+ * 可用 config.groupIdentityCacheMs 注入（0 = 关缓存，测试用）。
+ */
+export const GROUP_IDENTITY_CACHE_MS = 60_000;
+
+/**
+ * 契约 §8.2：pairProof 参与签名的 path。按 §7「共用常量各侧本地定义」写成本地字面量，
+ * 不从客户端正在改的文件 import（重复三五个字符串好过两个人同时改一个文件）。
+ */
+const GROUP_IDENTITY_REGISTER_PATH = '/v1/group/identity/register';
 
 /**
  * H4（安全审计）：/v1/ask 曾经没有任何频率/并发限制 —— 配对成功即可无限起会话，
@@ -622,6 +658,17 @@ export function resolveConfig(overrides = {}) {
     secretKeyEncoding: overrides.secretKeyEncoding === 'base64url' ? 'base64url' : 'utf8',
     // 兼容 §3/§8 冲突：验签时除 inboundSecret 外，也接受 peers.json 里的 secret
     acceptSecretFallback: overrides.acceptSecretFallback !== false,
+    // P2（0.9.0-α）双模式过渡：X-Peer-Auth: group 仍走 groupKey HMAC；置 false 后
+    // 老式群级请求一律 401 legacy-auth-disabled（下个版本可收紧）。默认 true。
+    allowLegacyGroupAuth: overrides.allowLegacyGroupAuth !== false,
+    // §8.3 出站 identity：读盘实现与缓存 TTL 都可注入（测试用计数器验缓存，不必真等 60 秒）
+    groupIdentityLoader: typeof overrides.groupIdentityLoader === 'function'
+      ? overrides.groupIdentityLoader
+      : loadGroupIdentity,
+    groupIdentityCacheMs: normalizeCount(overrides.groupIdentityCacheMs, GROUP_IDENTITY_CACHE_MS, {
+      min: 0,
+      max: 3_600_000,
+    }),
     // §6 v0.4.0：配对模式（auto 同时接受 ECDH 与旧明文）与长轮询 hold 上限
     pairingMode: normalizePairingMode(overrides.pairingMode),
     answerWaitMs: normalizeAnswerWaitMs(overrides.answerWaitMs),
@@ -2582,6 +2629,210 @@ export function createPeerServer(overrides = {}) {
     return { ok: true, senderId, ctx };
   }
 
+  // ---- P2（0.9.0-α）：X-Peer-Auth: group-v2 = 证书 + ed25519 -----------------
+  //
+  // 契约 §1：版本**只靠这个头分流**，绝不靠 canonical 内容判断 —— buildGroupCanonicalV2
+  // 与 v1 canonical 逐字节相同。契约 §3 的九步顺序与错误码逐条照抄，不自创。
+
+  /** 同一 peer 60 秒内最多一条 legacy 告警（去重表只在内存，重启归零不影响语义） */
+  const GROUP_LEGACY_WARN_WINDOW_MS = 60_000;
+  const legacyAuthLoggedAt = new Map();
+
+  /** 头分流：'group' | 'group-v2' | ''（缺失或其它值 = 现有 per-peer 签名路径） */
+  function groupAuthModeOf(req) {
+    const value = headerValue(req, GROUP_AUTH_HEADER.toLowerCase());
+    if (value === GROUP_AUTH_VALUE) return 'group';
+    if (value === GROUP_AUTH_V2_VALUE) return 'group-v2';
+    return '';
+  }
+
+  /**
+   * 群级鉴权认的路径 = 既有白名单（GROUP_AUTH_PATHS，契约 §7 一个字不改）
+   * + 本侧本地集合 GROUP_IDENTITY_PATHS（两条身份端点）。
+   * 少了这一处追加，v2/身份端点会被「非白名单路径带头就 401」的老规则打死。
+   */
+  function isGroupAuthPath(pathname) {
+    return GROUP_AUTH_PATHS.includes(pathname) || GROUP_IDENTITY_PATHS.includes(pathname);
+  }
+
+  /** legacy 告警：只记 peer 前 8 位，同一 peer 60 秒最多一条 */
+  function noteLegacyGroupAuth(peerId) {
+    const id = String(peerId ?? '');
+    const nowMs = config.now();
+    if (legacyAuthLoggedAt.size > 256) {
+      for (const [key, at] of legacyAuthLoggedAt) {
+        if (at + GROUP_LEGACY_WARN_WINDOW_MS <= nowMs) legacyAuthLoggedAt.delete(key);
+      }
+    }
+    if ((legacyAuthLoggedAt.get(id) ?? 0) + GROUP_LEGACY_WARN_WINDOW_MS > nowMs) return;
+    legacyAuthLoggedAt.set(id, nowMs);
+    if (config.logger) config.logger(`[group] legacy-auth peer=${shortPeerId(id)}`);
+  }
+
+  /** 本机信任的 hub CA 公钥：hub 用自己落盘那把；成员用注册时记下的那份 */
+  function trustedHubCa() {
+    if (groupStore) {
+      const ca = loadOrCreateHubCa(config.stateDir);
+      if (!ca.ok) return { ok: false, error: ca.error };
+      return { ok: true, publicKey: ca.publicKey, pubKey: ca.pubKey, privateKey: ca.privateKey };
+    }
+    const pubKey = readTrustedHubCaPubKey(config.stateDir);
+    if (!pubKey) return { ok: false, error: 'untrusted-ca' };
+    try {
+      return { ok: true, publicKey: publicKeyFromText(pubKey), pubKey };
+    } catch {
+      return { ok: false, error: 'untrusted-ca' };
+    }
+  }
+
+  /**
+   * 契约 §8.3：本机出站用的 v2 身份（证书 + 配对私钥 + 信任根），带 60 秒缓存。
+   *
+   * 返回 `loadGroupIdentity` 的原始结果（含 ok:false）或 null；缓存的是**已经归一化**的
+   * 「可用身份 or null」，所以读不到身份时这段时间内不会反复解封/验签。
+   * 读不到、文件坏、指纹变了 —— 一律返回 null，调用方据此走 v1，**不报错**（契约 §6）。
+   */
+  let outboundIdentityCache = { at: 0, primed: false, value: null };
+
+  function cachedGroupIdentity() {
+    const nowMs = config.now();
+    if (outboundIdentityCache.primed && nowMs - outboundIdentityCache.at < config.groupIdentityCacheMs) {
+      return outboundIdentityCache.value;
+    }
+    let loaded = null;
+    try {
+      loaded = config.groupIdentityLoader(config.stateDir);
+    } catch {
+      loaded = null;
+    }
+    outboundIdentityCache = {
+      at: nowMs,
+      primed: true,
+      value: loaded && loaded.ok === true ? loaded : null,
+    };
+    return outboundIdentityCache.value;
+  }
+
+  /**
+   * 出站群调用的入参：有身份就**加一个 identity 键**（groupCall 走 v2 头 + X-Peer-Cert），
+   * 没有就原样返回 —— 键都不出现，v1 那条路径的请求与改动前逐字节相同（契约 §8.3）。
+   */
+  function withIdentity(args) {
+    const identity = cachedGroupIdentity();
+    return identity ? { ...args, identity } : args;
+  }
+
+  /**
+   * 群级 v2 校验（契约 §3 九步，顺序与错误码逐条照抄）：
+   *   头齐全 → cert 解析 → 信任根+7 天宽限 → peer/group 匹配 → ts ±60s →
+   *   nonce 去重（与 v1 共用 groupNonces）→ ed25519 验签 → 成员表 → 登记 nonce
+   * 返回 {ok:true, senderId, ctx} 或 {ok:false, status, error}。
+   */
+  function verifyGroupAuthV2(req, rawBody, { allowUnknownSender = false } = {}) {
+    // 1) 六个头齐全（X-Peer-Auth 本身是分流判据，不在这里数）
+    const senderId = headerValue(req, 'x-peer-id');
+    const groupId = headerValue(req, GROUP_ID_HEADER.toLowerCase());
+    const tsRaw = headerValue(req, 'x-peer-ts');
+    const nonce = headerValue(req, 'x-peer-nonce');
+    const signature = headerValue(req, 'x-peer-sign');
+    const certHeader = headerValue(req, PEER_CERT_HEADER.toLowerCase());
+    if (!senderId || !groupId || !tsRaw || !nonce || !signature || !certHeader) {
+      return { ok: false, status: 401, error: 'bad-signature' };
+    }
+    // 2) 证书：base64url(UTF8(JSON))
+    let cert;
+    try {
+      cert = JSON.parse(Buffer.from(certHeader, 'base64url').toString('utf8'));
+    } catch {
+      return { ok: false, status: 401, error: 'bad-certificate' };
+    }
+    if (!cert || typeof cert !== 'object' || Array.isArray(cert)) {
+      return { ok: false, status: 401, error: 'bad-certificate' };
+    }
+    // 3) 信任根 + 宽限。只有「过期」有专码，其余（含 not-yet-valid）都归 untrusted-ca
+    const trust = trustedHubCa();
+    if (!trust.ok) return { ok: false, status: 401, error: trust.error };
+    const verdict = verifyCertificate(trust.publicKey, cert, {
+      now: config.now(),
+      graceMs: GROUP_CERT_GRACE_MS,
+    });
+    if (!verdict.ok) {
+      return { ok: false, status: 401, error: verdict.reason === 'expired' ? 'cert-expired' : 'untrusted-ca' };
+    }
+    // 4) 证书是谁的：peerId 与头一致；证书与本群一致（头里的 groupId 也必须等于证书里的）
+    const ctx = localGroupContext();
+    if (!ctx || !ctx.groupKey) return { ok: false, status: 401, error: 'group-auth-unavailable' };
+    if (String(cert.peerId) !== String(senderId)) {
+      return { ok: false, status: 401, error: 'cert-peer-mismatch' };
+    }
+    if (String(cert.groupId) !== String(ctx.groupId) || String(groupId) !== String(cert.groupId)) {
+      return { ok: false, status: 401, error: 'group-mismatch' };
+    }
+    // 5) 时钟窗。ts 不是数字时按坏签名处理（与 v1 同口径：NaN 会让比较恒假）
+    const ts = Number(tsRaw);
+    if (!Number.isFinite(ts)) return { ok: false, status: 401, error: 'bad-signature' };
+    const nowMs = config.now();
+    if (Math.abs(nowMs - ts) > GROUP_AUTH_CLOCK_SKEW_MS) return { ok: false, status: 401, error: 'clock-skew' };
+    // 6) 重放：与 v1 共用同一张表（跨版本重放也必须拦住）
+    if ((groupNonces.get(nonce) ?? 0) > nowMs) return { ok: false, status: 401, error: 'replay' };
+    // 7) ed25519 验签：公钥**取自证书**，不取自 peers.json —— 这是本次改造的核心
+    let memberKey;
+    try {
+      memberKey = publicKeyFromText(cert.pubKey);
+    } catch {
+      return { ok: false, status: 401, error: 'bad-signature' };
+    }
+    const canonical = buildGroupCanonicalV2({
+      method: req.method,
+      path: req.url,
+      ts: tsRaw,
+      nonce,
+      groupId,
+      senderPeerId: senderId,
+      rawBody,
+    });
+    if (!verifyMessage(memberKey, canonical, signature)) {
+      return { ok: false, status: 401, error: 'bad-signature' };
+    }
+    // 8) 成员表（语义与 v1 逐条一致，含 GROUP_SELF_HEAL_PATHS 的自愈分支）
+    if (senderId !== store.instanceId && !Object.prototype.hasOwnProperty.call(ctx.members, senderId)) {
+      if (!allowUnknownSender || groupStore) return { ok: false, status: 401, error: 'not-a-member' };
+      if (!authoritativeMemberIds.has(senderId)) {
+        if (config.logger) config.logger(`[group] self-heal refused peer=${shortPeerId(senderId)}`);
+        return { ok: false, status: 401, error: 'not-a-member' };
+      }
+      upsertGroupMember(senderId);
+      if (config.logger) config.logger(`[group] member healed peer=${shortPeerId(senderId)}`);
+    }
+    // 8.5) 台账吊销（契约 §8.1 r2）：宽限只管「证书自身过期」，**不是吊销容忍**。
+    //      本机有台账且该 peerId 有记录时，只有 current 证书（pubKey + issuedAt 都对上）算合法；
+    //      rotate 之后旧证书立刻 401 cert-revoked，previous 只是审计记录，一律不接受。
+    //      没有台账 / 没有该 peerId 的记录 → 跳过（首注册成员立刻可用）。
+    const ledger = ledgerAcceptsCertificate(config.stateDir, senderId, cert);
+    if (ledger.checked && !ledger.ok) {
+      return { ok: false, status: 401, error: 'cert-revoked' };
+    }
+    // 9) 全部通过才登记 nonce
+    rememberGroupNonce(nonce, nowMs);
+    return { ok: true, senderId, ctx };
+  }
+
+  /**
+   * 群级鉴权统一入口：按头分流到 v1（groupKey HMAC）或 v2（证书 + ed25519）。
+   * legacy 告警只在这里记一次（groupAuthDispatch 与 groupPostWithGroupAuth 都走它）。
+   */
+  function verifyGroupAuthByMode(req, rawBody, options = {}) {
+    const mode = groupAuthModeOf(req);
+    if (mode === 'group' && !config.allowLegacyGroupAuth) {
+      return { ok: false, status: 401, error: 'legacy-auth-disabled' };
+    }
+    const checked = mode === 'group-v2'
+      ? verifyGroupAuthV2(req, rawBody, options)
+      : verifyGroupAuth(req, rawBody, options);
+    if (checked.ok && mode === 'group') noteLegacyGroupAuth(checked.senderId);
+    return checked;
+  }
+
   /** 响应加密用的密钥（与 http 层的规则一致：inboundSecret 优先，兼容 secret 回落） */
   function responseKeyFor(peer) {
     if (peer?.inboundSecret) return peer.inboundSecret;
@@ -3780,7 +4031,7 @@ export function createPeerServer(overrides = {}) {
   function groupPostWithGroupAuth(req, rawBody) {
     if (groupRole === 'off') return { status: 404, body: { error: 'not-found' }, peerId: null };
     if (!groupStore) return { status: 409, body: { error: 'not-a-hub' }, peerId: null };
-    const checked = verifyGroupAuth(req, rawBody, { allowUnknownSender: false });
+    const checked = verifyGroupAuthByMode(req, rawBody, { allowUnknownSender: false });
     if (!checked.ok) return { status: checked.status, body: { error: checked.error }, peerId: null };
     const sender = String(checked.senderId ?? '');
     const member = Object.prototype.hasOwnProperty.call(checked.ctx.members ?? {}, sender)
@@ -4167,7 +4418,7 @@ export function createPeerServer(overrides = {}) {
     let lastError = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
-        return await withGroupKey((keyCtx) => groupCall({
+        return await withGroupKey((keyCtx) => groupCall(withIdentity({
           baseUrl: String(hub.baseUrl ?? '').trim().replace(/\/+$/, ''),
           groupKey: keyCtx.groupKey,
           groupId: String(keyCtx.groupId),
@@ -4177,7 +4428,7 @@ export function createPeerServer(overrides = {}) {
           apiPath,
           body,
           timeoutMs,
-        }));
+        })));
       } catch (error) {
         lastError = error;
         const status = Number(error?.status);
@@ -4401,6 +4652,166 @@ export function createPeerServer(overrides = {}) {
     return { status: 200, body: queryApplication(applicantPeerId), peerId: auth.peerId };
   }
 
+  // ---- P2（0.9.0-α）群身份：hub 签发成员证书（契约 §5） ---------------------
+  //
+  // 两条端点都只有 hub 处理（非 hub 一律 404，判据与既有 not-leader 一致），
+  // 走群信封（http 层已按 X-Peer-Auth 解好明文，响应自动加密回去）。
+  // 日志只留 peer 前 8 位与 hubEpoch，绝不记证书内容、公钥、路径。
+
+  /** 两条端点共用的入参校验：body 里的 peerId 必须与鉴权出来的身份一致 */
+  function identityRequestBody(rawBody, auth) {
+    const body = readPeerJsonBody(rawBody);
+    if (!body) return { error: { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId } };
+    const peerId = String(body.peerId ?? '').trim();
+    const groupId = String(body.groupId ?? '').trim();
+    const pubKey = String(body.pubKey ?? body.newPubKey ?? '').trim();
+    if (peerId === '' || groupId === '' || pubKey === '') {
+      return { error: { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId } };
+    }
+    // 握有 groupKey 只能证明「在群里」，不能证明「是某个别人」：身份以鉴权结果为准
+    if (peerId !== String(auth.peerId ?? '')) {
+      if (config.logger) config.logger(`[group] identity refused peer=${shortPeerId(auth.peerId)} reason=peer-mismatch`);
+      return { error: { status: 403, body: { error: 'peer-mismatch' }, peerId: auth.peerId } };
+    }
+    if (groupId !== String(auth.ctx?.groupId ?? '')) {
+      return { error: { status: 409, body: { error: 'group-mismatch' }, peerId: auth.peerId } };
+    }
+    return { peerId, groupId, pubKey, body };
+  }
+
+  /** 契约 §8.2：register 的 pairProof 签名对象是这**三个字段**（固定顺序，不含 pairProof 自身） */
+  function pairProofBody(parsed) {
+    return Buffer.from(
+      JSON.stringify({ peerId: parsed.peerId, pubKey: parsed.pubKey, groupId: parsed.groupId }),
+      'utf8',
+    );
+  }
+
+  /**
+   * 契约 §8.2（r2）—— 收窄 TOFU：hub 的 peers.json 里**有该 peerId 的配对记录**时，
+   * register 必须带 pairProof = { ts, nonce, sig }，用配对密钥证明「我就是这条配对记录的那一端」。
+   * 没配对过的成员（靠群名入群）允许不带，但调用方要记一行审计。
+   *
+   * 返回 { ok:true, paired } 或 { ok:false, status, error }：
+   *   缺 pairProof → 403 pair-proof-required（配对记录在，却没有证明）
+   *   任何一项验不过（形状/时钟/nonce/签名）→ 401 bad-pair-proof
+   */
+  function checkPairProof(parsed) {
+    const peer = store.getPeer(parsed.peerId);
+    if (!peer) return { ok: true, paired: false };
+    const proof = parsed.body?.pairProof;
+    if (!proof || typeof proof !== 'object' || Array.isArray(proof)) {
+      return { ok: false, status: 403, error: 'pair-proof-required' };
+    }
+    const tsRaw = String(proof.ts ?? '').trim();
+    const nonce = String(proof.nonce ?? '').trim();
+    const sig = String(proof.sig ?? '').trim();
+    if (tsRaw === '' || nonce === '' || sig === '') return { ok: false, status: 401, error: 'bad-pair-proof' };
+    const ts = Number(tsRaw);
+    if (!Number.isFinite(ts)) return { ok: false, status: 401, error: 'bad-pair-proof' };
+    const nowMs = config.now();
+    if (Math.abs(nowMs - ts) > CLOCK_SKEW_MS) return { ok: false, status: 401, error: 'bad-pair-proof' };
+    // 重放：沿用 per-peer 的 nonces 表（窗口 NONCE_WINDOW_MS），只有验过才登记
+    if ((nonces.get(nonce) ?? 0) > nowMs) return { ok: false, status: 401, error: 'bad-pair-proof' };
+    const canonical = buildCanonical({
+      method: 'POST',
+      path: GROUP_IDENTITY_REGISTER_PATH,
+      ts: tsRaw,
+      nonce,
+      rawBody: pairProofBody(parsed),
+    });
+    // verifyPeerSignature 自己会先试 inboundSecret 再试 secret（与 per-peer 路径同一口径）
+    if (!verifyPeerSignature(peer, canonical, sig)) {
+      return { ok: false, status: 401, error: 'bad-pair-proof' };
+    }
+    rememberNonce(nonce, nowMs);
+    return { ok: true, paired: true };
+  }
+
+  /**
+   * POST /v1/group/identity/register —— 用 **v1 头**鉴权（证明握有 groupKey = 群成员）。
+   * 已经有证书的 peerId 一律拒绝（409 cert-exists）：换钥只能走 v2 的 rotate，
+   * 否则握有 groupKey 的人就能用别人的 peerId 登记自己的公钥。
+   * 已配对的 peerId 还必须带 pairProof（契约 §8.2）。
+   */
+  function groupIdentityRegister(req, rawBody, url, auth) {
+    if (!groupStore) return { status: 404, body: { error: 'not-leader' }, peerId: auth.peerId };
+    const parsed = identityRequestBody(rawBody, auth);
+    if (parsed.error) return parsed.error;
+    const proof = checkPairProof(parsed);
+    if (!proof.ok) return { status: proof.status, body: { error: proof.error }, peerId: auth.peerId };
+    const ca = loadOrCreateHubCa(config.stateDir);
+    if (!ca.ok) {
+      if (config.logger) config.logger(`[group] identity refused peer=${shortPeerId(auth.peerId)} reason=${ca.error}`);
+      return { status: 503, body: { error: ca.error }, peerId: auth.peerId };
+    }
+    const issued = issueMemberCertificate({
+      stateDir: config.stateDir,
+      caPrivateKey: ca.privateKey,
+      peerId: parsed.peerId,
+      pubKey: parsed.pubKey,
+      groupId: parsed.groupId,
+      hubEpoch: auth.ctx?.epoch ?? 0,
+      now: config.now(),
+    });
+    if (!issued.ok) {
+      if (config.logger) {
+        config.logger(`[group] identity register refused peer=${shortPeerId(auth.peerId)} reason=${issued.reason}`);
+      }
+      return { status: 409, body: { error: issued.reason }, peerId: auth.peerId };
+    }
+    // 正好一行，只前 8 位：未配对成员（靠群名入群）显式留一条 TOFU 审计（契约 §8.2）。
+    if (config.logger) {
+      config.logger(proof.paired
+        ? `[group] identity register peer=${shortPeerId(auth.peerId)} epoch=${auth.ctx?.epoch ?? 0}`
+        : `[group] identity register peer=${shortPeerId(auth.peerId)} tofu`);
+    }
+    return {
+      status: 200,
+      body: { cert: issued.cert, hubCaPubKey: ca.pubKey, hubEpoch: auth.ctx?.epoch ?? 0 },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * POST /v1/group/identity/rotate —— 用 **v2 头**鉴权（旧证书 + 旧私钥证明身份）。
+   * 签新证书，旧证书降为 previous（带 revokedAt）—— 契约 §8.1（r2）：旧证书**立刻**失效，
+   * 宽限（graceUntil）只管「证书自身过期」，不再容忍吊销。
+   */
+  function groupIdentityRotate(req, rawBody, url, auth) {
+    if (!groupStore) return { status: 404, body: { error: 'not-leader' }, peerId: auth.peerId };
+    const parsed = identityRequestBody(rawBody, auth);
+    if (parsed.error) return parsed.error;
+    const ca = loadOrCreateHubCa(config.stateDir);
+    if (!ca.ok) {
+      if (config.logger) config.logger(`[group] identity refused peer=${shortPeerId(auth.peerId)} reason=${ca.error}`);
+      return { status: 503, body: { error: ca.error }, peerId: auth.peerId };
+    }
+    const rotated = rotateMemberCertificate({
+      stateDir: config.stateDir,
+      caPrivateKey: ca.privateKey,
+      peerId: parsed.peerId,
+      newPubKey: parsed.pubKey,
+      groupId: parsed.groupId,
+      hubEpoch: auth.ctx?.epoch ?? 0,
+      now: config.now(),
+    });
+    if (!rotated.ok) {
+      if (config.logger) {
+        config.logger(`[group] identity rotate refused peer=${shortPeerId(auth.peerId)} reason=${rotated.reason}`);
+      }
+      return { status: 409, body: { error: rotated.reason }, peerId: auth.peerId };
+    }
+    if (config.logger) {
+      config.logger(`[group] identity rotate peer=${shortPeerId(auth.peerId)} epoch=${auth.ctx?.epoch ?? 0}`);
+    }
+    return {
+      status: 200,
+      body: { cert: rotated.cert, hubCaPubKey: ca.pubKey, hubEpoch: auth.ctx?.epoch ?? 0 },
+      peerId: auth.peerId,
+    };
+  }
+
   // ---- S1/S2 v0.6.0 成员互访（群级鉴权；hub 与成员都提供） -------------------
 
   /** 成员自报的可达地址写进群状态（只写它自己那条；hub 侧才有成员表） */
@@ -4610,11 +5021,12 @@ export function createPeerServer(overrides = {}) {
   const GROUP_SELF_HEAL_PATHS = new Set(['/v1/group/election', '/v1/group/leader']);
 
   function authorizeGroupRequest(req, rawBody, url = null) {
-    if (headerValue(req, GROUP_AUTH_HEADER.toLowerCase()) === GROUP_AUTH_VALUE) {
+    const mode = groupAuthModeOf(req);
+    if (mode !== '') {
       const allowUnknownSender = Boolean(url && GROUP_SELF_HEAL_PATHS.has(url.pathname));
-      const checked = verifyGroupAuth(req, rawBody, { allowUnknownSender });
+      const checked = verifyGroupAuthByMode(req, rawBody, { allowUnknownSender });
       if (!checked.ok) return checked;
-      return { ok: true, mode: 'group', peerId: checked.senderId, ctx: checked.ctx };
+      return { ok: true, mode, peerId: checked.senderId, ctx: checked.ctx };
     }
     const checked = authenticate(req, rawBody);
     if (!checked.ok) return checked;
@@ -5243,12 +5655,12 @@ export function createPeerServer(overrides = {}) {
       acceptDispatch: acceptDispatchNow(),
       timeoutMs: peerTimeoutMs,
     };
-    const results = await Promise.allSettled(targets.map((peerId) => withGroupKey((keyCtx) => sendGroupHeartbeat({
+    const results = await Promise.allSettled(targets.map((peerId) => withGroupKey((keyCtx) => sendGroupHeartbeat(withIdentity({
       ...base,
       groupKey: keyCtx.groupKey,
       groupId: String(keyCtx.groupId),
       baseUrl: baseUrlOf(peerId),
-    }))));
+    })))));
     let conflictWith = '';
     let ahead = null;
     for (const result of results) {
@@ -5299,12 +5711,12 @@ export function createPeerServer(overrides = {}) {
       timeoutMs: peerTimeoutMs,
     };
     const targets = peerTargets();
-    const results = await Promise.allSettled(targets.map((peerId) => withGroupKey((keyCtx) => commitGroupMessage({
+    const results = await Promise.allSettled(targets.map((peerId) => withGroupKey((keyCtx) => commitGroupMessage(withIdentity({
       ...base,
       groupKey: keyCtx.groupKey,
       groupId: String(keyCtx.groupId),
       baseUrl: baseUrlOf(peerId),
-    }))));
+    })))));
     return { ok: true, delivered: results.filter((entry) => entry.status === 'fulfilled').length, total: targets.length };
   }
 
@@ -5419,7 +5831,7 @@ export function createPeerServer(overrides = {}) {
       let unreachable = unreachableBase;
       const tasks = targets.map(async (peerId) => {
         try {
-          const reply = await withGroupKey((keyCtx) => requestGroupVote({
+          const reply = await withGroupKey((keyCtx) => requestGroupVote(withIdentity({
             baseUrl: baseUrlOf(peerId),
             groupKey: keyCtx.groupKey,
             groupId: String(keyCtx.groupId),
@@ -5430,7 +5842,7 @@ export function createPeerServer(overrides = {}) {
             selfBaseUrl: localAdvertiseBaseUrl(),
             acceptDispatch: acceptDispatchNow(),
             timeoutMs: peerTimeoutMs,
-          }));
+          })));
           if (Number(reply?.epoch) > epoch && String(reply?.leaderPeerId ?? '') !== '') ahead = reply;
           if (typeof reply?.advertiseBaseUrl === 'string') rememberPeerBaseUrl(peerId, reply.advertiseBaseUrl);
           return reply?.vote === true;
@@ -6041,12 +6453,12 @@ export function createPeerServer(overrides = {}) {
     };
     const tasks = targets.map(async (peerId) => {
       try {
-        const reply = await withGroupKey((keyCtx) => proposeGroupMessage({
+        const reply = await withGroupKey((keyCtx) => proposeGroupMessage(withIdentity({
           ...base,
           groupKey: keyCtx.groupKey,
           groupId: String(keyCtx.groupId),
           baseUrl: baseUrlOf(peerId),
-        }));
+        })));
         return reply?.ok === true;
       } catch {
         return false;
@@ -6089,6 +6501,9 @@ export function createPeerServer(overrides = {}) {
       // v0.8.0（契约 §4.2/§5.1）：介绍人 → hub 的入群转交与代查（只有 hub 真的处理）
       'POST /v1/group/apply-intake': groupApplyIntake,
       'POST /v1/group/apply-query': groupApplyQuery,
+      // P2（0.9.0-α）群身份：register 用 v1 头、rotate 用 v2 头（都由头分流决定）
+      'POST /v1/group/identity/register': groupIdentityRegister,
+      'POST /v1/group/identity/rotate': groupIdentityRotate,
     };
     const handler = handlers[`${method} ${url.pathname}`];
     if (!handler) return { status: 405, body: { error: 'method-not-allowed' } };
@@ -6108,11 +6523,11 @@ export function createPeerServer(overrides = {}) {
     // POST /v1/group/post 是**双模式**端点（v0.8.0）：群级签名在 hub 上走单独分派，
     // per-peer 仍走下面的老路径（404 not-leader / 403 not-a-member 语义一字不变）。
     const groupAuthPost = method === 'POST' && url.pathname === '/v1/group/post'
-      && headerValue(req, GROUP_AUTH_HEADER.toLowerCase()) === GROUP_AUTH_VALUE;
+      && groupAuthModeOf(req) !== '';
     if (groupAuthPost) return groupPostWithGroupAuth(req, rawBody);
-    // S1/S2/S3 的八条 + v0.8.0 的两条：群级鉴权的路径 hub 与成员都提供（不经 hub 直连）。
+    // S1/S2/S3 的八条 + v0.8.0 的两条 + P2 的两条身份端点：群级鉴权的路径 hub 与成员都提供（不经 hub 直连）。
     // post 是双模式端点，例外地留在下面的 groupDispatch 里（per-peer 语义一字不变）。
-    if (GROUP_AUTH_PATHS.includes(url.pathname) && url.pathname !== '/v1/group/post') {
+    if (isGroupAuthPath(url.pathname) && url.pathname !== '/v1/group/post') {
       return groupAuthDispatch(req, rawBody, url);
     }
     // v0.8.0：per-peer 的发现/申请四条与群开关无关 —— 没启用群的节点也要能答
@@ -6233,7 +6648,7 @@ export function createPeerServer(overrides = {}) {
       }
       const batch = entry.messages.slice();
       try {
-        const sent = await replicateGroupMessages({
+        const sent = await replicateGroupMessages(withIdentity({
           baseUrl,
           groupKey: ctx.groupKey,
           groupId: ctx.groupId,
@@ -6243,7 +6658,7 @@ export function createPeerServer(overrides = {}) {
           messages: batch,
           selfBaseUrl: localAdvertiseBaseUrl(),
           timeoutMs: Math.max(500, replicaRetryMs),
-        });
+        }));
         entry.messages = entry.messages.slice(batch.length);
         entry.lastError = '';
         if (entry.messages.length === 0) replicaQueue.delete(peerId);
@@ -6509,7 +6924,7 @@ export function createPeerServer(overrides = {}) {
       }
       if (!ctx?.groupKey) return { ok: false, reason: 'no-group-key' };
       const sinceSeq = replicaStore.state().lastSeq;
-      const page = await withGroupKey((keyCtx) => pullGroupMessages({
+      const page = await withGroupKey((keyCtx) => pullGroupMessages(withIdentity({
         baseUrl: hub.baseUrl,
         groupKey: keyCtx.groupKey,
         groupId: keyCtx.groupId,
@@ -6522,7 +6937,7 @@ export function createPeerServer(overrides = {}) {
         // v0.8.2-α §4：follower 的周期自报渠道就是 pull（心跳只由 leader 发）
         acceptDispatch: acceptDispatchNow(),
         timeoutMs: Math.max(1000, replicaPullMs),
-      }));
+      })));
       if (String(page?.groupId ?? '') !== String(ctx.groupId)) {
         throw new Error('group-mismatch');
       }
@@ -7364,8 +7779,9 @@ export function createPeerServer(overrides = {}) {
 
   async function dispatch(req, rawBody, url, res) {
     const method = String(req.method ?? 'GET').toUpperCase();
-    // S1 路径白名单：群级鉴权只允许四条成员互访路径，其它路径一律 401 group-auth-scope
-    if (headerValue(req, 'x-peer-auth') === GROUP_AUTH_VALUE && !GROUP_AUTH_PATHS.includes(url.pathname)) {
+    // S1 路径白名单：群级鉴权（v1 与 v2 等价对待）只允许成员互访路径 + P2 的身份端点，
+    // 其它路径一律 401 group-auth-scope。漏掉 v2 这一支，v2 请求会被这条老规则打死。
+    if (groupAuthModeOf(req) !== '' && !isGroupAuthPath(url.pathname)) {
       return { status: 401, body: { error: 'group-auth-scope' } };
     }
     if (method === 'GET' && url.pathname === '/v1/health') return health();
@@ -7410,7 +7826,7 @@ export function createPeerServer(overrides = {}) {
         result = { status: 403, body: { error: 'forbidden-network' } };
       } else {
         rawBody = await readRequestBody(req);
-        const groupAuthRequest = headerValue(req, 'x-peer-auth') === GROUP_AUTH_VALUE;
+        const groupAuthRequest = groupAuthModeOf(req) !== '';
         // /v1/events 不在列表里：GET 没有请求体，加密信封无从谈起；
         // 它的签名在 handler 内验，事件载荷始终逐条加密（见 events()）。
         // 群级请求不参与 per-peer 门控：它用 HKDF(groupKey) 的信封，签名覆盖明文 body。
@@ -7697,7 +8113,7 @@ export function createPeerServer(overrides = {}) {
     let lastError = null;
     for (const baseUrl of targets) {
       try {
-        const sent = await withGroupKey((keyCtx) => postGroupWithGroupKey({
+        const sent = await withGroupKey((keyCtx) => postGroupWithGroupKey(withIdentity({
           baseUrl,
           groupKey: keyCtx.groupKey,
           groupId: String(keyCtx.groupId),
@@ -7707,7 +8123,7 @@ export function createPeerServer(overrides = {}) {
           meta,
           selfBaseUrl: localAdvertiseBaseUrl(),
           timeoutMs: 5_000,
-        }));
+        })));
         return { ok: true, seq: sent?.seq ?? null };
       } catch (error) {
         lastError = error;
