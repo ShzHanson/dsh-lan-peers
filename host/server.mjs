@@ -56,6 +56,7 @@ import {
   DispatchPrefs,
   isPermission,
   permissionRank,
+  readDispatchApprovalTtlMs,
 } from '../lib/dispatch-prefs.mjs';
 import {
   FILE_CHUNK_HARD_MAX,
@@ -706,6 +707,10 @@ export function resolveConfig(overrides = {}) {
     dispatchPendingTtlMs: normalizeCount(overrides.dispatchPendingTtlMs, DISPATCH_PENDING_TTL_MS, {
       max: 24 * 3600 * 1000,
     }),
+    // 显式注入 dispatchPendingTtlMs = 钉死这个值（既有旋钮与既有用例的口径一字不动）；
+    // 没注入时才由 <stateDir>/config.json 的 dispatchApprovalTtlMs 决定（默认 10 分钟，
+    // 允许 1 分钟 – 1 小时，手工改完不必重启 —— 见 lib/dispatch-prefs.mjs）。
+    dispatchPendingTtlPinned: Number.isFinite(Number(overrides.dispatchPendingTtlMs)),
   };
 }
 
@@ -2382,6 +2387,9 @@ export function createPeerServer(overrides = {}) {
     stateDir: config.stateDir,
     now: config.now,
     ttlMs: config.dispatchPendingTtlMs,
+    // 没被显式钉住时，每条新建的待批准记录都按 <stateDir>/config.json 的
+    // dispatchApprovalTtlMs 现算 expiresAt（改完 config.json 不必重启）。
+    ttlMsOf: config.dispatchPendingTtlPinned ? null : () => readDispatchApprovalTtlMs(config.stateDir),
     logger: config.logger,
   });
   /**
