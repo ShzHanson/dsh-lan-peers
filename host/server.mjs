@@ -932,6 +932,13 @@ export class StateStore {
 
   #lastTouchPersist = new Map();
 
+  /**
+   * 每个 peer「最近一次 touch 的毫秒时间戳」——touchPeer 每次都会更新，
+   * 但磁盘受 30s 节流限制，reloadPeers 会把内存态换成旧值。
+   * 读视图（listPeers）用它覆盖磁盘值，否则 30s 窗口内的活动看不见。
+   */
+  #lastTouch = new Map();
+
   constructor({ stateDir, name, now = Date.now }) {
     this.#stateDir = expandHome(stateDir);
     this.#name = String(name);
@@ -1102,7 +1109,19 @@ export class StateStore {
       peerId,
       name: peer?.name ?? '',
       baseUrl: peer?.baseUrl ?? null,
+      // 磁盘值可能比内存旧（30s 写盘节流）：取两者中较新的那个。
+      // 只对磁盘里仍然存在的条目这么做 —— 已解绑的 peer 不能靠内存值复活。
+      lastSeen: this.#freshLastSeen(peerId, peer?.lastSeen),
     }));
+  }
+
+  /** lastSeen 的「最新已知值」：磁盘值 vs #lastTouch 内存值，取较新的一个 */
+  #freshLastSeen(peerId, diskLastSeen) {
+    const touched = this.#lastTouch.get(peerId);
+    if (touched === undefined) return diskLastSeen ?? null;
+    const diskMs = typeof diskLastSeen === 'string' ? Date.parse(diskLastSeen) : Number.NaN;
+    if (!Number.isFinite(diskMs) || touched > diskMs) return nowIso(touched);
+    return diskLastSeen;
   }
 
   getPeerCount() {
@@ -1129,6 +1148,8 @@ export class StateStore {
       lastSeen: previous?.lastSeen ?? null,
     };
     writeJson0600(this.peersPath, loaded);
+    // 新记录以磁盘为准：清掉旧的内存 lastSeen 记账，避免读到上一段关系的时间戳
+    this.#lastTouch.delete(peerId);
     return loaded.peers[peerId];
   }
 
@@ -1144,6 +1165,8 @@ export class StateStore {
     delete loaded.peers[id];
     // 该 peer 的写盘节流记录也要清掉，否则重新配对后 first touch 会被旧时间戳吃掉
     this.#lastTouchPersist.delete(id);
+    // 内存里的 lastSeen 记账同理：留着它会让已解绑的 peer 在读视图上复活
+    this.#lastTouch.delete(id);
     writeJson0600(this.peersPath, loaded);
     return true;
   }
@@ -1153,6 +1176,8 @@ export class StateStore {
     const peer = this.peers.peers[peerId];
     if (!peer) return;
     peer.lastSeen = nowIso(atMs);
+    // 内存记账与写盘节流分开：读视图要立刻看到这次活动，磁盘仍每 30s 才写一次。
+    this.#lastTouch.set(peerId, atMs);
     const lastPersist = this.#lastTouchPersist.get(peerId) ?? 0;
     if (atMs - lastPersist < 30_000) return;
     this.#lastTouchPersist.set(peerId, atMs);
