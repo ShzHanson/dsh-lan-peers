@@ -1160,7 +1160,11 @@ export class StateStore {
       // Re-read first: the pairing CLI may have written baseUrl/secret since
       // this process loaded the file.
       this.reloadPeers();
-      this.peers.peers[peerId] = peer;
+      // ...and it may have *unpaired* this peer: 文件里已经没有这条就不要写回去，
+      // 否则一次群级请求（不依赖 peers.json 鉴权）就能把已解绑的 peer 复活。
+      const current = this.peers.peers[peerId];
+      if (!current) return;
+      current.lastSeen = peer.lastSeen;
       writeJson0600(this.peersPath, this.peers);
     } catch {
       // lastSeen 落盘失败不应让请求失败
@@ -2648,7 +2652,8 @@ export function createPeerServer(overrides = {}) {
     }
     // 只有签名通过的 nonce 才登记（同 per-peer 路径）
     rememberGroupNonce(nonce, nowMs);
-    return { ok: true, senderId, ctx };
+    // nowMs 带上：调用方刷新 lastSeen 用它，不再取一次时钟
+    return { ok: true, senderId, ctx, nowMs };
   }
 
   // ---- P2（0.9.0-α）：X-Peer-Auth: group-v2 = 证书 + ed25519 -----------------
@@ -2866,7 +2871,8 @@ export function createPeerServer(overrides = {}) {
     }
     // 9) 全部通过才登记 nonce
     rememberGroupNonce(nonce, nowMs);
-    return { ok: true, senderId, ctx };
+    // nowMs 带上：调用方刷新 lastSeen 用它，不再取一次时钟
+    return { ok: true, senderId, ctx, nowMs };
   }
 
   /**
@@ -2881,7 +2887,15 @@ export function createPeerServer(overrides = {}) {
     const checked = mode === 'group-v2'
       ? verifyGroupAuthV2(req, rawBody, options)
       : verifyGroupAuth(req, rawBody, options);
-    if (checked.ok && mode === 'group') noteLegacyGroupAuth(checked.senderId);
+    if (checked.ok) {
+      if (mode === 'group') noteLegacyGroupAuth(checked.senderId);
+      // 群成员的日常流量（心跳/拉取/复制/群派单）全走群级通道，不过 per-peer 验签；
+      // 不在这里刷新，「伙伴在线态」就停在最后一次 per-peer 交互上，几小时后被误判掉线。
+      // 语义不变：只有验签 + 成员校验全部通过（checked.ok）才走到这里，坏请求不刷新。
+      // touchPeer 只更新已配对条目（不存在直接 return），未配对成员不会凭空进 peers.json。
+      const senderId = String(checked.senderId ?? '');
+      if (senderId !== '' && senderId !== store.instanceId) store.touchPeer(senderId, checked.nowMs);
+    }
     return checked;
   }
 
