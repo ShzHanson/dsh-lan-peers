@@ -3599,6 +3599,14 @@ export function createPeerServer(overrides = {}) {
       // 不点名权限 = 接收方默认档（永远不会触发确认流程）
       const permission = named ? String(wantedPermission) : config.permission;
       if (permissionRank(permission) > permissionRank(prefs.maxPermission)) {
+        // 超上限 = 直接拒，不进确认流程。留一条可读的痕：现场判断「403 还是 202」
+        // 只能靠日志，而这个分支以前只留了一行通用访问日志。
+        if (config.logger) {
+          config.logger('[dispatch] denied from=' + shortPeer(auth.peerId)
+            + ' perm=' + permission
+            + ' max=' + prefs.maxPermission
+            + ' reason=permission-denied');
+        }
         return { status: 403, body: { error: 'permission-denied' }, peerId: auth.peerId };
       }
       dispatchScope = {
@@ -3639,19 +3647,33 @@ export function createPeerServer(overrides = {}) {
     if (dispatchScope?.needsApproval === true) {
       const replay = pendingApprovalFor(auth.peerId, requestId);
       if (replay) {
+        if (config.logger) {
+          // 三种 202 必须分得开：这条是「已经在队列里，复用同一条」。
+          config.logger('[dispatch] pending replay from=' + shortPeer(auth.peerId)
+            + ' id=' + String(replay.approvalId).slice(0, 8)
+            + ' ws=' + replay.workspaceId);
+        }
         return {
           status: 202,
           body: { state: 'pending-approval', approvalId: replay.approvalId, expiresAt: replay.expiresAt },
           peerId: auth.peerId,
         };
       }
-      const record = dispatchPending.create({
-        from: auth.peerId,
-        workspaceId: dispatchScope.entry.id,
-        workspaceName: dispatchScope.entry.name,
-        permission: dispatchScope.permission,
-        promptBytes: Buffer.byteLength(prompt, 'utf8'),
-      });
+      let record;
+      try {
+        record = dispatchPending.create({
+          from: auth.peerId,
+          workspaceId: dispatchScope.entry.id,
+          workspaceName: dispatchScope.entry.name,
+          permission: dispatchScope.permission,
+          promptBytes: Buffer.byteLength(prompt, 'utf8'),
+        });
+      } catch {
+        // 铁律：说了「等批准」就必须有一条查得到的记录。落盘/回读失败一律当场失败，
+        // 绝不回一个查不到的 202 —— 那会让对端永远等一条本机没有的记录。
+        if (config.logger) config.logger('[dispatch] pending failed reason=store');
+        return { status: 500, body: { error: 'approval-persist-failed' }, peerId: auth.peerId };
+      }
       dispatchPrompts.set(record.approvalId, { prompt, requestId, timeoutSec, dmSessionId, peerId: auth.peerId });
       while (dispatchPrompts.size > MAX_SESSIONS) {
         dispatchPrompts.delete(dispatchPrompts.keys().next().value);
@@ -3687,6 +3709,15 @@ export function createPeerServer(overrides = {}) {
       });
     } catch {
       return { status: 500, body: { error: 'runner-error' }, peerId: auth.peerId };
+    }
+    if (config.logger) {
+      // 真机事故的教训：/v1/ask 的 202 有三种含义（执行 / 新排队 / 重放），
+      // 而访问日志只记状态码 —— 一次误判「202 = 等批准」花了一整天才排除。
+      // 这条与 [dispatch] pending 成对出现，谁真开跑了从此一目了然。
+      config.logger('[dispatch] executed from=' + shortPeer(auth.peerId)
+        + ' ws=' + (dispatchScope ? dispatchScope.entry.id : '-')
+        + ' perm=' + (created.appliedPermission || '-')
+        + ' bytes=' + Buffer.byteLength(prompt, 'utf8'));
     }
     // sessionId 仍是 /v1/answer 的协议会话 id（旧客户端行为不变）；
     // dmSessionId 是 DSH 连续会话锚点，下一轮原样带回（契约 §1 的「连续会话」）。
