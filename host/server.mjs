@@ -7032,9 +7032,16 @@ export function createPeerServer(overrides = {}) {
       if (String(page?.groupId ?? '') !== String(ctx.groupId)) {
         throw new Error('group-mismatch');
       }
+      // 副本 epoch 是被两个平面写过的：applyCommitted/commitStaged 下发的是**角色平面**
+      // roleState().epoch（真机 2133），而这里 pull 响应带的是**群平面** keyVersion（真机 3）。
+      // 直接下发 page.epoch 会让 replicaStore 把每一批补差都判成「旧 leader 的补发」整批
+      // 丢弃（拉取永远成功、永远 got=0）。取两个平面里更大的那个再交给副本：修复的是
+      // 「同一件事两个刻度」的错配，丢弃判据本身（防旧 leader 补发的安全阀）原样保留。
+      const pageEpoch = Number(page.epoch) || 0;
+      const roleEpoch = Number(roleState()?.epoch) || 0;
       const applied = replicaStore.append({
         groupId: String(page.groupId),
-        epoch: Number(page.epoch) || 0,
+        epoch: Math.max(pageEpoch, roleEpoch),
         leaderPeerId: String(page.leaderPeerId ?? ''),
         messages: Array.isArray(page.messages) ? page.messages : [],
       });
