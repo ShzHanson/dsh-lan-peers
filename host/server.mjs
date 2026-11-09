@@ -5348,6 +5348,9 @@ export function createPeerServer(overrides = {}) {
   let roleStore = groupRole === 'off'
     ? null
     : new GroupRoleStore({ stateDir: config.stateDir, now: config.now });
+  // 加载期一次对账：把历史直写留下的「lastSeq 已推进、commitSeq 没跟上」修平。
+  // 位置在这里（早于任何群写入、早于 listen）：面板/成员第一次读 role() 前就已自洽。
+  reconcileCommitSeq();
   /** 学到的对端优先级（选举/心跳 body 里带），同 epoch 冲突裁决用（契约 §4） */
   const peerPriorities = new Map();
   /** 学到的对端可达地址（X-Peer-Base / 投票回执），成员侧没有 group.json 时靠它 */
@@ -5667,6 +5670,75 @@ export function createPeerServer(overrides = {}) {
       messages: [message],
     });
     return message;
+  }
+
+  /**
+   * 单阶段**提交完备**写：写权威日志 → 同步推进 commitSeq → 入复制队列，三件事成套。
+   *
+   * 谁走这里：quorum:none 的 post，以及 hub 自己的本地门面写（面板发言 / 派单回执）。
+   * 为什么 hub 本地写不走 deliverPost 的两阶段：
+   *   · server.group.post 是**同步**冻结门面（契约 §4）——lib/admin.mjs 与面板在同一个
+   *     tick 里读 message.seq；两阶段要等其它成员的 propose ack（await），同步签名表达
+   *     不出来，改成返回 Promise 会把所有既有调用方打断。
+   *   · 这条路径本来就是「hub 权威日志本地写」：不产生提案、不参与 quorum 裁决。
+   *     两阶段语义没有降级 —— 成员的 post 仍走 HTTP → deliverPost 的 propose→commit。
+   * 为什么必须成套：真机 seq 74 就是只做了第一件事 —— 消息可读、pull 也给得出去，
+   * 但 commitSeq 永远停在 73，而 pending 里没有条目，任何补偿都抓不到它。
+   *
+   * flush=false 给同步门面用：队列照排，网络推送交给复制重试定时器，
+   * 同步写路径（面板一次发言）不在这里发起网络 I/O。
+   */
+  function commitLocalMessage(input, { flush = true } = {}) {
+    const message = ledgerAppend(input);
+    const st = ensureRole();
+    if (st) {
+      roleStore.update({ commitSeq: Math.max(Number(st.commitSeq) || 0, Number(message.seq) || 0) });
+    }
+    if (groupStore) enqueueReplication(message, { flush });
+    return message;
+  }
+
+  /**
+   * 启动期一次性对账（治存量）：hub 的 commitSeq 落后于 lastSeq 时把它推到 lastSeq。
+   *
+   * 为什么需要：直写分支曾经只 append 不推进 commitSeq（真机 lastSeq=74 / commitSeq=73），
+   * 那些消息**已经在权威日志 messages 里**、pull 也给得出去，但「已提交」水位永远停在旧值。
+   *
+   * 只做一件可证伪的事：区间 (commitSeq, lastSeq] 的每一条 seq 都确实在 messages 里
+   * （落在归档区间里也算），才推进；否则一条都不动，只记一行，让「日志里有洞」显性化 ——
+   * 绝不把 commitSeq 蒙上去把洞藏起来。崩在 pending 里的提案也不在 messages 里，
+   * 因此同样按缺口处理（它的 seq 不会被承诺已提交）。
+   * 幂等：推进后 commitSeq === lastSeq，下次启动不再进入这个分支（不重复写、不重复记日志）。
+   */
+  function reconcileCommitSeq() {
+    if (!groupStore || !roleStore) return null;
+    const lastSeq = Math.floor(Number(groupStore.state().lastSeq) || 0);
+    const commitSeq = Math.floor(Number(roleStore.state().commitSeq) || 0);
+    if (lastSeq <= commitSeq) return null;
+    const window = lastSeq - commitSeq;
+    // 读窗口被 GROUP_HISTORY_MAX_LIMIT 截断：区间大到读不全就收手，绝不猜
+    if (window > GROUP_HISTORY_MAX_LIMIT) return null;
+    const fresh = groupStore.messages({ sinceSeq: commitSeq, limit: window });
+    const archives = groupStore.archives();
+    const archived = (seq) => archives.some(
+      (entry) => seq >= Number(entry.fromSeq) && seq <= Number(entry.toSeq),
+    );
+    const contiguous = fresh.length === window
+      && Number(fresh[0]?.seq) === commitSeq + 1
+      && Number(fresh[fresh.length - 1]?.seq) === lastSeq;
+    if (!contiguous) {
+      let gap = commitSeq + 1;
+      while (gap <= lastSeq) {
+        const covered = archived(gap) || fresh.some((message) => Number(message.seq) === gap);
+        if (!covered) break;
+        gap += 1;
+      }
+      if (config.logger && gap <= lastSeq) config.logger(`[group] commitSeq gap seq=${gap}`);
+      return null;
+    }
+    roleStore.update({ commitSeq: lastSeq });
+    if (config.logger) config.logger(`[group] commitSeq reconciled from=${commitSeq} to=${lastSeq}`);
+    return { from: commitSeq, to: lastSeq };
   }
 
   function stagePending(input) {
@@ -6497,15 +6569,13 @@ export function createPeerServer(overrides = {}) {
    */
   async function deliverPost(input) {
     if (quorumMode === 'none') {
-      const message = ledgerAppend(input);
-      const st0 = ensureRole();
-      if (st0) roleStore.update({ commitSeq: Math.max(st0.commitSeq, message.seq) });
+      // 与 hub 本地门面共用同一套动作（写日志 + 推进 commitSeq + 入队），两条写路径不会分叉
+      const message = commitLocalMessage(input);
       if (config.logger) {
         config.logger(
           `[group] post kind=${message.kind} seq=${message.seq} peer=${shortPeerId(input.peerId)} quorum=none`,
         );
       }
-      if (groupStore) enqueueReplication(message);
       return { status: 201, body: { seq: message.seq, ts: message.ts }, peerId: input.peerId };
     }
     const st = ensureRole();
@@ -6691,10 +6761,11 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * leader 写本地后调这里：把消息排进每个成员的队列并立刻尝试一次。
+   * leader 写本地后调这里：把消息排进每个成员的队列并（默认）立刻尝试一次。
    * 不 await、不抛 —— S2 的提交语义就是「写本地即提交」，复制失败只重试。
+   * flush=false：只排队，交给复制重试定时器推（同步门面路径用，见 commitLocalMessage）。
    */
-  function enqueueReplication(message) {
+  function enqueueReplication(message, { flush = true } = {}) {
     if (!groupStore) return;
     const ctx = localGroupContext();
     if (!ctx?.groupKey) return;
@@ -6709,7 +6780,7 @@ export function createPeerServer(overrides = {}) {
     }
     if (replicaQueue.size === 0) return;
     ensureReplicaTimer();
-    void flushReplication().catch(() => {});
+    if (flush) void flushReplication().catch(() => {});
   }
 
   async function flushReplication() {
@@ -8232,21 +8303,21 @@ export function createPeerServer(overrides = {}) {
 
   /**
    * 往群里投一条派单回执（progress/result）。三条通道，按可用性依次降级：
-   *   1. hub（有 groupStore）→ 直写 group.json，自己当 leader 时顺手入复制队列；
+   *   1. hub（有 groupStore）→ 本地提交完备写（group.json + commitSeq + 复制队列）；
    *   2. 有 hub 的 per-peer 密钥 → 既有 per-peer 通道打 hub（与 §14 进度镜像同一条路）；
    *   3. 只有群密钥（按名入群）→ 群级签名通道打 leader，leader 未知回落 hub。
    * 只有 2/3 都失败才抛（派单器记 group.error + 一行日志）；回执成败绝不影响派单本身。
    */
   async function postGroupReceipt({ kind, text = '', meta = null }) {
     if (groupStore) {
-      const message = groupStore.append({
+      // 回执也是消息：与面板发言同一套提交语义，否则回执一条条把 commitSeq 落下来
+      const message = commitLocalMessage({
         peerId: store.instanceId,
         name: config.name,
         kind,
         text,
         meta,
-      });
-      if (isLocalLeader()) enqueueReplication(message);
+      }, { flush: false });
       return { ok: true, seq: message?.seq ?? null };
     }
     const hub = groupHubPeer();
@@ -8367,7 +8438,9 @@ export function createPeerServer(overrides = {}) {
    * 契约 §4 冻结门面：server.group.post({ text, target?, workspaceId?, permission? })
    *
    * 关键向后兼容：**不带** target/workspaceId/permission 时逐字是 0.8.4 的行为 ——
-   * hub 直接 groupStore.append(input) 并原样返回那条消息（同步）；既有调用方零改动。
+   * hub 直接写 group.json 并原样返回那条消息（同步）；既有调用方零改动。
+   * 唯一变化是写入语义补齐：以前只 append（只推进 lastSeq），现在走 commitLocalMessage，
+   * commitSeq 同步推进并进复制队列 —— 否则这条消息在群视图里永远「未提交」（真机 seq 74）。
    * 带新字段才进「发帖 + 派单」链路，帖子与两条回执的 meta 都只带 id/名字/档位。
    */
   function groupPostFacade(input = {}) {
@@ -8376,7 +8449,7 @@ export function createPeerServer(overrides = {}) {
       || value.workspaceId !== undefined
       || value.permission !== undefined;
     if (!wantsDispatch) {
-      if (groupStore) return groupStore.append(value);
+      if (groupStore) return commitLocalMessage(value, { flush: false });
       return postGroupReceipt({
         peerId: store.instanceId,
         name: config.name,

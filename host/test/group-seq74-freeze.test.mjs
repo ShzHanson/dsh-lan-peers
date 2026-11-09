@@ -5,7 +5,8 @@
  *   A. hub 自己的门面直写（面板发言 / 派单回执）绕过 propose→commit，
  *      只推进 lastSeq，不推进 commitSeq → 日志里有一条「永远未提交」的消息，
  *      pending 里也没有它（pendingCount=0），任何补偿都无从下手。
- *      **这一条在 hub 侧，本机修复不动它 —— 用例继续钉现状。**
+ *      **这一条已修（hub 侧走提交完备写）**，所以用例反转成「两者同步推进」；
+ *      历史遗留（真机 73/74）由启动期对账兜底，见 group-hub-commit.test.mjs。
  *   B. 成员副本的 epoch 同时被两个平面写入（角色平面 roleState().epoch 与
  *      群平面 keyVersion），一旦角色的 epoch 更大，此后所有 pull 批次都被
  *      「旧 leader 的补发」整批丢弃（added=0/stale=true），拉取永远成功、永远拉不到。
@@ -44,7 +45,7 @@ async function pullNow(member) {
   throw new Error('pull 一直被后台那一轮占着（reason=skipped）');
 }
 
-test('DEFECT-A：hub 门面直写推进 lastSeq 但不推进 commitSeq，也不留 pending', async (t) => {
+test('DEFECT-A：hub 门面直写也必须走提交完备写（commitSeq 跟着 lastSeq 走，且不留 pending）', async (t) => {
   const cluster = await startCluster(t, { count: 2 });
   const hub = cluster.nodes[0];
   const before = hub.server.group.role();
@@ -55,13 +56,16 @@ test('DEFECT-A：hub 门面直写推进 lastSeq 但不推进 commitSeq，也不�
 
   const after = hub.server.group.role();
   assert.equal(hub.server.group.lastSeq(), posted.seq, 'lastSeq 是推进了的（真机 74）');
-  assert.equal(after.commitSeq, before.commitSeq, 'commitSeq 没动（真机 73 —— 这就是「卡在未提交」）');
-  assert.equal(after.pendingCount, 0, 'pending 里也没有它，连重试的抓手都不存在');
+  // 反转：修好之后 commitSeq 与 lastSeq 同步推进（修前 commitSeq 停在旧值 = 真机 73）
+  assert.equal(after.commitSeq, posted.seq, 'commitSeq 必须与 lastSeq 同步推进（真机停在 73 的那个洞）');
+  assert.equal(after.commitSeq, hub.server.group.lastSeq(), '两者相等 = 没有「永远未提交」的尾巴');
+  assert.equal(after.pendingCount, 0, '它走的是提交完备写，不是提案 —— pending 里不该有残留');
   assert.equal(hub.server.group.state().pendingCount, 0);
 
-  // 同一条消息对 pull 是可见的：它不是丢了，是「可读但未提交」。
+  // 同一条消息对 pull 是可见的：消息确实进了权威日志
   const history = hub.server.group.history({ sinceSeq: 0 });
   assert.ok(Array.isArray(history) && history.length >= 1, 'hub 权威日志里能看到这条');
+  assert.deepEqual(history.map((m) => m.seq), [posted.seq]);
 });
 
 test('FIXED-B：副本 epoch 被角色平面抬高后，群平面的补差仍然收得下（真机 73 → 74）', async (t) => {
