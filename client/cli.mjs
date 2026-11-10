@@ -22,6 +22,14 @@ import {
 } from './peer-call.mjs';
 import { readPeerEvents } from './sse.mjs';
 import { resolveLang, t } from '../lib/i18n.mjs';
+// v0.9.0-α：会话复用三元键的键名与区间只认 batch 1 那一份（CLI 不再抄一套常量）。
+import {
+  SESSION_NEW_APPROVAL_WINDOW_KEY,
+  SESSION_NEW_REQUEST_ALLOWED_KEY,
+  SESSION_REUSE_MS_MAX,
+  SESSION_REUSE_MS_MIN,
+  SESSION_REUSE_TTL_KEY,
+} from '../lib/session-reuse-prefs.mjs';
 // v0.8.2-α（契约 §1/§5）：@! 的解析口径与面板共用一份 —— 解析属于协议，不属于某一端。
 // 面板在管理接口里解析，CLI 在发完消息后解析，两边落在同一个函数上。
 import { parseGroupDispatchCommand } from '../lib/admin.mjs';
@@ -1823,6 +1831,49 @@ async function cmdDispatchDecide(dir, args, action) {
   console.log(L(key, { id: approvalId, state: String(out?.state ?? '-') }));
 }
 
+/** 毫秒 → 人话（与面板同一套档位口径；面板摆的是下拉，这里写的是任意值）。 */
+function reuseLabel(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return L('cli.dispatch.reuseOff');
+  // 一天以内说小时（86400000 说「24 小时」，与面板那一档同一个说法），两天往上才说天。
+  if (value % 86_400_000 === 0 && value >= 172_800_000) return L('cli.dispatch.reuseDays', { n: value / 86_400_000 });
+  if (value % 3_600_000 === 0) return L('cli.dispatch.reuseHours', { n: value / 3_600_000 });
+  if (value % 60_000 === 0) return L('cli.dispatch.reuseMinutes', { n: value / 60_000 });
+  return L('cli.dispatch.reuseMs', { n: value });
+}
+
+/**
+ * --reuse-ttl / --approval-window 的取值：off | 0 | <n>m | <n>h | <n>d | 纯毫秒。
+ * 看不懂或越界（0 … 30 天）一律回 -1 —— 调用方据此报错并以非零退出，不猜、不夹。
+ */
+function parseReuseMs(value) {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (text === 'off' || text === '0') return 0;
+  const matched = /^(\d+)(ms|m|h|d)$/.exec(text);
+  let ms;
+  if (matched) {
+    const unit = matched[2] === 'ms' ? 1 : matched[2] === 'm' ? 60_000 : matched[2] === 'h' ? 3_600_000 : 86_400_000;
+    ms = Number(matched[1]) * unit;
+  } else if (/^\d+$/.test(text)) {
+    ms = Number(text);
+  } else {
+    return -1;
+  }
+  if (!Number.isSafeInteger(ms) || ms < SESSION_REUSE_MS_MIN || ms > SESSION_REUSE_MS_MAX) return -1;
+  return ms;
+}
+
+/** 会话复用那三个值：只在宿主给了键时才打（老宿主没有这三个键，绝不假装是「关闭」）。 */
+function printDispatchReuse(view) {
+  const src = view && typeof view === 'object' ? view : {};
+  if (!Object.prototype.hasOwnProperty.call(src, SESSION_REUSE_TTL_KEY)) return;
+  console.log(L('cli.dispatch.reuseHead', {
+    reuse: reuseLabel(src[SESSION_REUSE_TTL_KEY]),
+    approval: reuseLabel(src[SESSION_NEW_APPROVAL_WINDOW_KEY]),
+    allow: src[SESSION_NEW_REQUEST_ALLOWED_KEY] === true ? L('cli.dispatch.reuseYes') : L('cli.dispatch.reuseNo'),
+  }));
+}
+
 /** 打印本机派单设置（本机视角，含 path —— 与面板设置页同一份口径）。 */
 function printDispatchSettings(view) {
   const workspaces = Array.isArray(view?.workspaces) ? view.workspaces : [];
@@ -1831,6 +1882,7 @@ function printDispatchSettings(view) {
     max: String(view?.maxPermission ?? '') || '-',
     count: workspaces.length,
   }));
+  printDispatchReuse(view);
   for (const ws of workspaces) {
     console.log(L('cli.dispatch.workspaceRow', {
       id: String(ws?.id ?? ''),
@@ -1840,16 +1892,33 @@ function printDispatchSettings(view) {
   }
 }
 
-/** dispatch settings [--default <id>] [--max-perm <档>]：不带参数就是只读。 */
+/** dispatch settings [--default <id>] [--max-perm <档>] [--reuse-ttl <24h>] [--approval-window <7d>] [--allow-new-request <true|false>] */
 async function cmdDispatchSettings(dir, args) {
   const wantedDefault = args.default === undefined || args.default === true ? '' : String(args.default).trim();
   const wantedMax = args['max-perm'] === undefined || args['max-perm'] === true ? '' : String(args['max-perm']).trim();
+  const rawTtl = args['reuse-ttl'] === undefined || args['reuse-ttl'] === true ? '' : String(args['reuse-ttl']).trim();
+  const rawWindow = args['approval-window'] === undefined || args['approval-window'] === true
+    ? '' : String(args['approval-window']).trim();
+  const rawAllow = args['allow-new-request'] === undefined || args['allow-new-request'] === true
+    ? '' : String(args['allow-new-request']).trim().toLowerCase();
   if (wantedMax !== '' && !DISPATCH_PERMISSIONS.includes(wantedMax)) {
     throw new Error(L('cli.dispatch.badPerm') + '\n' + L('cli.dispatch.usage'));
+  }
+  const ttlMs = rawTtl === '' ? -1 : parseReuseMs(rawTtl);
+  if (rawTtl !== '' && ttlMs < 0) throw new Error(L('cli.dispatch.badReuseTtl') + '\n' + L('cli.dispatch.usage'));
+  const windowMs = rawWindow === '' ? -1 : parseReuseMs(rawWindow);
+  if (rawWindow !== '' && windowMs < 0) {
+    throw new Error(L('cli.dispatch.badApprovalWindow') + '\n' + L('cli.dispatch.usage'));
+  }
+  if (rawAllow !== '' && rawAllow !== 'true' && rawAllow !== 'false') {
+    throw new Error(L('cli.dispatch.badAllowNewRequest') + '\n' + L('cli.dispatch.usage'));
   }
   const patch = {};
   if (wantedDefault !== '') patch.defaultWorkspaceId = wantedDefault;
   if (wantedMax !== '') patch.maxPermission = wantedMax;
+  if (ttlMs >= 0) patch[SESSION_REUSE_TTL_KEY] = ttlMs;
+  if (windowMs >= 0) patch[SESSION_NEW_APPROVAL_WINDOW_KEY] = windowMs;
+  if (rawAllow !== '') patch[SESSION_NEW_REQUEST_ALLOWED_KEY] = rawAllow === 'true';
   const write = Object.keys(patch).length > 0;
   let url;
   try {
@@ -1875,6 +1944,7 @@ async function cmdDispatchSettings(dir, args) {
       max: String(out?.maxPermission ?? '') || '-',
       count: Array.isArray(out?.workspaces) ? out.workspaces.length : 0,
     }));
+    printDispatchReuse(out);
     return;
   }
   printDispatchSettings(out);

@@ -221,3 +221,80 @@ test('语言钉住：每个 client/cli*.test.mjs 都显式设了 DSH_LAN_PEERS_L
     assert.match(text, /DSH_LAN_PEERS_LANG['\]]?\s*[:=]\s*'zh'/, name + ' 必须把语言钉成 zh');
   }
 });
+
+// ---------------------------------------------------------------------------
+// v0.9.0-α：dispatch settings 的会话复用三元键（值与面板、管理接口同一份 config.json）。
+// 口径：不带参数就显示（含单位）；带了就只发那几个键；看不懂的输入本地挡住、非零退出。
+// ---------------------------------------------------------------------------
+const REUSE_PREFS = {
+  ...PREFS,
+  sessionReuseTtlMs: 86_400_000,
+  sessionNewApprovalWindowMs: 604_800_000,
+  sessionNewRequestAllowed: false,
+};
+
+test('dispatch settings：只读时打印会话复用三值（带单位），老宿主没有这三个键就不打这一行', async (t) => {
+  const admin = await startAdmin(t, () => ({ body: REUSE_PREFS }));
+  const out = await runAsync(['dispatch', 'settings', '--url', admin.url, '--state-dir', admin.dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /^会话复用 24 小时 · 新建批准窗 7 天 · 接受新会话请求 否$/m);
+  // 既有的默认/上限/清单三行一个字都没变。
+  assert.match(out.stdout, /^默认工作区 main\t最大授权 workspace-write\t工作区 2 个$/m);
+  assert.match(out.stdout, /^  docs\t文档\tD:\/work\/docs$/m);
+
+  const old = await startAdmin(t, () => ({ body: PREFS }));
+  const oldOut = await runAsync(['dispatch', 'settings', '--url', old.url, '--state-dir', old.dir]);
+  assert.equal(oldOut.status, 0);
+  assert.equal(/会话复用/.test(oldOut.stdout), false, '老宿主没有这三个键，不假装是「关闭」');
+});
+
+test('dispatch settings --reuse-ttl/--approval-window/--allow-new-request：POST 只带这几个键并回显', async (t) => {
+  const admin = await startAdmin(t, () => ({
+    body: {
+      ...PREFS,
+      sessionReuseTtlMs: 604_800_000,
+      sessionNewApprovalWindowMs: 86_400_000,
+      sessionNewRequestAllowed: false,
+    },
+  }));
+  const out = await runAsync([
+    'dispatch', 'settings',
+    '--reuse-ttl', '7d', '--approval-window', '1d', '--allow-new-request', 'false',
+    '--url', admin.url, '--state-dir', admin.dir,
+  ]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(admin.seen[0].method, 'POST');
+  assert.deepEqual(admin.seen[0].body, {
+    sessionReuseTtlMs: 604_800_000,
+    sessionNewApprovalWindowMs: 86_400_000,
+    sessionNewRequestAllowed: false,
+  });
+  assert.match(out.stdout, /^派单设置已保存: 默认 main · 最大授权 workspace-write · 工作区 2 个$/m);
+  assert.match(out.stdout, /^会话复用 7 天 · 新建批准窗 24 小时 · 接受新会话请求 否$/m);
+
+  // off / 0 都是「关闭」，纯毫秒照收。
+  const off = await startAdmin(t, (call) => ({ body: { ...REUSE_PREFS, ...call.body } }));
+  const offOut = await runAsync([
+    'dispatch', 'settings', '--reuse-ttl', 'off', '--approval-window', '604800000',
+    '--url', off.url, '--state-dir', off.dir,
+  ]);
+  assert.equal(offOut.status, 0, offOut.stderr);
+  assert.deepEqual(off.seen[0].body, { sessionReuseTtlMs: 0, sessionNewApprovalWindowMs: 604_800_000 });
+  assert.match(offOut.stdout, /^会话复用 关闭 · 新建批准窗 7 天/m);
+});
+
+test('dispatch settings：看不懂或越界的会话复用输入本地挡住，非零退出且一个请求都不发', async (t) => {
+  const admin = await startAdmin(t, () => ({ body: REUSE_PREFS }));
+  for (const args of [
+    ['--reuse-ttl', '45d'],
+    ['--reuse-ttl', 'abc'],
+    ['--approval-window', '12y'],
+    ['--allow-new-request', 'maybe'],
+  ]) {
+    const out = await runAsync(['dispatch', 'settings', ...args, '--url', admin.url, '--state-dir', admin.dir]);
+    assert.equal(out.status, 1, args.join(' ') + ' 必须以 1 退出');
+    assert.equal(out.stderr.includes('at '), false, '不许甩栈：' + out.stderr);
+    assert.match(out.stderr, /--reuse-ttl 只认|--approval-window 只认|--allow-new-request 只认/);
+  }
+  assert.equal(admin.seen.length, 0, '非法输入不发请求');
+});
