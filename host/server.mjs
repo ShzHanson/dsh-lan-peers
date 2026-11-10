@@ -59,6 +59,14 @@ import {
   readDispatchApprovalTtlMs,
 } from '../lib/dispatch-prefs.mjs';
 import {
+  SESSION_ACTION_APPROVAL,
+  SESSION_ACTION_REUSE,
+  SESSION_REUSE_REASONS,
+  decideSessionAction,
+  normalizeWorkspaceKey,
+} from '../lib/session-reuse.mjs';
+import { readSessionReusePrefs } from '../lib/session-reuse-prefs.mjs';
+import {
   FILE_CHUNK_HARD_MAX,
   FILE_DEFAULT_CHUNK_BYTES,
   FILE_DEFAULT_INBOX_BYTES,
@@ -3224,6 +3232,41 @@ export function createPeerServer(overrides = {}) {
    *   workspaceId / workspaceName —— 会话记录里的对外标识（id + 名字，永不含 path）
    *   permission     —— **请求**的权限档（实际生效档由 runner 回报，见 appliedPermission）
    */
+  /**
+   * 0.9.0-α 会话账本：**会话记录自己就是账本**（不新开文件、不落盘 ——
+   * host 的会话本来就不跨进程存活）。每条记录在创建时钉住三元与 lastUsedAt，
+   * 之后按三元找「最近用过的那条」：对端、归一化工作区、权限档三者全等才可能复用。
+   */
+  function tripleMatches(left, right) {
+    return left !== null && typeof left === 'object'
+      && right !== null && typeof right === 'object'
+      && String(left.peerId ?? '') === String(right.peerId ?? '')
+      && String(left.workspace ?? '') === String(right.workspace ?? '')
+      && String(left.permission ?? '') === String(right.permission ?? '');
+  }
+
+  /**
+   * 找可复用会话：三元全等，且它真有一个 runner 会话 id。
+   * 发送方点了锚点时**优先**用锚点那条（仍要三元全等 —— 锚点不是免检通行证），
+   * 否则取最近用过的那条。找不到返回 null（= 新建）。
+   */
+  function findReusableSession(triple, anchor) {
+    let best = null;
+    let anchored = null;
+    for (const record of sessions.values()) {
+      if (!tripleMatches(record.triple, triple)) continue;
+      const runnerSessionId = typeof record.runnerSessionId === 'string' ? record.runnerSessionId : '';
+      if (runnerSessionId === '') continue;
+      const stamp = Number.isFinite(record.lastUsedAt) ? record.lastUsedAt : 0;
+      const candidate = { lastUsedAt: stamp, runnerSessionId, triple: record.triple };
+      if (best === null || stamp > best.lastUsedAt) best = candidate;
+      if (anchor !== '' && runnerSessionId === anchor && (anchored === null || stamp > anchored.lastUsedAt)) {
+        anchored = candidate;
+      }
+    }
+    return anchored ?? best;
+  }
+
   async function createAskSession({
     peerId,
     requestId,
@@ -3234,6 +3277,13 @@ export function createPeerServer(overrides = {}) {
     workspaceId = '',
     workspaceName = '',
     permission = '',
+    // 0.9.0-α 会话复用策略的三个输入（都由上层决定，这里只执行）：
+    //   requestNewSession —— 发送方点名「我要新会话」
+    //   approvedNewSession —— 人已经在待批准队列里点头（不再回头去排队）
+    //   reuseFallback —— 新建会话的批准被拒/过期：强制回落复用（用户已决定的行为）
+    requestNewSession = false,
+    approvedNewSession = false,
+    reuseFallback = false,
   }) {
     const key = `${peerId}\u0000${requestId}`;
     const existingId = requestIds.get(key);
@@ -3259,8 +3309,91 @@ export function createPeerServer(overrides = {}) {
     // 真 DSH 适配器可能是异步的，这里 await 兼容 string/Promise/新对象形状。
     // 契约 §2：没点名工作区/权限时**调用形状与以前一模一样**（连 options 都不传），
     // 旧 runner 与旧断言不受影响；点名的两个键对不认识的 runner 是未知键，忽略即可。
+    // ---- 0.9.0-α 会话复用策略：复用 / 新建 / 待批准 --------------------------
+    // 键是**三元**（对端 + 归一化工作区 + 权限档）：权限档折进会话创建时的事件里
+    // （session/create 没有权限字段，见 lib/runner-dsh.mjs 的注释），所以跨档复用
+    // 等于跨权限复用 —— 一律不算可复用。窗口以 lastUsedAt 为滑动锚点。
+    const reusePrefs = readSessionReusePrefs(config.stateDir);
+    const triple = {
+      peerId,
+      // 没点名工作区时执行侧用的就是 config.workspace，这一致性必须显式写出来，
+      // 否则「不点名」与「点名默认工作区」会变成两个永不相等的工作区键。
+      workspace: normalizeWorkspaceKey(typeof workspace === 'string' && workspace !== '' ? workspace : config.workspace),
+      permission: permission !== '' ? permission : config.permission,
+    };
+    const nowMs = config.now();
+    const reusable = findReusableSession(triple, wanted);
+    const verdict = decideSessionAction({
+      now: nowMs,
+      existing: reusable,
+      reuseTtlMs: reusePrefs.sessionReuseTtlMs,
+      approvalWindowMs: reusePrefs.sessionNewApprovalWindowMs,
+      requestAllowed: reusePrefs.sessionNewRequestAllowed,
+      requestedNew: requestNewSession === true,
+      triple,
+    });
+    let action = verdict.action;
+    let reason = verdict.reason;
+    if (action === SESSION_ACTION_APPROVAL) {
+      if (reuseFallback === true) {
+        // 人拒绝了「新建」：按用户决定回落复用，而不是让这一问失败
+        action = reusable === null ? 'new' : SESSION_ACTION_REUSE;
+        reason = SESSION_REUSE_REASONS.FALLBACK_REUSE;
+      } else if (approvedNewSession === true) {
+        // 这一问已经过了人工批准，不能再排一次队
+        action = 'new';
+      }
+    }
+    if (action === SESSION_ACTION_REUSE && reusable === null) {
+      action = 'new';
+      reason = SESSION_REUSE_REASONS.NO_SESSION;
+    }
+    if (config.logger) {
+      // 一条决策一行，形状稳定：不记正文、不记路径、不记 token（gap 只是毫秒数）
+      config.logger('[dispatch] session reuse=' + action + ' reason=' + reason + ' gap_ms=' + verdict.gapMs);
+    }
+    if (action === SESSION_ACTION_APPROVAL) {
+      // 同一条请求重试：复用队列里那条，不排第二条（与权限批准的重放同口径）
+      const replay = pendingApprovalFor(peerId, requestId);
+      if (replay !== null) {
+        if (config.logger) {
+          config.logger('[dispatch] pending replay from=' + shortPeer(peerId)
+            + ' id=' + String(replay.approvalId).slice(0, 8)
+            + ' ws=' + replay.workspaceId);
+        }
+        return { pendingApproval: true, approvalId: replay.approvalId, expiresAt: replay.expiresAt, reason, replayed: true };
+      }
+      // 窗口内新建会话 = 要人点头：走**既有的**待批准队列与 202 形状，不另起一套
+      let record;
+      try {
+        record = dispatchPending.create({
+          from: peerId,
+          workspaceId,
+          workspaceName,
+          permission,
+          promptBytes: Buffer.byteLength(prompt, 'utf8'),
+        });
+      } catch {
+        // 铁律：说了「等批准」就必须有一条查得到的记录
+        if (config.logger) config.logger('[dispatch] pending failed reason=store');
+        return { approvalPersistFailed: true };
+      }
+      dispatchPrompts.set(record.approvalId, {
+        prompt,
+        requestId,
+        timeoutSec,
+        dmSessionId,
+        peerId,
+        // 只有「新建会话」的批准在拒绝/过期时会回落复用；权限档批准是提权，绝不自动执行
+        kind: 'session-new',
+      });
+      while (dispatchPrompts.size > MAX_SESSIONS) {
+        dispatchPrompts.delete(dispatchPrompts.keys().next().value);
+      }
+      return { pendingApproval: true, approvalId: record.approvalId, expiresAt: record.expiresAt, reason };
+    }
     const askOptions = {};
-    if (wanted !== '') askOptions.sessionId = wanted;
+    if (action === SESSION_ACTION_REUSE && reusable !== null) askOptions.sessionId = reusable.runnerSessionId;
     if (typeof workspace === 'string' && workspace !== '') askOptions.workspace = workspace;
     if (typeof permission === 'string' && permission !== '') askOptions.permission = permission;
     const asked = normalizeRunnerAnswer(
@@ -3299,6 +3432,9 @@ export function createPeerServer(overrides = {}) {
       startedAt,
       timeoutSec,
       deadline: startedAt + timeoutSec * 1000,
+      // 0.9.0-α 复用账本：三元 + 滑动锚点（lastUsedAt 每次用这个会话都会刷新）
+      triple,
+      lastUsedAt: startedAt,
       // H4：结算后释放全局并发名额（answerFor 是所有观测路径的唯一出口）
       settled: false,
     });
@@ -3333,6 +3469,8 @@ export function createPeerServer(overrides = {}) {
     /** 终态（done/error/timeout）都算结算：名额立刻还给 H4 的并发闸 */
     const settle = (outcome) => {
       session.settled = true;
+      // 0.9.0-α：用完了才算「最近用过」—— 滑动的复用窗口锚点在这里刷新
+      session.lastUsedAt = config.now();
       return outcome;
     };
     if (result.status === 'done') {
@@ -3706,9 +3844,31 @@ export function createPeerServer(overrides = {}) {
         workspaceId: dispatchScope ? dispatchScope.entry.id : '',
         workspaceName: dispatchScope ? dispatchScope.entry.name : '',
         permission: dispatchScope ? dispatchScope.permission : '',
+        // 0.9.0-α §3：发送方点名「我要新会话」（接收方可以用 sessionNewRequestAllowed 拒绝）
+        requestNewSession: body.requestNewSession === true,
       });
     } catch {
       return { status: 500, body: { error: 'runner-error' }, peerId: auth.peerId };
+    }
+    if (created?.approvalPersistFailed === true) {
+      // 与权限批准同一条铁律：记录没落地就不许回 202
+      return { status: 500, body: { error: 'approval-persist-failed' }, peerId: auth.peerId };
+    }
+    if (created?.pendingApproval === true) {
+      // 窗口内新建会话：回**既有**的 202 形状（state/approvalId/expiresAt 三键不动）
+      if (config.logger) {
+        config.logger(
+          '[dispatch] pending from=' + shortPeer(auth.peerId)
+          + ' ws=' + (dispatchScope ? dispatchScope.entry.id : '-')
+          + ' perm=' + (dispatchScope ? dispatchScope.permission : '-')
+          + ' bytes=' + Buffer.byteLength(prompt, 'utf8'),
+        );
+      }
+      return {
+        status: 202,
+        body: { state: 'pending-approval', approvalId: created.approvalId, expiresAt: created.expiresAt },
+        peerId: auth.peerId,
+      };
     }
     if (config.logger) {
       // 真机事故的教训：/v1/ask 的 202 有三种含义（执行 / 新排队 / 重放），
@@ -7834,8 +7994,60 @@ export function createPeerServer(overrides = {}) {
     return { status: 200, body: dispatchPrefs.options(), peerId: auth.peerId };
   }
 
+  /**
+   * 0.9.0-α §5（用户决定）：新建会话的批准被**拒绝或过期**时回落到复用，而不是让这一问失败。
+   *
+   * 只对 kind=session-new 的排队条目生效：权限档批准是**提权**，拒绝就是拒绝，
+   * 过期就是过期 —— 那条路上绝不自动执行（铁律 §0）。
+   * 复用目标由 createAskSession 的 reuseFallback 分支自己按三元重找一遍，
+   * 这里不猜会话 id；拿不到就保持原状态（不编造）。
+   */
+  async function sessionNewFallback(approvalId, record) {
+    const queued = dispatchPrompts.get(approvalId);
+    if (!queued || queued.kind !== 'session-new' || typeof queued.prompt !== 'string' || queued.prompt === '') {
+      return null;
+    }
+    // 空 workspaceId = 旧客户端没点名派单范围：执行侧用的就是接收方默认工作区，
+    // 这一路照原样（不点名）重新跑一遍，三元才对得上。
+    const legacy = String(record.workspaceId ?? '') === '';
+    const entry = legacy ? null : dispatchPrefs.workspace(record.workspaceId);
+    if (!legacy && !entry) {
+      dispatchPrompts.delete(approvalId);
+      return null;
+    }
+    let created;
+    try {
+      created = await createAskSession({
+        peerId: record.from,
+        requestId: queued.requestId,
+        prompt: queued.prompt,
+        timeoutSec: queued.timeoutSec,
+        dmSessionId: queued.dmSessionId,
+        workspace: entry ? entry.path : '',
+        workspaceId: entry ? entry.id : '',
+        workspaceName: entry ? entry.name : '',
+        permission: record.permission,
+        reuseFallback: true,
+      });
+    } catch {
+      // 复用也失败：正文留着，状态不变（下一次查询还能再试一次），绝不编造成功
+      return null;
+    }
+    if (typeof created?.sessionId !== 'string' || created.sessionId === '') return null;
+    dispatchPrompts.delete(approvalId);
+    // 结论仍是「拒绝/过期」，但把复用到的会话 id 写回去：发送方据此接着聊
+    dispatchPending.settle(approvalId, record.state === 'expired' ? 'expired' : 'rejected', { sessionId: created.sessionId });
+    if (config.logger) {
+      config.logger(
+        '[dispatch] session fallback state=' + (record.state === 'expired' ? 'expired' : 'rejected')
+        + ' bytes=' + Buffer.byteLength(queued.prompt, 'utf8'),
+      );
+    }
+    return created;
+  }
+
   /** GET /v1/dispatch/approval?id= —— 只有发起方本人能读自己那条 */
-  function dispatchApproval(req, rawBody, url) {
+  async function dispatchApproval(req, rawBody, url) {
     const auth = authenticate(req, rawBody);
     if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
     const approvalId = url.searchParams.get('id');
@@ -7847,13 +8059,22 @@ export function createPeerServer(overrides = {}) {
     if (!record || record.from !== auth.peerId) {
       return { status: 404, body: { error: 'unknown-approval' }, peerId: auth.peerId };
     }
-    return {
-      status: 200,
-      body: record.state === 'approved' && typeof record.sessionId === 'string' && record.sessionId !== ''
-        ? { state: 'approved', sessionId: record.sessionId }
-        : { state: record.state },
-      peerId: auth.peerId,
-    };
+    let current = record;
+    // 拒绝/过期 + 这条是「新建会话」→ 当场回落复用（发送方轮询到这里就能接着聊）
+    if ((record.state === 'rejected' || record.state === 'expired')
+      && (typeof record.sessionId !== 'string' || record.sessionId === '')) {
+      const fallback = await sessionNewFallback(approvalId, record);
+      if (fallback) current = dispatchPending.peek(approvalId) ?? record;
+    }
+    const sessionId = typeof current.sessionId === 'string' && current.sessionId !== '' ? current.sessionId : '';
+    if (current.state === 'approved' && sessionId !== '') {
+      return { status: 200, body: { state: 'approved', sessionId }, peerId: auth.peerId };
+    }
+    if (sessionId !== '') {
+      // 回落到复用的结论：状态如实（rejected/expired），但标 reused 并给出会话 id
+      return { status: 200, body: { state: current.state, reused: true, sessionId }, peerId: auth.peerId };
+    }
+    return { status: 200, body: { state: current.state }, peerId: auth.peerId };
   }
 
   /**
@@ -7880,8 +8101,11 @@ export function createPeerServer(overrides = {}) {
       if (config.logger) config.logger('[dispatch] approve state=expired reason=prompt-lost');
       return { ok: false, state: 'expired', reason: 'prompt-lost' };
     }
-    const entry = dispatchPrefs.workspace(record.workspaceId);
-    if (!entry) {
+    // 空 workspaceId = 旧客户端的待批准记录（没点名派单范围）：执行侧本来就该用接收方
+    // 默认工作区，这一路照原样（不点名）执行；点过名的仍然不许退回某个「猜的对目录」。
+    const legacyApproval = String(record.workspaceId ?? '') === '';
+    const entry = legacyApproval ? null : dispatchPrefs.workspace(record.workspaceId);
+    if (!legacyApproval && !entry) {
       // 排队期间工作区被改名/删掉：按拒绝处理，绝不退回某个「猜的对目录」
       dispatchPending.settle(approvalId, 'rejected');
       dispatchPrompts.delete(approvalId);
@@ -7896,15 +8120,23 @@ export function createPeerServer(overrides = {}) {
         prompt: queued.prompt,
         timeoutSec: queued.timeoutSec,
         dmSessionId: queued.dmSessionId,
-        workspace: entry.path,
-        workspaceId: entry.id,
-        workspaceName: entry.name,
+        workspace: entry ? entry.path : '',
+        workspaceId: entry ? entry.id : '',
+        workspaceName: entry ? entry.name : '',
         permission: record.permission,
+        // 人已经点头：不再回头排一次队（否则批准会把自己重新排进队列）
+        approvedNewSession: true,
       });
     } catch {
       // 执行侧失败：记录留在 pending，用户可以再点一次批准
       if (config.logger) config.logger('[dispatch] approve state=pending reason=runner-error');
       return { ok: false, state: 'pending', reason: 'runner-error' };
+    }
+    if (created?.pendingApproval === true || created?.approvalPersistFailed === true
+      || typeof created?.sessionId !== 'string' || created.sessionId === '') {
+      // 走到这里说明没拿到会话（不该发生）：如实回 pending，绝不编造一个 sessionId 去结案
+      if (config.logger) config.logger('[dispatch] approve state=pending reason=session-approval-required');
+      return { ok: false, state: 'pending', reason: 'session-approval-required' };
     }
     dispatchPrompts.delete(approvalId);
     dispatchPending.settle(approvalId, 'approved', { sessionId: created.sessionId });
@@ -7919,7 +8151,7 @@ export function createPeerServer(overrides = {}) {
     return { ok: true, state: 'approved', sessionId: created.sessionId };
   }
 
-  /** 契约 §4：拒绝 = 只结算，不执行（正文当场丢掉） */
+  /** 契约 §4：拒绝 = 只结算，不执行（正文当场丢掉）——「新建会话」例外：正文留着等回落复用 */
   function rejectDispatch(approvalIdRaw) {
     const approvalId = String(approvalIdRaw ?? '');
     if (approvalId === '') return { ok: false, state: 'unknown', reason: 'bad-approval' };
@@ -7929,6 +8161,16 @@ export function createPeerServer(overrides = {}) {
       return record.state === 'approved'
         ? { ok: false, state: 'approved' }
         : { ok: true, state: record.state };
+    }
+    const queued = dispatchPrompts.get(approvalId);
+    if (queued?.kind === 'session-new') {
+      // 人拒绝的是「**新建**会话」这一件事，不是这一问：正文留着，
+      // 发送方下一次轮询（GET /v1/dispatch/approval）时按用户决定回落到复用。
+      dispatchPending.settle(approvalId, 'rejected');
+      if (config.logger) {
+        config.logger('[dispatch] reject ws=' + record.workspaceId + ' perm=' + record.permission + ' state=rejected');
+      }
+      return { ok: true, state: 'rejected' };
     }
     dispatchPrompts.delete(approvalId);
     dispatchPending.settle(approvalId, 'rejected');

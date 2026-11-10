@@ -12,6 +12,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 
 import {
   ASK_BUSY_RETRY_MS,
@@ -292,6 +294,9 @@ test('H4 全局在跑会话上限：占满后新请求 429，会话结算后立�
   // 假时钟从真实时间起步：签名的时间戳用的是真实 Date.now，偏差必须留在 CLOCK_SKEW_MS 内
   const clock = { now: Date.now() };
   const stateDir = makeTempStateDir();
+  // 0.9.0-α：这条验的是并发闸本身 —— 把复用窗口关掉（TTL=0 = 永不复用），
+  // 让每一次 ask 都真的在 runner 侧新建会话（否则同三元三次 ask 只会有一条会话）。
+  fs.writeFileSync(path.join(stateDir, 'config.json'), JSON.stringify({ sessionReuseTtlMs: 0 }), 'utf8');
   seedPeers(stateDir, [PEER]);
   const runner = createRunner({ delayMs: 0 });
   const { baseUrl } = await startServer(t, {
@@ -347,6 +352,8 @@ test('H4 关闭开关（askRateLimit=false）：回到不限流，连发 12 次�
 
 test('H4 pruneSessions 淘汰会话时显式取消 runner 会话（提供 cancel 就调用）', async (t) => {
   const stateDir = makeTempStateDir();
+  // 0.9.0-α：淘汰语义要求「每次 ask 一条新会话」，关掉复用窗口（TTL=0）回到这个前提
+  fs.writeFileSync(path.join(stateDir, 'config.json'), JSON.stringify({ sessionReuseTtlMs: 0 }), 'utf8');
   seedPeers(stateDir, [PEER]);
   const cancelled = [];
   const runner = createRunner({ delayMs: 60_000 });
