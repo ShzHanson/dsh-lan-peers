@@ -23,7 +23,7 @@ const MEMBER2 = peerFixture('peer-replica-2');
 const DAY = 86_400_000;
 
 /** hub：stateDir 由调用方持有，便于「杀掉再重启」 */
-async function startHub(t, { stateDir = makeTempStateDir(), group = {} } = {}) {
+async function startHub(t, { stateDir = makeTempStateDir(), group = {}, runner, name, logger } = {}) {
   seedPeers(stateDir, [MEMBER, MEMBER2]);
   const server = createPeerServer({
     listenHost: '127.0.0.1',
@@ -33,6 +33,10 @@ async function startHub(t, { stateDir = makeTempStateDir(), group = {} } = {}) {
     // S3 起 majority 会把 post 变成 propose→commit（复制失败就不再是 201）；
     // 这个文件测的是 S2 的复制语义，固定 quorum:「none」= 写本地即提交。
     group: { enabled: true, name: 'default', autoJoin: true, retentionDays: 7, quorum: 'none', ...group },
+    // 片 3b：hub 自己也要答题（Q&A 的参与者），测试必须能喂它一个假 runner
+    ...(runner ? { runner } : {}),
+    ...(name ? { name } : {}),
+    ...(logger ? { logger } : {}),
   });
   const info = await listenOnRandomPort(server);
   t.after(async () => { await server.close(); });
@@ -489,6 +493,8 @@ function answerRunner({ reply = '答：磁盘还剩 42G', fail = false, delayMs 
     async poll(sessionId) {
       const session = sessions.get(sessionId);
       if (!session) return { status: 'error', error: 'session-not-found' };
+      // 片 3b B5：把某台节点「卡在答题中」，好让别的节点的答案先行落地
+      if (state.hold) return { status: 'running' };
       if (now() < session.completesAt) return { status: 'running' };
       if (!session.reported) {
         session.reported = true;
@@ -642,3 +648,209 @@ test('3a A6 meta 白名单：quote 收下并收窄，未知键照旧丢掉（静
   const stored = hubMessages(hub).at(-1);
   assert.deepEqual(stored.meta, { quote: { seq: 1, from: 'x', excerpt: 'y' } }, 'quote 收下、evil 丢掉');
 });
+
+// ---------------------------------------------------------------------------
+// 0.10.0-α slice 3b · hub 侧触发 / 多 @ / 无 @ 首答胜 / 抢答塌陷
+//
+// 共同前提：hub 与成员都喂假 runner（默认 MemoryRunner 会答成 "OK …"，断言就不确定了）。
+// 每条用例都先 killPush：只留「自己 pull」这一条触发路径，去重才可断言。
+// ---------------------------------------------------------------------------
+
+const HUB_NAME = 'hub-box';
+
+function killPush(hub, peerId) {
+  const members = hub.server.group.state().members;
+  if (members[peerId]) members[peerId].baseUrl = 'http://127.0.0.1:1';
+}
+
+const hubAuthored = (hub, text) => hub.server.group.post({
+  peerId: hub.server.store.instanceId,
+  name: HUB_NAME,
+  kind: 'chat',
+  text,
+});
+
+/** 群里引用了 seq 的那些 chat（= 答案） */
+const quoting = (messages, seq) => messages.filter(
+  (m) => m.kind === 'chat' && Number(m.meta?.quote?.seq) === Number(seq),
+);
+
+test('3b B1 hub 触发：成员发帖 @ 到 hub → hub 恰好一条带 quote 的答复（不许发两次）', async (t) => {
+  const hubRunner = answerRunner({ reply: 'hub 答：还剩 42G' });
+  const hub = await startHub(t, { runner: hubRunner, name: HUB_NAME });
+  hub.server.group.addMember(MEMBER.peerId, MEMBER.name);
+
+  const posted = await postAs(hub, MEMBER, '@hub-box 磁盘还剩多少');
+  assert.equal(posted.status, 201, posted.text);
+  await hub.server.group.waitAnswers();
+
+  assert.equal(hubRunner.asks.length, 1, '@ 到 hub → 恰好一次 runner 调用');
+  const answers = quoting(hubMessages(hub), 1);
+  assert.equal(answers.length, 1, 'hub 只发一条答复（post 缝与复制缝不许各发一条）');
+  assert.equal(answers[0].from.peerId, hub.server.store.instanceId, '作者必须是 hub 自己（不是空 peerId）');
+  assert.equal(answers[0].text, 'hub 答：还剩 42G');
+  assert.equal(answers[0].meta.quote.excerpt, '@hub-box 磁盘还剩多少');
+});
+
+test('3b B2 seq 幂等：同一条消息从复制缝投两遍 → 只答一次、只发一条', async (t) => {
+  // hub 拒绝收副本（409 not-a-replica，hub 就是 leader），所以双投递在成员侧复现：
+  // 同一个 seq 走两遍 /v1/group/replicate —— 第二遍连派发都不该进（副本按 seq 去重），
+  // 就算进了也有「群:seq」认领兜住（见 lib/group-resident.test.mjs 的认领用例）。
+  const hub = await startHub(t, { runner: answerRunner({ fail: true }), name: HUB_NAME });
+  hub.server.group.addMember(MEMBER.peerId, MEMBER.name);
+  const runner = answerRunner({ reply: '答：42G' });
+  const member = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, runner, name: 'nas-box',
+  });
+  await pullNow(member);
+  killPush(hub, MEMBER.peerId);
+
+  const state = hub.server.group.state({ includeKey: true });
+  const question = hubAuthored(hub, '@nas-box 磁盘还剩多少');
+  const body = {
+    groupId: state.groupId,
+    epoch: 1,
+    leaderPeerId: hub.server.store.instanceId,
+    messages: [question],
+  };
+  const deliver = () => groupRequest(member.baseUrl, {
+    groupKey: state.groupKey,
+    groupId: state.groupId,
+    senderId: hub.server.store.instanceId,
+    method: 'POST',
+    path: '/v1/group/replicate',
+    body,
+  });
+  const first = await deliver();
+  assert.equal(first.status, 200, first.text);
+  assert.equal(first.json.added, 1);
+  await member.server.group.waitAnswers();
+  assert.equal(runner.asks.length, 1, '第一次投递 → 一问一答');
+
+  const second = await deliver();
+  assert.equal(second.status, 200, second.text);
+  assert.equal(second.json.added, 0, '同一个 seq 不许二次入库');
+  await member.server.group.waitAnswers();
+  assert.equal(runner.asks.length, 1, '第二次投递不再触发答题');
+  const memberAnswers = hubMessages(hub).filter((m) => m.from.peerId === MEMBER.peerId);
+  assert.equal(memberAnswers.length, 1, '答复只发一条');
+  assert.equal(memberAnswers[0].meta.quote.seq, question.seq);
+});
+
+test('3b B3 多 @：一条消息 @ 两台成员机 → 两条答复，引用同一个 seq', async (t) => {
+  const hub = await startHub(t, { runner: answerRunner({ fail: true }), name: HUB_NAME });
+  hub.server.group.addMember(MEMBER.peerId, MEMBER.name);
+  hub.server.group.addMember(MEMBER2.peerId, MEMBER2.name);
+  const runnerA = answerRunner({ reply: 'A 在' });
+  const runnerB = answerRunner({ reply: 'B 在' });
+  const a = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, identity: MEMBER, runner: runnerA, name: 'nas-box',
+  });
+  const b = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, identity: MEMBER2, runner: runnerB, name: 'nas-box2',
+  });
+  await pullNow(a);
+  await pullNow(b);
+  killPush(hub, MEMBER.peerId);
+  killPush(hub, MEMBER2.peerId);
+
+  const question = hubAuthored(hub, '@nas-box @nas-box2 谁在');
+  await pullNow(a);
+  await pullNow(b);
+  await a.server.group.waitAnswers();
+  await b.server.group.waitAnswers();
+
+  assert.equal(runnerA.asks.length, 1, '被点名的第一台答一次');
+  assert.equal(runnerB.asks.length, 1, '被点名的第二台也答一次（不是只答第一个）');
+  const answers = quoting(hubMessages(hub), question.seq);
+  assert.equal(answers.length, 2, '两台被点名的机器各一条答复');
+  assert.deepEqual(
+    answers.map((m) => m.from.peerId).sort(),
+    [MEMBER.peerId, MEMBER2.peerId].sort(),
+    '两条答复来自两台不同的机器',
+  );
+});
+
+test('3b B4 无 @：没人答过 → 一台答一条；已经有人答过 → 后来者一条都不发', async (t) => {
+  const hub = await startHub(t, { runner: answerRunner({ fail: true }), name: HUB_NAME });
+  hub.server.group.addMember(MEMBER.peerId, MEMBER.name);
+  hub.server.group.addMember(MEMBER2.peerId, MEMBER2.name);
+  const runnerA = answerRunner({ reply: '答：还剩 42G' });
+  const runnerB = answerRunner({ reply: '我也来答' });
+  const a = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, identity: MEMBER, runner: runnerA, name: 'nas-box',
+  });
+  await pullNow(a);
+  killPush(hub, MEMBER.peerId);
+
+  const question = hubAuthored(hub, '磁盘还剩多少');
+  await pullNow(a);
+  await a.server.group.waitAnswers();
+
+  assert.equal(runnerA.asks.length, 1, '没人答过 → 这台答一次');
+  const first = quoting(hubMessages(hub), question.seq);
+  assert.equal(first.length, 1, '群里一条答复');
+  assert.equal(first[0].from.peerId, MEMBER.peerId);
+  assert.equal(first[0].text, '答：还剩 42G');
+
+  // 后来才上线的第二台：bootstrap + 补差时这条已经被答过了 → 零调用零发帖
+  const b = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, identity: MEMBER2, runner: runnerB, name: 'nas-box2',
+  });
+  await pullNow(b);
+  await b.server.group.waitAnswers();
+  assert.equal(runnerB.asks.length, 0, 'B9 哨兵：拆掉第 (a) 道复查后这里会变成 1');
+  assert.equal(
+    hubMessages(hub).filter((m) => m.from.peerId === MEMBER2.peerId).length, 0,
+    '一条都不许发',
+  );
+});
+
+test('3b B5 抢答塌陷：两个节点都过了资格检查，先答的落地后，后者的发帖前复查必须丢掉它', async (t) => {
+  const logsB = [];
+  const hub = await startHub(t, { runner: answerRunner({ fail: true }), name: HUB_NAME });
+  hub.server.group.addMember(MEMBER.peerId, MEMBER.name);
+  hub.server.group.addMember(MEMBER2.peerId, MEMBER2.name);
+  const runnerA = answerRunner({ reply: 'A 先答' });
+  const runnerB = answerRunner({ reply: 'B 后答' });
+  const a = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, identity: MEMBER, runner: runnerA, name: 'nas-box',
+  });
+  const b = await startMember(t, {
+    hubBaseUrl: hub.baseUrl,
+    hubInstanceId: hub.server.store.instanceId,
+    identity: MEMBER2,
+    runner: runnerB,
+    name: 'nas-box2',
+    logger: (line) => logsB.push(String(line)),
+  });
+  await pullNow(a);
+  await pullNow(b);
+  killPush(hub, MEMBER.peerId);
+  killPush(hub, MEMBER2.peerId);
+
+  const question = hubAuthored(hub, '磁盘还剩多少');
+
+  // 两个节点都通过 check (a)：B 先起跑并卡在「答题中」，A 随后答完发帖
+  runnerB.state.hold = true;
+  await pullNow(b);
+  await sleep(400); // 让 B 走完抖动 + check (a)，进入 runner 等待
+  await pullNow(a);
+  await a.server.group.waitAnswers();
+  assert.equal(quoting(hubMessages(hub), question.seq).length, 1, 'A 的答案已经落地');
+  assert.equal(runnerB.asks.length, 1, 'B 也已经过了 check (a) 并开始答题');
+
+  // B 现在拿得到 A 的答案（本地已知消息的唯一来源），再放行它的 runner
+  await pullNow(b);
+  runnerB.state.hold = false;
+  await b.server.group.waitAnswers();
+
+  const answers = quoting(hubMessages(hub), question.seq);
+  assert.equal(answers.length, 1, 'B9 哨兵：拆掉发帖前复查后这里会变成 2');
+  assert.equal(answers[0].from.peerId, MEMBER.peerId, '留下的是先答的那条');
+  const drops = logsB.filter((line) => line.includes('[group] answer dropped'));
+  assert.equal(drops.length, 1, '丢掉一次，只记一行');
+  assert.match(drops[0], /seq=\d+ reason=answered-first/);
+  assert.equal(drops[0].includes('磁盘'), false, '日志绝不带正文');
+});
+

@@ -161,16 +161,23 @@ import {
   verifyCertificate,
   verifyMessage,
 } from '../lib/group-identity.mjs';
-// 0.10.0-α slice 3a：群内 @ 必答的常驻会话层（存储 + 判定 + 单飞队列，全部纯逻辑）
+// 0.10.0-α slice 3a/3b：群内 @ 必答的常驻会话层（存储 + 判定 + 单飞队列，全部纯逻辑）
 import {
+  RESIDENT_TTL_MS,
   ResidentSessionStore,
   addressedToNode,
+  alreadyAnsweredSeq,
+  answerJitterMs,
   buildResidentPrompt,
+  createAnswerClaimSet,
   createAnswerQueue,
+  isAnswerMessage,
+  memberMentionAliases,
   mentionAliases,
   quoteExcerpt,
   resolveResidentUse,
   sanitizeQuoteMeta,
+  undirectedQuestion,
 } from '../lib/group-resident.mjs';
 import os from 'node:os';
 import path from 'node:path';
@@ -464,6 +471,15 @@ export const GROUP_GROUP_DEFAULT_REPLICA_PULL_MS = GROUP_DEFAULT_REPLICA_PULL_MS
  */
 export const GROUP_ANSWER_POLL_MS = 250;
 export const GROUP_ANSWER_TIMEOUT_MS = 120_000;
+
+/**
+ * 出站推送（fan-out：复制 / 回执 / 群名广播）的统一上界：3s。
+ *
+ * 依据 —— LAN 往返是毫秒级，低秒级既容得下「对端忙 / 首包丢」的一次重传，
+ * 又短到「一个不可达成员」绝不会把发送方吊住：到点 abort，socket 立刻释放。
+ * 生效方式是 `min(调用方自带上界, 本值)`：对端可达时一次请求的时延与改动前完全相同。
+ */
+export const GROUP_PUSH_TIMEOUT_MS = 3_000;
 
 /** S3 v0.7.0：角色文件、角色取值与未提交区的 TTL（与 lib/group-client.mjs 同一份常量） */
 export const GROUP_ROLE_KINDS = GROUP_ROLES;
@@ -2488,6 +2504,42 @@ export function createPeerServer(overrides = {}) {
     for (const [code, pending] of pendingPairs) {
       if (pending.expiresAt <= nowMs) pendingPairs.delete(code);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 出站推送的闸门（fan-out 的关停缺陷）
+  //
+  // 一次打向「不可达成员」的推送（对端已下线，地址仍是它自报的 LAN 地址）会让 undici
+  // 的 ConnectWrap 一直挂在事件循环上；没有上界的话发送方被永久吊住，关停也等不到空转。
+  // 这里给每一次出站推送两道闸：
+  //   1. GROUP_PUSH_TIMEOUT_MS —— 到点 abort（低秒级，见常量处的取值依据）；
+  //   2. pushGate —— close() 一 abort，在飞的推送立刻以 push-shutdown 失败，不必等上界。
+  // 两者都是 AbortSignal，与调用方自带的 signal 合并，正常路径（对端可达）零影响。
+  // ---------------------------------------------------------------------------
+
+  /** 本实例在飞推送的总闸（close() 时 abort） */
+  const pushGate = new AbortController();
+  /** close() 起手即置 true：此后不再起复制定时器、不再发起新的出站推送 */
+  let closing = false;
+
+  /** 推送失败的一行原因（只有原因码，没有正文、没有地址） */
+  function pushFailureReason(error) {
+    if (pushGate.signal.aborted) return 'push-shutdown';
+    if (error?.name === 'TimeoutError' || error?.code === 'push-timeout') return 'push-timeout';
+    return String(error?.message ?? error).slice(0, 80);
+  }
+
+  /**
+   * 出站推送专用的 fetchImpl：把「上界」与「关停闸」叠进调用方已有的 signal。
+   * 所有推送入口（复制、回执、群名广播）都以 `fetchImpl: pushFetch` 走这里 ——
+   * lib 侧一行不用改，线上格式与状态码也不动。
+   */
+  function pushFetch(url, init = {}) {
+    const budget = AbortSignal.timeout(GROUP_PUSH_TIMEOUT_MS);
+    const signal = init?.signal
+      ? AbortSignal.any([init.signal, budget, pushGate.signal])
+      : AbortSignal.any([budget, pushGate.signal]);
+    return fetch(url, { ...init, signal });
   }
 
   /**
@@ -4543,6 +4595,8 @@ export function createPeerServer(overrides = {}) {
         stateDir: config.stateDir,
         manual,
         now: () => config.now(),
+        // 推送闸：不可达伙伴的广播到点就 abort，绝不把发送方吊在 ConnectWrap 上
+        fetchImpl: pushFetch,
       });
     } catch (error) {
       if (config.logger) {
@@ -5870,6 +5924,10 @@ export function createPeerServer(overrides = {}) {
       roleStore.update({ commitSeq: Math.max(Number(st.commitSeq) || 0, Number(message.seq) || 0) });
     }
     if (groupStore) enqueueReplication(message, { flush });
+    // 0.10.0-α slice 3b：hub 自己的写路径也要触发群问答 —— 成员的 quorum:none post、
+    // 面板发言、派单回执全都从这条缝落盘，3a 只挂了成员的两条缝。多缝并存不会出现两条答案：
+    // 「群:seq」认领让同一条消息只排一次（答案自身带 quote，被判定为答案后不再触发）。
+    dispatchGroupAnswers([message], String(localGroupContext()?.groupId ?? ''));
     return message;
   }
 
@@ -5946,7 +6004,13 @@ export function createPeerServer(overrides = {}) {
   /** 收下一条已提交消息（commit 广播 / 本机自己 commit 后转正） */
   function applyCommitted(message) {
     const value = normalizeIncomingMessage(message, message?.seq);
-    if (groupStore) return Boolean(groupStore.commitMessage(value));
+    const groupId = String(localGroupContext()?.groupId ?? '');
+    if (groupStore) {
+      const committed = groupStore.commitMessage(value);
+      // 0.10.0-α slice 3b：quorum 模式下成员的消息是从这里转正的 —— hub 也要答
+      if (committed) dispatchGroupAnswers([committed], groupId);
+      return Boolean(committed);
+    }
     const ctx = localGroupContext();
     const applied = replicaStore.append({
       groupId: String(ctx?.groupId ?? ''),
@@ -5954,6 +6018,7 @@ export function createPeerServer(overrides = {}) {
       leaderPeerId: roleState()?.leaderPeerId ?? '',
       messages: [value],
     });
+    if (applied.added > 0) dispatchGroupAnswers([value], groupId);
     return applied.added > 0;
   }
 
@@ -6928,7 +6993,9 @@ export function createPeerServer(overrides = {}) {
   }
 
   function ensureReplicaTimer() {
-    if (replicaRetryTimer) return;
+    // 关停之后绝不再起定时器：close() 清过一次的定时器被后续 commit 重新点亮，
+    // 就是「测试全过、进程永退不出」的那条腿。
+    if (closing || replicaRetryTimer) return;
     replicaRetryTimer = setInterval(() => {
       void flushReplication().catch(() => {});
     }, replicaRetryMs);
@@ -6959,6 +7026,8 @@ export function createPeerServer(overrides = {}) {
   }
 
   async function flushReplication() {
+    // 关停中：不再发起任何出站推送（在飞的那一条由 pushGate 立刻 abort）
+    if (closing) return;
     if (replicaQueue.size === 0) {
       if (replicaRetryTimer) {
         clearInterval(replicaRetryTimer);
@@ -6969,6 +7038,8 @@ export function createPeerServer(overrides = {}) {
     const ctx = localGroupContext();
     if (!ctx?.groupKey) return;
     for (const [peerId, entry] of [...replicaQueue]) {
+      // 关停中不再对下一个成员起新推送（已发出的那条由 pushGate 收尾）
+      if (closing) break;
       if (entry.messages.length === 0) {
         replicaQueue.delete(peerId);
         continue;
@@ -6995,6 +7066,8 @@ export function createPeerServer(overrides = {}) {
           messages: batch,
           selfBaseUrl: localAdvertiseBaseUrl(),
           timeoutMs: Math.max(500, replicaRetryMs),
+          // 推送闸：不可达成员到点 abort（push-timeout）/ 关停立刻 abort（push-shutdown）
+          fetchImpl: pushFetch,
         }));
         entry.messages = entry.messages.slice(batch.length);
         entry.lastError = '';
@@ -7006,7 +7079,8 @@ export function createPeerServer(overrides = {}) {
           );
         }
       } catch (error) {
-        entry.lastError = String(error?.message ?? error);
+        // 失败照旧只记一行（对端短 id + 原因码；没有正文、没有 URL）
+        entry.lastError = pushFailureReason(error);
         if (config.logger) {
           config.logger(
             `[group] replicate retry peer=${shortPeerId(peerId)} pending=${entry.messages.length} reason=${entry.lastError}`,
@@ -7249,6 +7323,32 @@ export function createPeerServer(overrides = {}) {
   const groupAnswerQueue = createAnswerQueue();
   /** 在飞的答案作业（门面 group.waitAnswers 用它把测试/CLI 变成确定性的） */
   const groupAnswersInFlight = new Set();
+  /** 正在答题的群 id：TTL 驱逐必须绕开它们（见 ResidentSessionStore.prune 的 busy） */
+  const answeringGroups = new Set();
+  /** 「群:seq 已经排过答案」的去重键（post 缝 / 复制缝 / commit 广播缝共用这一份） */
+  let answerClaims = null;
+
+  function answerClaimKey(groupId, seq) {
+    return String(groupId ?? '') + ':' + String(Math.floor(Number(seq) || 0));
+  }
+
+  function claimAnswerSeq(groupId, seq) {
+    if (!answerClaims) answerClaims = createAnswerClaimSet();
+    return answerClaims.claim(answerClaimKey(groupId, seq));
+  }
+
+  /**
+   * 把一次**没有产出**的认领还回去（失败路径专用）。
+   *
+   * 认领和「取号」是同一件事：先占住 `群:seq`，再花一次 runner 调用。占住之后如果 runner
+   * 报错 / 没有回复 / 发帖失败，而认领不还回去，这条消息在本机就**永久哑火** —— 后续任何
+   * 一条缝（复制、commit 广播）再来都不再排答案。还回去之后仍由两道「已有人答」复查兜底，
+   * 不会变成重复发帖。
+   */
+  function releaseAnswerSeq(groupId, seq) {
+    if (!answerClaims) return false;
+    return answerClaims.release(answerClaimKey(groupId, seq));
+  }
 
   /** 这条消息是不是「@ 我问了一句」：kind/自己发的/`/task` 都在纯函数里否决 */
   function isQuestionToSelf(message) {
@@ -7260,6 +7360,64 @@ export function createPeerServer(overrides = {}) {
       selfPeerId: String(store.instanceId ?? ''),
       aliases: selfMentionAliases(),
     });
+  }
+
+  /** 群里所有可被 @ 的名字（成员表 + 自己）：用来判断「这条消息到底点名了谁」 */
+  function groupMentionAliases() {
+    const ctx = localGroupContext();
+    const members = ctx?.members && typeof ctx.members === 'object' ? ctx.members : {};
+    return memberMentionAliases({
+      members,
+      selfPeerId: String(store.instanceId ?? ''),
+      selfName: String(config.name ?? ''),
+    });
+  }
+
+  /**
+   * 本机**已经读到**的群消息（不加任何网络往返）：hub 读权威日志，成员读本地副本。
+   * 首答胜的两道复查都只读这一份 —— 复查的代价是一次内存过滤，不是一次请求。
+   */
+  function knownGroupMessages({ sinceSeq = 0, limit = GROUP_HISTORY_MAX_LIMIT } = {}) {
+    if (groupStore) return groupStore.messages({ sinceSeq, limit });
+    return replicaStore ? replicaStore.messages({ sinceSeq, limit }) : [];
+  }
+
+  /**
+   * 作者是不是群里的已知成员（本机也算：hub 自己就是群成员）。
+   *
+   * 抢答（无 @ 也答）只对**成员**生效。理由是这个判据同时修掉两件事：
+   *   · 面板/管理接口的本地单阶段写没有作者身份（`from.peerId === ''`），
+   *     抢答它就是「自己答自己」，而且答出来的那条消息会占走下一个群 seq；
+   *   · 陌生 peerId（不是成员）不是「群里有人提问」，不该为它花一次 runner 调用。
+   * 点名答（directed）不受影响 —— @ 到我就是要答，作者是谁都不改这个结论。
+   */
+  function isGroupMemberAuthor(peerId) {
+    const id = String(peerId ?? '');
+    if (id === '') return false;
+    if (id === String(store.instanceId ?? '')) return true;
+    const ctx = localGroupContext();
+    const members = ctx?.members && typeof ctx.members === 'object' ? ctx.members : {};
+    return Object.prototype.hasOwnProperty.call(members, id);
+  }
+
+  /** 这条消息要不要答、以什么身份答：''=不答 / 'directed'=点名答 / 'undirected'=抢答 */
+  function groupAnswerIntent(message) {
+    const from = message?.from && typeof message.from === 'object' ? message.from : {};
+    // 带 quote 的消息是别人的答案，不是问题（否则两台机器会对着答案互相作答，无限乒乓）
+    if (isAnswerMessage(message?.meta)) return '';
+    if (isQuestionToSelf(message)) return 'directed';
+    // 抢答的前提：作者是群成员（见 isGroupMemberAuthor 的注释）
+    if (!isGroupMemberAuthor(from.peerId)) return '';
+    return undirectedQuestion({
+      text: message?.text,
+      kind: message?.kind,
+      fromPeerId: String(from.peerId ?? ''),
+      selfPeerId: String(store.instanceId ?? ''),
+      knownMentions: groupMentionAliases(),
+      meta: message?.meta,
+    })
+      ? 'undirected'
+      : '';
   }
 
   /** 轮询常驻会话到终态：done → 正文；error/超时 → ''（调用方据此「什么都不发」） */
@@ -7281,9 +7439,20 @@ export function createPeerServer(overrides = {}) {
   }
 
   /** 一条 @ 消息的回答作业：常驻会话（没有就建、陈旧就换）+ 成功才发帖 + 失败只记一行 */
-  async function answerGroupQuestion(message, groupId) {
+  async function answerGroupQuestion(message, groupId, { undirected = false } = {}) {
     const seq = Number(message?.seq) || 0;
     const from = message?.from && typeof message.from === 'object' ? message.from : {};
+    // 无 @ 的抢答：起跑抖动 + 起跑前复查（有人已经答了就别花这次 runner 调用）
+    if (undirected) {
+      await sleep(answerJitterMs(String(store.instanceId ?? '')));
+      if (alreadyAnsweredSeq(knownGroupMessages({ sinceSeq: seq }), seq)) {
+        if (config.logger) {
+          config.logger('[group] answer dropped seq=' + seq + ' reason=answered-first'
+            + ' at=start group=' + shortPeerId(groupId));
+        }
+        return { ok: false, reason: 'answered-first' };
+      }
+    }
     const record = residentSessions.read(groupId);
     const prompt = buildResidentPrompt({
       senderName: String(from.name ?? ''),
@@ -7317,6 +7486,14 @@ export function createPeerServer(overrides = {}) {
       if (config.logger) config.logger('[group] answer skipped seq=' + seq + ' reason=empty-reply');
       return { ok: false, reason: 'empty-reply' };
     }
+    // 发帖前的最后一道复查（首答胜）：答案在我生成期间已经出现 → 丢掉，只记一行
+    if (undirected && alreadyAnsweredSeq(knownGroupMessages({ sinceSeq: seq }), seq)) {
+      if (config.logger) {
+        config.logger('[group] answer dropped seq=' + seq + ' reason=answered-first'
+          + ' at=post group=' + shortPeerId(groupId));
+      }
+      return { ok: false, reason: 'answered-first' };
+    }
     const quote = sanitizeQuoteMeta({
       seq,
       from: String(from.name ?? ''),
@@ -7325,6 +7502,9 @@ export function createPeerServer(overrides = {}) {
     let posted = null;
     try {
       posted = await Promise.resolve(groupPostFacade({
+        // 作者必须显式给出：hub 的 append 不会替调用方补 from，缺了就是 from.peerId=''
+        peerId: String(store.instanceId ?? ''),
+        name: String(config.name ?? ''),
         kind: 'chat',
         text: reply,
         meta: quote === null ? {} : { quote },
@@ -7343,21 +7523,57 @@ export function createPeerServer(overrides = {}) {
   /**
    * 新到的群消息 → 排回答作业。单飞机制 = **每群一条 Promise 链**：
    * 第二条 @ 消息排在第一条后面（顺序 = 到达顺序），同一时刻只有一个 runner 调用在飞。
-   * 返回排进队列的条数（0 = 这批里没有问到我）。
+   * 去重机制 = `群:seq` 认领（一条消息从几条缝进来都只答一次）。
+   * 返回排进队列的条数（0 = 这批里没有该我答的）。
    */
   function dispatchGroupAnswers(messages, groupId) {
     const list = Array.isArray(messages) ? messages : [];
     const key = String(groupId ?? '');
     let queued = 0;
+    pruneResidentSessions();
     for (const message of list) {
-      if (!isQuestionToSelf(message)) continue;
+      const intent = groupAnswerIntent(message);
+      if (intent === '') continue;
+      const seq = Math.floor(Number(message?.seq) || 0);
+      if (seq <= 0) continue;
+      if (!claimAnswerSeq(key, seq)) continue;
+      // 首答胜的第 (a) 道：本地已知消息里已经有人引用这个 seq 了 → 不排
+      if (intent === 'undirected' && alreadyAnsweredSeq(knownGroupMessages({ sinceSeq: seq }), seq)) {
+        if (config.logger) {
+          config.logger('[group] answer dropped seq=' + seq + ' reason=answered-first'
+            + ' at=dispatch group=' + shortPeerId(key));
+        }
+        continue;
+      }
       queued += 1;
-      const job = groupAnswerQueue.enqueue(key, () => answerGroupQuestion(message, key));
+      const job = groupAnswerQueue.enqueue(key, async () => {
+        answeringGroups.add(key);
+        let settled = null;
+        try {
+          settled = await answerGroupQuestion(message, key, { undirected: intent === 'undirected' });
+          return settled;
+        } finally {
+          answeringGroups.delete(key);
+          // 认领的释放点只有这一处（成功 / 失败 / 抛错 / 关停都从这里过）：
+          // 「答完并落地」与「已经有人答了」算用掉，其余一律还回去。
+          const spent = settled?.ok === true || settled?.reason === 'answered-first';
+          if (!spent) releaseAnswerSeq(key, seq);
+        }
+      });
       groupAnswersInFlight.add(job);
       const clear = () => { groupAnswersInFlight.delete(job); };
       void job.then(clear, clear);
     }
     return queued;
+  }
+
+  /** 空闲常驻会话的驱逐：在飞的群一律跳过（剩下的删了也无害，下次提问会新建） */
+  function pruneResidentSessions() {
+    const removed = residentSessions.prune({ ttlMs: RESIDENT_TTL_MS, busy: answeringGroups });
+    if (removed.length > 0 && config.logger) {
+      config.logger('[group] resident pruned n=' + removed.length);
+    }
+    return removed;
   }
 
   /** 门面：等所有答案作业落定（测试/CLI 用；生产路径不依赖它） */
@@ -8704,6 +8920,8 @@ export function createPeerServer(overrides = {}) {
           meta,
           selfBaseUrl: localAdvertiseBaseUrl(),
           timeoutMs: 5_000,
+          // 推送闸：回执推给不可达的对端时到点 abort，不吊住发送方
+          fetchImpl: pushFetch,
         })));
         return { ok: true, seq: sent?.seq ?? null };
       } catch (error) {
@@ -8744,6 +8962,8 @@ export function createPeerServer(overrides = {}) {
           text,
           meta,
           timeoutMs: 5_000,
+          // 推送闸：同上（回执是推送，不可达时必须有界）
+          fetchImpl: pushFetch,
         });
         return { ok: true, seq: sent?.seq ?? null };
       } catch (error) {
@@ -8956,6 +9176,13 @@ export function createPeerServer(overrides = {}) {
       };
     },
     async close() {
+      // 关停闸：先 abort 在飞的出站推送（复制 / 回执 / 广播），再清定时器。
+      // 顺序不能反 —— 先清定时器的话，一条已经在飞的推送仍会吊着 undici 的 ConnectWrap，
+      // 进程就等不到空转（测试里表现为「断言全过、进程永不退出」）。
+      closing = true;
+      const shutdown = new Error('push-shutdown');
+      shutdown.code = 'push-shutdown';
+      pushGate.abort(shutdown);
       clearInterval(pendingPairTimer);
       stopRoleTimers();
       if (advertiseTimer) {

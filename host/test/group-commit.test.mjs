@@ -351,6 +351,36 @@ test('S3 取号闸门：pending 占着的号不会被单阶段写（面板/管�
   assert.deepEqual(seqs, [panel.seq, panel.seq + 1]);
   assert.equal(new Set(seqs).size, seqs.length, 'seq 不得重复（客户端按 seq 去重）');
 });
+
+// 片 3b 回归（0.10.0-α）：抢答只对**群成员**生效。
+//
+// 起因：3b 把「群问答」挂到了 hub 的本地单阶段写这条缝上，而这条缝的作者是调用方给的
+// （面板/管理接口没有作者身份 = `from.peerId === ''`）。于是 hub 会抢答**自己刚写下的**
+// 那条面板消息，答出来的那条消息再占走下一个群 seq —— 单阶段写的取号从此不连续。
+// 拆掉 groupAnswerIntent 里的 isGroupMemberAuthor 闸门，这个用例的
+// `history().length === 1` 会先变 2，`next.seq === panel.seq + 1` 会变 panel.seq + 2。
+test('S3 回归（片 3b）：未知作者的单阶段写不触发抢答，所以不额外占号', async (t) => {
+  const cluster = await startCluster(t, { count: 2 });
+  const [a] = cluster.nodes;
+  const panel = a.server.group.post({ peerId: 'peer-panel', name: 'panel', kind: 'chat', text: 'panel-msg' });
+  assert.equal(panel.seq, 1);
+  assert.equal(a.server.group.state().pendingCount, 0, '单阶段写不产生 pending');
+
+  // 等过一个完整的抢答窗口（抖动 ≤300ms + 一次 runner 调用 + 一次 250ms 轮询）
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+  assert.equal(a.server.group.history({ sinceSeq: 0 }).length, 1, '未知作者的消息不许被抢答（不许自己答自己）');
+  assert.equal(a.server.group.state().pendingCount, 0, 'pending 基线仍是 0');
+
+  const next = a.server.group.post({ peerId: 'peer-panel', name: 'panel', kind: 'chat', text: 'panel-2' });
+  assert.equal(next.seq, panel.seq + 1, '答题不许占走下一个单阶段写的 seq');
+  assert.deepEqual(
+    a.server.group.history({ sinceSeq: 0 }).map((m) => m.seq),
+    [panel.seq, panel.seq + 1],
+    'seq 连续、无空号',
+  );
+  assert.equal(a.server.group.state().pendingCount, 0);
+});
 test('S3 提交串行化：连续多条 post 的 seq 严格连续（并发下也不撞号）', async (t) => {
   const cluster = await startCluster(t, { count: 3 });
   const [a, b] = cluster.nodes;
