@@ -16,6 +16,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createPeerServer, GroupReplicaStore, sanitizeGroupMeta } from '../server.mjs';
 import { deriveGroupKeys, decryptGroupJson, encryptGroupBody, groupAuthHeaders } from '../../lib/group-client.mjs';
 import { fileMode, makeTempStateDir, peerFixture, readJson, request, seedPeers, writeJson0600 } from './helpers.mjs';
+// 0.10.0-α slice 4a：纪要的群级 HTTP 读口/写口 + 真集群脚手架
+import { fetchGroupNotes, postGroupNote } from '../../lib/group-client.mjs';
+import { startCluster } from './group-cluster.mjs';
 
 const MEMBER = peerFixture('peer-replica-1');
 const MEMBER2 = peerFixture('peer-replica-2');
@@ -854,3 +857,119 @@ test('3b B5 抢答塌陷：两个节点都过了资格检查，先答的落地�
   assert.equal(drops[0].includes('磁盘'), false, '日志绝不带正文');
 });
 
+
+// ---------------------------------------------------------------------------
+// 0.10.0-α slice 4a：群纪要（hub 单写、成员只读同步）
+//
+// N4：hub 从**管理接口**追加 → GET group 回 rev+1；成员 POST 被 403 notes-hub-only。
+// N5：纪要搭同一次 pull 同步到成员副本；成员没有写路径（管理接口拒 + 群里拒 + 不落 hub 那份文件）。
+// ---------------------------------------------------------------------------
+
+/** 管理接口的最小请求/应答桩（与 lib/admin-group.test.mjs 同款，只留必需的头） */
+function adminRequest(admin, method, url, body) {
+  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+  const req = {
+    method,
+    url,
+    socket: { remoteAddress: '127.0.0.1', setNoDelay() {} },
+    headers: {
+      host: '127.0.0.1:7788',
+      'content-type': 'application/json',
+      'content-length': String(chunks[0]?.length ?? 0),
+      'x-lan-peers-token': String(admin.token ?? ''),
+    },
+    on() { return req; },
+    once() { return req; },
+    async *[Symbol.asyncIterator]() { for (const chunk of chunks) yield chunk; },
+  };
+  const res = {
+    status: 0, headers: {}, body: '',
+    setHeader(k, v) { this.headers[k] = v; },
+    writeHead(status, headers) { this.status = status; Object.assign(this.headers, headers || {}); },
+    write(chunk) { this.body += chunk; return true; },
+    end(chunk) { if (chunk) this.body += chunk; if (!this.status) this.status = 200; },
+    once() {}, on() {},
+  };
+  return { req, res };
+}
+
+async function hitAdmin(admin, method, apiPath, body) {
+  const { req, res } = adminRequest(admin, method, apiPath, body);
+  await admin.handle(req, res, new URL('http://127.0.0.1' + apiPath));
+  return { status: res.status, json: (() => { try { return JSON.parse(res.body); } catch { return null; } })() };
+}
+
+test('4a N4：hub 从管理接口追加纪要 → GET group 回 rev+1；成员 POST 被 403 notes-hub-only', async (t) => {
+  const { createAdmin } = await import('../../lib/admin.mjs');
+  const cluster = await startCluster(t, { count: 2 });
+  const [hub, member] = cluster.nodes;
+  const hubAdmin = createAdmin({ server: hub.server });
+
+  // 1) hub 运维者在面板/CLI 上追加一条 → 200 + rev
+  const first = await hitAdmin(hubAdmin, 'POST', '/api/lan-peers/group/notes', { text: '十月计划：先做纪要' });
+  assert.equal(first.status, 200, JSON.stringify(first.json));
+  assert.equal(first.json.rev, 1);
+  assert.equal(first.json.note.text, '十月计划：先做纪要');
+
+  // 2) 群状态那条 GET 带着纪要回来（面板的 2s 节拍不新增请求）
+  const state = await hitAdmin(hubAdmin, 'GET', '/api/lan-peers/group?sinceSeq=0');
+  assert.equal(state.json.notes.rev, 1);
+  assert.deepEqual(state.json.notes.notes.map((entry) => entry.text), ['十月计划：先做纪要']);
+  assert.deepEqual(state.json.notesSummary, { count: 1, rev: 1, lastAt: state.json.notes.notes[0].createdAt });
+
+  // 3) 群级 HTTP：成员 GET 拿得到（成员允许），rev/正文一致
+  const got = await fetchGroupNotes({
+    baseUrl: hub.baseUrl, groupKey: cluster.groupKey, groupId: cluster.groupId, senderId: member.peerId,
+  });
+  assert.equal(got.rev, 1);
+  assert.equal(got.notes[0].text, '十月计划：先做纪要');
+
+  // 4) 群级 HTTP：成员 POST → 403 notes-hub-only（门在 handler，不在白名单）
+  await assert.rejects(
+    () => postGroupNote({
+      baseUrl: hub.baseUrl, groupKey: cluster.groupKey, groupId: cluster.groupId,
+      senderId: member.peerId, text: '成员想写一条',
+    }),
+    (error) => {
+      assert.equal(error.status, 403, '成员写纪要必须 403，实测 ' + String(error.message));
+      assert.equal(error.code, 'notes-hub-only');
+      return true;
+    },
+  );
+  assert.equal(hub.server.group.notes().notes.length, 1, '被拒的那次一个字都没落盘');
+});
+
+test('4a N5：纪要随 pull 同步到成员副本；成员没有任何写路径', async (t) => {
+  const { createAdmin } = await import('../../lib/admin.mjs');
+  const cluster = await startCluster(t, { count: 2 });
+  const [hub, member] = cluster.nodes;
+  const hubNotesFile = path.join(hub.dir, 'group-notes.json');
+  const memberNotesFile = path.join(member.dir, 'group-notes.json');
+
+  assert.equal(hub.server.group.appendNote({ text: '第一条纪要' }).ok, true);
+  const second = hub.server.group.appendNote({ text: '第二条纪要' });
+  assert.equal(second.rev, 2);
+  assert.equal(fs.existsSync(hubNotesFile), true, 'hub 有自己的纪要文件');
+
+  // 成员靠**既有的** pull 拿到纪要（没有新轮询）
+  assert.equal(member.server.group.notes().rev, 0, '同步前成员什么都还没有');
+  const pulled = await pullNow(member);
+  assert.equal(pulled?.ok, true, '成员这一轮 pull 必须真跑起来：' + JSON.stringify(pulled));
+  const synced = member.server.group.notes();
+  assert.equal(synced.rev, 2);
+  assert.deepEqual(synced.notes.map((entry) => entry.text), ['第一条纪要', '第二条纪要']);
+
+  // 成员那份落在**副本文件**里，绝不写 hub 的 group-notes.json
+  assert.equal(fs.existsSync(memberNotesFile), false, '成员不许写纪要文件（那本是 hub 的）');
+  const replica = readJson(path.join(member.dir, 'group-replica.json'));
+  assert.equal(replica.notes.rev, 2, '纪要存在成员自己的副本里');
+
+  // 写路径：管理接口按 isHub 先拒
+  const memberAdmin = createAdmin({ server: member.server });
+  const refused = await hitAdmin(memberAdmin, 'POST', '/api/lan-peers/group/notes', { text: '成员要写' });
+  assert.equal(refused.status, 403);
+  assert.deepEqual(refused.json, { error: 'notes-hub-only' });
+  // 门面这一侧也一样（面板/CLI 走的是同一条门面）
+  assert.deepEqual(member.server.group.appendNote({ text: '成员要写' }), { ok: false, error: 'notes-hub-only' });
+  assert.equal(fs.existsSync(memberNotesFile), false, '成员侧没有任何写纪要文件的代码路径');
+});

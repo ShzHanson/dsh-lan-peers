@@ -179,6 +179,16 @@ import {
   sanitizeQuoteMeta,
   undirectedQuestion,
 } from '../lib/group-resident.mjs';
+// 0.10.0-α slice 4a：群纪要（hub 单写、成员只读同步）。纯值对象与三条不变量都在 lib/ 里，
+// 这里只负责落盘与走线。
+import {
+  NOTES_LIMIT,
+  appendNote,
+  makeNote,
+  mergeNotesReplica,
+  normalizeNotesValue,
+  notesSummary,
+} from '../lib/group-notes.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -378,6 +388,13 @@ export const DEFAULT_MAX_CONCURRENT_SESSIONS = 8;
 export const ASK_BUSY_RETRY_MS = 1_000;
 
 const GROUP_FILE = 'group.json';
+
+/**
+ * 0.10.0-α slice 4a：群纪要文件（<stateDir>/group-notes.json，0600 原子写）。
+ * **只有 hub 写这个文件**；成员把同步来的纪要落在自己的 group-replica.json 里，
+ * 永不回写（用户决定：hub 单写、成员只读 —— 4b 才谈提议/表决）。
+ */
+const GROUP_NOTES_FILE = 'group-notes.json';
 
 /** 尾部斜杠（地址归一化共用；写成常量是为了别在正则字面量里反复转义） */
 const TRAILING_SLASHES = /\/+$/;
@@ -1885,6 +1902,77 @@ export class GroupStore {
 }
 
 // ---------------------------------------------------------------------------
+// 0.10.0-α slice 4a · hub 侧群纪要：<stateDir>/group-notes.json（0600 原子写）
+// ---------------------------------------------------------------------------
+
+/**
+ * hub 单写的纪要存储（成员只读同步，本类不上成员节点）。
+ *
+ * 形状固定 `{rev, notes:[{id, text, author, createdAt}]}`：
+ *   - rev 只由 append 前进，**永不回退**（成员靠它判「谁的视图更新」）；
+ *   - id 由 hub 生成，`n<rev>` 这种短号（日志只允许 ≤8 字符的 id）；
+ *   - 超过 NOTES_LIMIT 只丢最旧的，rev 不动 —— 号不复用，成员判新旧仍正确。
+ */
+export class GroupNotesStore {
+  #stateDir;
+
+  #now;
+
+  #data = null;
+
+  constructor({ stateDir, now = Date.now }) {
+    this.#stateDir = expandHome(stateDir);
+    this.#now = typeof now === 'function' ? now : Date.now;
+  }
+
+  get notesPath() {
+    return path.join(this.#stateDir, GROUP_NOTES_FILE);
+  }
+
+  #load() {
+    if (this.#data) return this.#data;
+    this.#data = normalizeNotesValue(readJsonFile(this.notesPath));
+    return this.#data;
+  }
+
+  #save(value) {
+    this.#data = value;
+    writeJson0600(this.notesPath, value);
+    return value;
+  }
+
+  /** 只读视图（网络/面板/CLI 共用；normalizeNotesValue 已复制，调用方改不动内存） */
+  value() {
+    return normalizeNotesValue(this.#load());
+  }
+
+  /** 状态行用的便宜摘要（条数/rev/最后一条时间；不含正文） */
+  summary() {
+    return notesSummary(this.#load());
+  }
+
+  /**
+   * 追加一条纪要。返回 `{ok:true, rev, count, note}` 或 `{ok:false, error}`。
+   * 校验全在 lib/group-notes.mjs 的 makeNote/appendNote 里 —— 这里不重复一遍口径。
+   */
+  append({ text = '', author = '' } = {}) {
+    const current = this.#load();
+    // id 用「下一条 rev」：短、稳定、可读，日志里不会出现 36 位 uuid
+    const made = makeNote({
+      id: `n${Math.max(0, current.rev) + 1}`,
+      text,
+      author,
+      createdAt: this.#now(),
+    });
+    if (!made.ok) return { ok: false, error: made.error };
+    const out = appendNote(current, made.note);
+    if (!out.ok) return { ok: false, error: out.error };
+    const saved = this.#save(out.value);
+    return { ok: true, rev: saved.rev, count: saved.notes.length, note: made.note };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // S2 v0.6.0 成员副本：<stateDir>/group-replica.json（0600）
 // ---------------------------------------------------------------------------
 
@@ -2005,6 +2093,33 @@ export class GroupReplicaStore {
       : GROUP_HISTORY_DEFAULT_LIMIT;
     const fresh = data.messages.filter((message) => Number(message?.seq ?? 0) > from);
     return fresh.length > cap ? fresh.slice(fresh.length - cap) : fresh;
+  }
+
+  /**
+   * 0.10.0-α slice 4a：同步来的群纪要（只读视图）。
+   * 成员的纪要**不是**本机写的：它只是 hub 那份的缓存，形状 {rev, notes}。
+   */
+  notes() {
+    return normalizeNotesValue(this.#load().notes);
+  }
+
+  /**
+   * 收下一份纪要快照（pull 响应里的 notes 字段）。
+   * 只认 rev 更大的那份（mergeNotesReplica）：本地见过更新的视图时绝不因对端更旧而丢掉它。
+   * 返回 {rev, count, adopted}；adopted=false 表示这次什么都没落盘。
+   */
+  setNotes(value) {
+    const data = this.#load();
+    const current = normalizeNotesValue(data.notes);
+    const merged = mergeNotesReplica(current, value);
+    const adopted = merged.rev !== current.rev
+      || merged.notes.length !== current.notes.length
+      || merged.notes[merged.notes.length - 1]?.id !== current.notes[current.notes.length - 1]?.id;
+    if (adopted) {
+      data.notes = merged;
+      this.#save(data);
+    }
+    return { rev: merged.rev, count: merged.notes.length, adopted };
   }
 
   /** bootstrap 时写入/校正头部字段（groupId/epoch/leader），不动消息与 lastSeq */
@@ -2611,6 +2726,31 @@ export function createPeerServer(overrides = {}) {
 
   let replicaStore = groupRole === 'member' ? createReplicaStore() : null;
 
+  /**
+   * 0.10.0-α slice 4a：纪要**只有 hub** 有这个存储（成员那侧只有副本里的缓存）。
+   * 与 groupStore 同生共死：role 从 off 提升成 hub 时才建（真机上 hub 角色重启即建）。
+   */
+  const notesStore = groupStore
+    ? new GroupNotesStore({ stateDir: config.stateDir, now: config.now })
+    : null;
+
+  /** hub 侧追加一条纪要（面板/CLI/群级 HTTP 三条入口共用这一份实现） */
+  function appendLocalNote({ text = '', author = '' } = {}) {
+    if (!notesStore) return { ok: false, error: 'notes-hub-only' };
+    const out = notesStore.append({ text, author: author === '' ? config.name : author });
+    if (out.ok) {
+      // 只记 rev 与条数：纪要正文绝不上日志（与群消息同一口径）
+      if (config.logger) config.logger(`[group] notes append rev=${out.rev} n=${out.count}`);
+    }
+    return out;
+  }
+
+  /** 纪要只读视图：hub 读权威文件，成员读自己同步来的副本（永不回写） */
+  function notesView() {
+    if (notesStore) return notesStore.value();
+    return replicaStore ? replicaStore.notes() : { rev: 0, notes: [] };
+  }
+
   /** 真实监听端口（listen 时才知道）；S1 的地址探测要用 */
   let boundAddress = null;
 
@@ -2744,6 +2884,13 @@ export function createPeerServer(overrides = {}) {
   const GROUP_LEGACY_WARN_WINDOW_MS = 60_000;
   const legacyAuthLoggedAt = new Map();
 
+  /**
+   * 0.10.0-α slice 4a：群纪要的两条方法共用一个路径 —— GET 成员允许、POST hub only。
+   * 它在**本机**的白名单里（契约 §7 的 11 条是冻结的，不能往里加），
+   * 写权限由 groupNotesAppend 在 handler 里判，与路径白名单无关。
+   */
+  const GROUP_NOTES_PATHS = Object.freeze(['/v1/group/notes']);
+
   /** 头分流：'group' | 'group-v2' | ''（缺失或其它值 = 现有 per-peer 签名路径） */
   function groupAuthModeOf(req) {
     const value = headerValue(req, GROUP_AUTH_HEADER.toLowerCase());
@@ -2754,11 +2901,16 @@ export function createPeerServer(overrides = {}) {
 
   /**
    * 群级鉴权认的路径 = 既有白名单（GROUP_AUTH_PATHS，契约 §7 一个字不改）
-   * + 本侧本地集合 GROUP_IDENTITY_PATHS（两条身份端点）。
-   * 少了这一处追加，v2/身份端点会被「非白名单路径带头就 401」的老规则打死。
+   * + 本侧本地集合 GROUP_IDENTITY_PATHS（两条身份端点）
+   * + 本侧本地集合 GROUP_NOTES_PATHS（0.10.0-α slice 4a 的群纪要）。
+   * 少了前一处追加，v2/身份端点会被「非白名单路径带头就 401」的老规则打死；
+   * 纪要走同一个机制：契约的 11 条是**冻结**的（host/test/group-auth.test.mjs 逐条钉死），
+   * 新端点要能过群级鉴权只能加在本侧集合里，不去改那份冻结清单。
    */
   function isGroupAuthPath(pathname) {
-    return GROUP_AUTH_PATHS.includes(pathname) || GROUP_IDENTITY_PATHS.includes(pathname);
+    return GROUP_AUTH_PATHS.includes(pathname)
+      || GROUP_IDENTITY_PATHS.includes(pathname)
+      || GROUP_NOTES_PATHS.includes(pathname);
   }
 
   /** legacy 告警：只记 peer 前 8 位，同一 peer 60 秒最多一条 */
@@ -5432,6 +5584,9 @@ export function createPeerServer(overrides = {}) {
         leaderPeerId: ctx.leaderPeerId,
         lastSeq: ctx.lastSeq,
         messages,
+        // 0.10.0-α slice 4a：群纪要搭**同一次 pull** 回来（不新增轮询）。
+        // 成员拿到后只落副本（replicaStore.setNotes），永不回写 hub —— 纪要 hub 单写。
+        notes: notesView(),
         // 成员靠它把成员表刷新到最新（新成员加进来后不会一直判 not-a-member）
         memberIds: Object.keys(ctx.members),
         memberAcceptDispatch: groupMemberAcceptMask(ctx),
@@ -5441,6 +5596,47 @@ export function createPeerServer(overrides = {}) {
       },
       peerId: auth.peerId,
     };
+  }
+
+  /** GET /v1/group/notes —— 纪要只读视图（成员也允许：这是同步的那一半） */
+  function groupNotes(req, rawBody, url, auth) {
+    const value = notesView();
+    if (config.logger) {
+      config.logger(`[group] notes read from=${shortPeerId(auth.peerId)} rev=${value.rev} n=${value.notes.length}`);
+    }
+    return {
+      status: 200,
+      body: { ok: true, groupId: String(auth.ctx.groupId), rev: value.rev, notes: value.notes },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * POST /v1/group/notes —— **hub 自己**才能写。
+   *
+   * hub-only 的门在**这里**，不在白名单：白名单只回答「这条路径认不认群签名」，
+   * 而成员必须能 GET 纪要（同步的那一半）。把写权限也塞进白名单，等于让任何握群钥的
+   * 成员都能改纪要 —— 那正是用户明确排除的「多人写、冲突合并」。
+   * 判据：本机是 hub（有权威存储）且签名者就是本机 instanceId；别的签名者一律 403 notes-hub-only。
+   */
+  function groupNotesAppend(req, rawBody, url, auth) {
+    if (!notesStore || String(auth.peerId ?? '') !== store.instanceId) {
+      if (config.logger) {
+        config.logger(`[group] notes append refused from=${shortPeerId(auth.peerId)} reason=notes-hub-only`);
+      }
+      return { status: 403, body: { ok: false, error: 'notes-hub-only' }, peerId: auth.peerId };
+    }
+    let body;
+    try {
+      body = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const out = appendLocalNote({ text: body.text == null ? '' : String(body.text), author: config.name });
+    if (!out.ok) {
+      return { status: 400, body: { ok: false, error: out.error }, peerId: auth.peerId };
+    }
+    return { status: 201, body: { ok: true, rev: out.rev, note: out.note }, peerId: auth.peerId };
   }
 
   function groupReplicate(req, rawBody, url, auth) {
@@ -6891,6 +7087,9 @@ export function createPeerServer(overrides = {}) {
     const handlers = {
       'GET /v1/group/probe': groupProbe,
       'GET /v1/group/pull': groupPull,
+      // 0.10.0-α slice 4a：纪要读（成员允许）/ 写（hub only，门在 handler 里）
+      'GET /v1/group/notes': groupNotes,
+      'POST /v1/group/notes': groupNotesAppend,
       // S1 查询 leader（GET）/ S3 心跳（POST）共用这一条路径，方法区分
       'GET /v1/group/leader': groupLeader,
       'POST /v1/group/leader': groupHeartbeat,
@@ -7665,6 +7864,9 @@ export function createPeerServer(overrides = {}) {
       if (Array.isArray(page.memberIds) && page.memberIds.length > 0) {
         replaceGroupMembers(page.memberIds, ctx.members, page.memberAcceptDispatch ?? null);
       }
+      // 0.10.0-α slice 4a：纪要搭同一次 pull 回来 —— 不新增轮询、不多发请求。
+      // 成员只把它落进副本（rev 更大的才采纳），**永不回写** hub：纪要 hub 单写。
+      const synced = page.notes && typeof page.notes === 'object' ? replicaStore.setNotes(page.notes) : null;
       memberLastError = '';
       // hub 在 pull 响应里自报地址（X-Peer-Base 同一口径）：按名入群的节点本地没有 hub 的
       // 配对记录，靠这一条把地址写进 group-key.json 的成员表（选举/提案要用）。
@@ -7684,6 +7886,9 @@ export function createPeerServer(overrides = {}) {
       }
       if (config.logger) {
         config.logger(`[group] pull since=${sinceSeq} got=${applied.added} lastSeq=${applied.lastSeq}`);
+      }
+      if (synced && synced.adopted && config.logger) {
+        config.logger(`[group] notes sync rev=${synced.rev} n=${synced.count}`);
       }
       return { ok: true, added: applied.added, lastSeq: applied.lastSeq };
     } catch (error) {
@@ -9077,6 +9282,11 @@ export function createPeerServer(overrides = {}) {
           // 契约 §4：不带新字段时逐字是 0.8.4 的 append（同步、原样返回那条消息）；
           // 带 workspaceId/permission/target 才进「发帖 + 派单」链路（返回 Promise）。
           post: (input) => groupPostFacade(input),
+          // 0.10.0-α slice 4a：纪要 hub 单写。summary 只含条数/rev/时间，不含正文。
+          notes: () => notesView(),
+          notesSummary: () => notesSummary(notesView()),
+          appendNote: (input) => appendLocalNote(input ?? {}),
+          notesCap: () => NOTES_LIMIT,
           // 与 /v1/group/history 同一个渲染口径：同名成员在这里就已经带上短 id 后缀
           history: (options = {}) => decoratedMessages(options),
           // §18：归档索引 / 人工删除 / 游标落在归档区间的判定（管理接口与面板走这里）
@@ -9118,6 +9328,12 @@ export function createPeerServer(overrides = {}) {
             };
           },
           pull: () => memberTick(),
+          // 0.10.0-α slice 4a：成员侧纪要**只读** —— 读的是 pull 同步来的副本，
+          // appendNote 一律拒绝（不是「暂时没实现」，是成员永远没有这条写路径）。
+          notes: () => notesView(),
+          notesSummary: () => notesSummary(notesView()),
+          appendNote: () => ({ ok: false, error: 'notes-hub-only' }),
+          notesCap: () => NOTES_LIMIT,
           // 契约 §4 的门面在成员节点也要在：不带新字段时走既有回执通道（hub / 群级签名）
           post: (input) => groupPostFacade(input),
           advertiseBaseUrl: () => localAdvertiseBaseUrl(),
