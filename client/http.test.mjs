@@ -303,7 +303,10 @@ test('a peer without /v1/events falls back to long-polling in auto mode', async 
       secret: SECRET,
       senderId: SENDER,
       sessionId: 'sess-fallback',
-      timeoutMs: 10_000,
+      // 预算必须大于 2×STREAM_RESERVE_MS(30s)，否则 awaitPeerAnswer 按设计直接跳过流、
+      // 直奔长轮询（2026-11-09 的缺陷正是流吃掉整个预算）。这里要验的是
+      // 「流断了就回退」，所以给足预算；404 秒回，测试不会真的等。
+      timeoutMs: 70_000,
       mode: 'auto',
       pollIntervalMs: 10,
     });

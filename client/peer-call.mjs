@@ -25,6 +25,21 @@ export const MAX_ANSWER_WAIT_MS = 25_000;
 export const LEGACY_POLL_MS = 1_500;
 /** A peer that answers `running` faster than this did not hold the request. */
 const FAST_ANSWER_MS = 500;
+/**
+ * SSE 阶段只准花掉预算的一小块，必须给长轮询留出保底时间。
+ * 2026-11-09 实测：7/7 次 ask 都把整个预算花在 /v1/events 上，流一断就正好到期，
+ * `while (Date.now() < deadline)` 一次都不执行，答案明明可取却没人再去问一次。
+ * 保留时长 = 一次满额 hold（MAX_ANSWER_WAIT_MS 25s）再加 5s 余量。
+ */
+export const STREAM_RESERVE_MS = 30_000;
+/** SSE 自身也设上限：再长也只是白等，答案早已可由 /v1/answer 取回。 */
+export const STREAM_CAP_MS = 300_000;
+/** 预算 <= 2×保留时长时流拿不到有意义的窗口，直接轮询（见下方 streamBudget 判断）。 */
+/** 可重试失败的指数退避：500ms 起，封顶 4s。 */
+const POLL_BACKOFF_BASE_MS = 500;
+const POLL_BACKOFF_CAP_MS = 4_000;
+/** 4xx 里仍然可重试的：408 超时说话不算话，429 就是让你退避重试。 */
+const RETRYABLE_4XX = new Set([408, 429]);
 const PROBE_TTL_MS = 30_000;
 const probeCache = new Map();
 
@@ -82,7 +97,14 @@ export async function callPeer({
   if (json && json.enc === ENC_VERSION && typeof json.data === 'string') {
     json = decryptJson(secret, json.data);
   }
-  if (!res.ok) throw new Error(`${res.status} ${json?.error || ''}`.trim());
+  if (!res.ok) {
+    // 消息文案保持不变；把状态码和错误码挂在 Error 上，让调用方能区分
+    // 「永久拒绝」（400 encryption-required）和「可重试」（429 / 传输故障）。
+    const error = new Error(`${res.status} ${json?.error || ''}`.trim());
+    error.status = res.status;
+    error.code = json?.error == null ? null : String(json.error);
+    throw error;
+  }
   return json;
 }
 
@@ -146,6 +168,9 @@ export async function awaitPeerAnswer({
   onProgress,
   signal,
   fetchImpl = fetch,
+  // 预算切分的默认值就是上面两个常量；仅在测试里收窄，生产不要传。
+  streamReserveMs = STREAM_RESERVE_MS,
+  streamCapMs = STREAM_CAP_MS,
 }) {
   const startedAt = Date.now();
   const budget = Math.max(1000, Number(timeoutMs) || 300_000);
@@ -153,22 +178,40 @@ export async function awaitPeerAnswer({
   const hold = Math.min(Math.max(1000, Number(waitMs) || DEFAULT_ANSWER_WAIT_MS), MAX_ANSWER_WAIT_MS);
   const useWaitMs = mode !== 'legacy';
   const transport = useWaitMs ? 'long-poll' : 'legacy-poll';
+  const reserve = Math.max(1000, Number(streamReserveMs) || STREAM_RESERVE_MS);
+  const streamCap = Math.max(1000, Number(streamCapMs) || STREAM_CAP_MS);
 
-  if (mode === 'auto' || mode === 'stream') {
-    const streamed = await readPeerEvents({
-      baseUrl,
-      secret,
-      senderId,
-      sessionId,
-      signal,
-      timeoutMs: budget,
-      fetchImpl,
-      onEvent: (info) => {
-        if (info.type === 'ping') return;
-        onProgress?.({ transport: 'sse', status: info.status, elapsedMs: info.elapsedMs });
-      },
-    });
-    if (streamed.ok) {
+  // 预算切分：流最多花 min(预算 - 保留, 上限)，剩下的留给长轮询。
+  // 预算太小（<= 2*保留）时流拿不到有意义的窗口，直接跳过。
+  const streamBudget = Math.min(budget - reserve, streamCap);
+  if ((mode === 'auto' || mode === 'stream') && budget > reserve * 2 && streamBudget >= 1000) {
+    const streamAbort = new AbortController();
+    const forwardAbort = () => streamAbort.abort(signal?.reason);
+    if (signal) {
+      if (signal.aborted) streamAbort.abort(signal.reason);
+      else signal.addEventListener('abort', forwardAbort, { once: true });
+    }
+    let streamed;
+    try {
+      streamed = await readPeerEvents({
+        baseUrl,
+        secret,
+        senderId,
+        sessionId,
+        signal: streamAbort.signal,
+        timeoutMs: streamBudget,
+        fetchImpl,
+        onEvent: (info) => {
+          if (info.type === 'ping') return;
+          onProgress?.({ transport: 'sse', status: info.status, elapsedMs: info.elapsedMs });
+        },
+      });
+    } finally {
+      // 任何出口路径都拆掉流：监听器、socket 都不留。
+      try { signal?.removeEventListener?.('abort', forwardAbort); } catch {}
+      try { streamAbort.abort(new Error('stream-phase-over')); } catch {}
+    }
+    if (streamed?.ok) {
       return {
         status: streamed.status,
         reply: streamed.reply,
@@ -179,14 +222,21 @@ export async function awaitPeerAnswer({
     }
     // Contract: a broken stream is continued with waitMs long-polling. Events are
     // not replayed; /v1/answer reports the session's current state on its own.
+    // 此时预算还剩 >= 保留时长（或流提前结束），轮询至少能问一次。
   }
 
   const base = `/v1/answer?sessionId=${encodeURIComponent(String(sessionId ?? ''))}`;
-  while (Date.now() < deadline) {
+  let attempts = 0;
+  let lastError = null;
+  let sawRunning = false;
+  let backoffMs = 0;
+  // first 保证：流没给出确定答案时，即使已经过了 deadline 也务必问一次 /v1/answer。
+  for (let first = true; first || Date.now() < deadline; first = false) {
     const remaining = Math.max(1000, deadline - Date.now());
     const holdMs = Math.min(hold, remaining);
     const apiPath = useWaitMs ? `${base}&waitMs=${holdMs}` : base;
     const startedCall = Date.now();
+    attempts += 1;
     let answer;
     try {
       answer = await callPeer({
@@ -200,7 +250,29 @@ export async function awaitPeerAnswer({
         fetchImpl,
       });
     } catch (error) {
-      return { status: 'error', error: message(error), elapsedMs: Date.now() - startedAt, transport };
+      const status = Number(error?.status);
+      const fatal = status >= 400 && status < 500 && !RETRYABLE_4XX.has(status);
+      if (fatal) {
+        // 永久性协议拒绝（2026-11-06 的 29255 次 400 encryption-required 就是这里被打成可重试）：
+        // 立刻收手，不再问第二次。
+        return {
+          status: 'error',
+          error: message(error) || `http-${status}`,
+          elapsedMs: Date.now() - startedAt,
+          transport,
+          sessionId,
+          httpStatus: status,
+          terminal: true,
+        };
+      }
+      // 只有传输层故障和 408/429 走重试；退避封顶，快失败的服务端也打不穿。
+      lastError = message(error);
+      backoffMs = backoffMs ? Math.min(backoffMs * 2, POLL_BACKOFF_CAP_MS) : POLL_BACKOFF_BASE_MS;
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      onProgress?.({ transport, status: 'retry', elapsedMs: Date.now() - startedAt });
+      await sleep(Math.min(backoffMs, left), signal);
+      continue;
     }
     const took = Date.now() - startedCall;
     const elapsedMs = Number(answer?.elapsedMs) || Date.now() - startedAt;
@@ -210,14 +282,22 @@ export async function awaitPeerAnswer({
     if (answer?.status === 'error') {
       return { status: 'error', error: String(answer.error ?? 'peer-error'), elapsedMs, transport };
     }
+    backoffMs = 0;
+    sawRunning = true;
     onProgress?.({ transport, status: 'running', elapsedMs });
     // A peer that answers "running" without holding ignores waitMs (a 0.3.1 host
     // does exactly that), so keep the old cadence instead of spinning on it.
-    if (took < FAST_ANSWER_MS) {
+    if (took < FAST_ANSWER_MS && Date.now() < deadline) {
       await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())), signal);
     }
   }
-  return { status: 'timeout', error: 'timeout', elapsedMs: Date.now() - startedAt, transport };
+  const elapsedMs = Date.now() - startedAt;
+  // 预算耗尽仍在跑：带上 sessionId，调用方可以据此续问，不必整轮重来。
+  // 一次都没问到状态、且最后一次是可重试失败：报 error 比报 timeout 诚实。
+  if (lastError && !sawRunning) {
+    return { status: 'error', error: lastError, elapsedMs, transport, sessionId };
+  }
+  return { status: 'timeout', error: 'timeout', elapsedMs, transport, sessionId, attempts };
 }
 
 // ---- pairing --------------------------------------------------------------
