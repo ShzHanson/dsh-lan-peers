@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { SECRET_RULES } from '../../scripts/leak-check.mjs';
+import { SECRET_RULES, historyFileOwner, scanText } from '../../scripts/leak-check.mjs';
 
 const BS = '\\';
 const ip = (...octets) => octets.join('.');
@@ -94,4 +94,53 @@ test('非空验证：去掉后顾断言就会把 URL 误判成路径', () => {
   assert.equal(naive.test(drive('D', 'DS-Harness')), true, '朴素写法能命中真路径');
   assert.equal(caught('workstation-path', 'http://example.com/x'), false, '真实规则挡住 URL');
   assert.equal(caught('workstation-path', drive('D', 'DS-Harness')), true, '真实规则仍命中真路径');
+});
+
+// 历史归属：git show 的 diff 头决定「这一行属于哪个文件」，规则里的文件级豁免全靠它。
+// 删除文件的 `+++` 侧是 /dev/null，文件名只剩在 `--- a/<path>` 侧——这里用内存里的 diff 字符串复现，
+// 不依赖真实 git 历史。夹具值形状与真实泄漏一致，只在 *.test.mjs 里才该被豁免。
+const FIXTURE_LINE = "        secret: 'should-not-leak',";
+
+const diffHeader = (oldPath, newPath) => [
+  'diff --git a/' + (oldPath || newPath) + ' b/' + (newPath || oldPath),
+  'index 1111111..2222222 100644',
+  '--- ' + (oldPath ? 'a/' + oldPath : '/dev/null'),
+  '+++ ' + (newPath ? 'b/' + newPath : '/dev/null'),
+];
+
+const scanDiff = (text) => {
+  const owners = historyFileOwner(text);
+  return scanText(text, SECRET_RULES, (index) => owners[index]);
+};
+
+test('历史归属：删除的测试文件仍带着自己的路径，夹具豁免生效', () => {
+  const text = [...diffHeader('host/test/gone.test.mjs', ''), '@@ -1,1 +0,0 @@', '-' + FIXTURE_LINE].join('\n');
+  assert.equal(historyFileOwner(text).at(-1), 'host/test/gone.test.mjs', '删除侧的文件名必须从 --- a/<path> 取回');
+  assert.deepEqual(scanDiff(text), [], '取回文件名后 password-assign 的夹具豁免应当生效，不报问题');
+});
+
+test('历史归属：同一行落在被删除的非测试文件上必须照报', () => {
+  const text = [...diffHeader('lib/app.js', ''), '@@ -1,1 +0,0 @@', '-' + FIXTURE_LINE].join('\n');
+  const hits = scanDiff(text);
+  assert.equal(hits.length, 1, '生产文件没有夹具豁免，必须报出来');
+  assert.equal(hits[0].rule, 'password-assign');
+});
+
+test('历史归属：归属未知的行按严格处理，绝不当成测试夹具', () => {
+  const text = ['@@ -1,1 +1,1 @@', '-' + FIXTURE_LINE].join('\n');
+  assert.equal(historyFileOwner(text).at(-1), '', '完全没有 diff 头时归属必须是空');
+  assert.equal(scanDiff(text).length, 1, '空归属匹配不到 *.test.mjs，必须照报（fail closed）');
+});
+
+test('历史归属：新增侧与改名同样带上文件名，改出测试文件后不再豁免', () => {
+  const added = [...diffHeader('', 'host/test/new.test.mjs'), '@@ -0,0 +1,1 @@', '+' + FIXTURE_LINE].join('\n');
+  assert.equal(historyFileOwner(added).at(-1), 'host/test/new.test.mjs');
+  assert.deepEqual(scanDiff(added), [], '新增的测试文件同样豁免');
+
+  const renamedIn = [...diffHeader('lib/old.mjs', 'host/test/renamed.test.mjs'), '@@ -1,1 +1,1 @@', '-' + FIXTURE_LINE, '+' + FIXTURE_LINE].join('\n');
+  assert.equal(historyFileOwner(renamedIn).at(-1), 'host/test/renamed.test.mjs', '改名后归属取新路径');
+  assert.deepEqual(scanDiff(renamedIn), [], '改名进测试文件名后豁免生效');
+
+  const renamedOut = [...diffHeader('host/test/old.test.mjs', 'lib/renamed.js'), '@@ -1,1 +1,1 @@', '-' + FIXTURE_LINE, '+' + FIXTURE_LINE].join('\n');
+  assert.equal(scanDiff(renamedOut).length, 2, '改名出测试文件后两行都必须照报，豁免不能跟着旧名字泄漏');
 });

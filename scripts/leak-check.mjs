@@ -138,20 +138,25 @@ function loadLocalPatterns() {
 }
 
 // 历史扫描是整段 git show，某一行属于哪个文件只能靠 diff 头推断，所以这里按行解析归属文件。
-function historyFileOwner(text) {
+// 归属必须跟着 hunk 走完整条 diff：删除文件的 `+++` 侧是 /dev/null，文件名只剩在 `--- a/<path>` 侧，
+// 所以 `+++ /dev/null` 时回落到同一段落里记下的删除侧路径；两侧都拿不到（真正的未知归属）留 ''，
+// 由规则按「非测试文件」严格处理（fail closed），绝不当成测试夹具放行。
+export function historyFileOwner(text) {
   const owners = [];
   let current = '';
+  let removedSide = '';
   const lines = text.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
-    const added = /^\+\+\+ b\/(.+)$/.exec(lines[index]);
-    if (added) current = added[1];
-    else if (/^\+\+\+ \/dev\/null$/.test(lines[index])) current = '';
+    const removed = /^--- (?:a\/)?(.+)$/.exec(lines[index]);
+    if (removed) removedSide = removed[1] === '/dev/null' ? '' : removed[1];
+    const added = /^\+\+\+ (?:b\/)?(.+)$/.exec(lines[index]);
+    if (added) current = added[1] === '/dev/null' ? removedSide : added[1];
     owners[index] = current;
   }
   return owners;
 }
 
-function scanText(text, rules, owner) {
+export function scanText(text, rules, owner) {
   const hits = [];
   const lines = text.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
