@@ -19,6 +19,8 @@ import { fileMode, makeTempStateDir, peerFixture, readJson, request, seedPeers, 
 // 0.10.0-α slice 4a：纪要的群级 HTTP 读口/写口 + 真集群脚手架
 import { fetchGroupNotes, groupCall, postGroupNote } from '../../lib/group-client.mjs';
 import { startCluster, waitFor } from './group-cluster.mjs';
+// 0.10.0：投影行的拆包是纯函数，直接单测六种已知形状
+import { permissionOf, turnOutlineTurns } from '../../lib/runner-ctx.mjs';
 
 const MEMBER = peerFixture('peer-replica-1');
 const MEMBER2 = peerFixture('peer-replica-2');
@@ -648,6 +650,31 @@ async function loadCtxRunner(dir) {
   return mod.createCtxRunner;
 }
 
+// ---------------------------------------------------------------------------
+// 真机 fixture 出处（读盘取得，不是照文档猜的）：
+//   C:/Users/user/.dsh/storages/session_projcache/sessions/session-9efc4183-c86e-4224-8048-9382f6edaead.json
+//   record.rows.turnOutline  = { ver:2, seq:41, val:{ turns:[{turn,seq,prompt,response}], draft:'' } }
+//   record.rows.permissions  = { ver:2, seq:41, val:{ preset, sandbox, approval, seeded } }
+//   record.rows.workingDirectory = { ver:1, seq:41, val:'D:/DS-Harness/lan-peers-workspace' }
+// 同一个形状在第二条真机会话里复现（session-9e97b884-…：val.turns[0].response = '桌面在线'、
+// val.preset = 'workspace-write'）。下面三行**逐字**是那三行，只把 prompt 正文按缓存里的
+// 截断原样保留；response 就是真机观测到的字符串。
+// ---------------------------------------------------------------------------
+const LIVE_TURN_OUTLINE = {
+  ver: 2,
+  seq: 41,
+  val: {
+    turns: [
+      { turn: 1, seq: 5, prompt: '【群内提问 · 致本机】群里有人 @ 了你，请直接、简洁地回答这个问题。…', response: '收到' },
+      { turn: 2, seq: 24, prompt: '【群内提问 · 致本机】群里有人 @ 了你，请直接、简洁地回答这个问题。…', response: '收到' },
+      { turn: 3, seq: 33, prompt: '【群内提问 · 致本机】群里有人 @ 了你，请直接、简洁地回答这个问题。…', response: '桌面在线' },
+    ],
+    draft: '',
+  },
+};
+const LIVE_PERMISSIONS = { ver: 2, seq: 41, val: { preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask', seeded: false } };
+const LIVE_WORKING_DIRECTORY_VAL = 'D:/DS-Harness/lan-peers-workspace';
+
 /**
  * 照真机造一个 sessionController：
  *   - `list()` 的 turnOutline 是 `{ turns: [...] }`，permissions 是 `{preset,sandbox,approval}`；
@@ -698,14 +725,22 @@ function liveController({ reply = '收到', steps = 3 } = {}) {
             running: session.running,
             projections: {
               values: {
+                // 真机三层：每行都是 { ver, seq, val }，真值在 val 里（见文件末尾 LIVE_* 的出处）
                 turnOutline: {
-                  turns: session.turns.map((prompt, index) => ({
-                    turn: index + 1,
-                    prompt,
-                    response: index === last && !session.running ? session.reply : '',
-                  })),
+                  ver: 2,
+                  seq: 41,
+                  val: {
+                    turns: session.turns.map((prompt, index) => ({
+                      turn: index + 1,
+                      seq: 5 + index * 9,
+                      prompt,
+                      response: index === last && !session.running ? session.reply : '',
+                    })),
+                    draft: '',
+                  },
                 },
-                permissions: { preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
+                permissions: { ver: 2, seq: 41, val: { preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask', seeded: false } },
+                workingDirectory: { ver: 1, seq: 41, val: LIVE_WORKING_DIRECTORY_VAL },
               },
             },
           };
@@ -1328,4 +1363,114 @@ test('4b-1 V8：一轮一个定时器；关轮与 close() 都清掉（进程能�
   assert.equal(g.voteTimers(), 1);
   await hub.server.close();
   assert.equal(g.voteTimers(), 0, 'close() 必须清掉表决定时器（否则进程吊死）');
+});
+
+// ---------------------------------------------------------------------------
+// 0.10.0 真机回归 T1–T4：直接喂**从本机 projection 缓存读出来的**三行
+//
+// a66b570 把这些形状一个个列出来认，列漏了最外层 `.val`（真机是 {ver,seq,val} 三层），
+// 于是 turnOutlineTurns 回 []、poll 恒 running、120 s 后 empty-reply —— 会话里明明写着
+// response，调用方却说「对端没答」。下面 T1/T2 就是拿真机那两行验的；T3 守住
+// 「真空 = 还在跑」的既有语义。
+//
+// T4（非空断言）：把 lib/runner-ctx.mjs 的 PROJECTION_WRAPPERS 改成 []（等于回到
+// a66b570 只列形状的读法），T1 的 deepEqual({status:'done'}) 立刻变成
+// {status:'running'} —— 断言必挂。这不是推测：同一条真机行在 a66b570 上就是这样
+// 返回 running 的（production 的 120 s empty-reply 即由此而来）。
+// ---------------------------------------------------------------------------
+
+/** list() 直接把真机那三行原样吐回来的 stub controller（形状不加工） */
+function cachedController(options = {}) {
+  // 键缺席才用真机行；显式传 null 表示「投影行还没写」
+  const turnOutline = 'turnOutline' in options ? options.turnOutline : LIVE_TURN_OUTLINE;
+  const permissions = 'permissions' in options ? options.permissions : LIVE_PERMISSIONS;
+  const running = options.running === true;
+  const items = new Map();
+  return {
+    async create() {
+      const sessionId = 'cache-' + (items.size + 1);
+      items.set(sessionId, true);
+      return { sessionId };
+    },
+    async prompt() { return {}; },
+    async list() {
+      return {
+        items: [...items.keys()].map((sessionId) => ({
+          sessionId,
+          running,
+          projections: {
+            values: {
+              turnOutline,
+              permissions,
+              workingDirectory: { ver: 1, seq: 41, val: LIVE_WORKING_DIRECTORY_VAL },
+            },
+          },
+        })),
+      };
+    },
+  };
+}
+
+test('0.10.0 真机 T1：{ver,seq,val:{turns}} 真行 → poll 立刻 done，reply = 真机 response', async (t) => {
+  const dir = makeTempStateDir('dsh-ctx-proj-');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const createCtxRunner = await loadCtxRunner(dir);
+  const runner = createCtxRunner(cachedController(), { workspace: dir });
+
+  const sessionId = await runner.ask('群内提问');
+  const polled = await runner.poll(sessionId);
+  // 少了任一层拆包，这里就是 {status:'running'}（见 T4）
+  assert.deepEqual(polled, { status: 'done', reply: '桌面在线' }, 'reply 必须是 val.turns[last].response');
+});
+
+test('0.10.0 真机 T2：{ver,seq,val:{preset}} 真行 → runner 回报真机 preset 且 honored', async (t) => {
+  const dir = makeTempStateDir('dsh-ctx-proj-');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const createCtxRunner = await loadCtxRunner(dir);
+  const runner = createCtxRunner(cachedController(), { workspace: dir });
+
+  const scoped = await runner.ask('群内提问', { permission: 'workspace-write' });
+  assert.equal(scoped.appliedPermission, 'workspace-write', 'preset 在 val 里，读不到就会是空串');
+  assert.equal(scoped.permissionHonored, true);
+  assert.equal(scoped.permissionReason, 'matched-effective');
+});
+
+test('0.10.0 真机 T3：真空 projection（val.turns=[] / 认不出的形状）→ 仍是 running', async (t) => {
+  const dir = makeTempStateDir('dsh-ctx-proj-');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const createCtxRunner = await loadCtxRunner(dir);
+
+  for (const turnOutline of [
+    { ver: 2, seq: 7, val: { turns: [], draft: '' } }, // 真机「还没有这一轮」
+    { ver: 2, seq: 7, val: {} },
+    null, // 投影行还没写
+  ]) {
+    const runner = createCtxRunner(cachedController({ turnOutline }), { workspace: dir });
+    const sessionId = await runner.ask('群内提问');
+    assert.deepEqual(await runner.poll(sessionId), { status: 'running' }, '没轮次 = 还在跑，不是 done 也不是 error');
+  }
+});
+
+test('0.10.0 真机 T1b：六种已知线形状都认（裸数组 / turns / val / currentValue 的两两组合），认不出仍 []', () => {
+  const turns = [{ turn: 1, response: '收到' }];
+  const shapes = {
+    'bare array': turns,
+    '{turns}': { turns },
+    '{val:{turns}}': { ver: 2, seq: 41, val: { turns, draft: '' } }, // ← 真机形状
+    '{currentValue:{turns}}': { currentValue: { turns } },
+    '{val:[...]}': { ver: 2, seq: 41, val: turns },
+    '{currentValue:[...]}': { currentValue: turns },
+  };
+  for (const [name, row] of Object.entries(shapes)) {
+    assert.deepEqual(turnOutlineTurns(row), turns, name + ' 必须认出轮次');
+  }
+  // 认不出的形状一律 []（= 没有这一轮，调用方维持 running，绝不猜）
+  for (const row of [undefined, null, {}, { ver: 2, seq: 1 }, { turns: 'nope' }, 42]) {
+    assert.deepEqual(turnOutlineTurns(row), [], JSON.stringify(row) + ' 不该被猜成一轮');
+  }
+  // permissions 同口径：真机 {ver,seq,val:{preset}} 与历代 {currentValue} 都读得出
+  assert.equal(permissionOf({ ver: 2, seq: 41, val: { preset: 'read-only', sandbox: 'read-only', approval: 'ask' } }), 'read-only');
+  assert.equal(permissionOf({ currentValue: 'danger-full-access' }), 'danger-full-access');
+  assert.equal(permissionOf({ val: { preset: 'custom', sandbox: 'workspace-write' } }), 'workspace-write');
+  assert.equal(permissionOf(undefined), '', '读不到就是空串（调用方据此如实降级）');
 });
