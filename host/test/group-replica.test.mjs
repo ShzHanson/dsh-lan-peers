@@ -13,7 +13,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { createPeerServer, GroupReplicaStore } from '../server.mjs';
+import { createPeerServer, GroupReplicaStore, sanitizeGroupMeta } from '../server.mjs';
 import { deriveGroupKeys, decryptGroupJson, encryptGroupBody, groupAuthHeaders } from '../../lib/group-client.mjs';
 import { fileMode, makeTempStateDir, peerFixture, readJson, request, seedPeers, writeJson0600 } from './helpers.mjs';
 
@@ -63,7 +63,7 @@ function memberStateDir(t, { hubBaseUrl, hubInstanceId, identity = MEMBER, hubNa
   return dir;
 }
 
-async function startMember(t, { hubBaseUrl, hubInstanceId, identity = MEMBER, group = {}, stateDir }) {
+async function startMember(t, { hubBaseUrl, hubInstanceId, identity = MEMBER, group = {}, stateDir, runner, logger, name }) {
   const dir = stateDir ?? memberStateDir(t, { hubBaseUrl, hubInstanceId, identity });
   const server = createPeerServer({
     listenHost: '127.0.0.1',
@@ -73,6 +73,11 @@ async function startMember(t, { hubBaseUrl, hubInstanceId, identity = MEMBER, gr
     group: { enabled: true, hub: 'hub', autoJoin: true, ...group },
     // 测试自己驱动补差，不让后台定时器插进来
     groupReplica: { pullIntervalMs: 600_000 },
+    // 0.10.0-α slice 3a：@ 必答要用喂进来的假 runner（默认的 MemoryRunner 会答成 "OK …"）
+    ...(runner ? { runner } : {}),
+    ...(logger ? { logger } : {}),
+    // slice 3a：本机显示名（@ 判定按名字命中时用得上；config.name 默认是 os.hostname()）
+    ...(name ? { name } : {}),
   });
   const info = await listenOnRandomPort(server);
   // 回环地址做「成员自报地址」：否则 hub 推到探测出的私网 IP，测试机上打不通
@@ -452,3 +457,188 @@ test('S2 hub members().lastSeq：从未 probe/pull 的成员是 null，自己那
   assert.equal(member.server.group.replica.state().lastSeq, 1);
 });
 
+
+// ---------------------------------------------------------------------------
+// 0.10.0-α slice 3a · 群内 @ 必答（常驻会话 + 引用 + 单飞）
+//
+// 假 runner 记录 ask/done 的先后：events 就是 A3 的顺序断言，asks 就是 A4 的次数断言。
+// ---------------------------------------------------------------------------
+
+function answerRunner({ reply = '答：磁盘还剩 42G', fail = false, delayMs = 0, now = Date.now } = {}) {
+  const sessions = new Map();
+  const events = [];
+  const asks = [];
+  const state = { reply, fail, delayMs };
+  let created = 0;
+  let turns = 0;
+  return {
+    events,
+    asks,
+    sessions,
+    state,
+    async ask(prompt, options = undefined) {
+      const wanted = typeof options?.sessionId === 'string' ? options.sessionId.trim() : '';
+      const live = wanted !== '' && sessions.has(wanted);
+      const sessionId = live ? wanted : 'rs-' + (++created);
+      turns += 1;
+      asks.push({ prompt, wanted, sessionId, reused: live, turn: turns });
+      events.push('ask:' + turns);
+      sessions.set(sessionId, { turn: turns, completesAt: now() + state.delayMs, reported: false });
+      return { sessionId, reused: live };
+    },
+    async poll(sessionId) {
+      const session = sessions.get(sessionId);
+      if (!session) return { status: 'error', error: 'session-not-found' };
+      if (now() < session.completesAt) return { status: 'running' };
+      if (!session.reported) {
+        session.reported = true;
+        events.push('done:' + session.turn);
+      }
+      if (state.fail) return { status: 'error', error: 'runner-error' };
+      return { status: 'done', reply: state.reply };
+    },
+  };
+}
+
+/** hub 群日志（落盘视图，带 sanitize 后的 meta）：答复到底进没进群，看这里 */
+const hubMessages = (hub) => readJson(path.join(hub.stateDir, 'group.json')).messages;
+
+/** 关掉 hub → 成员的推送：只留「成员自己 pull」这一条触发路径，用例才确定 */
+function disablePush(hub) {
+  hub.server.group.state().members[MEMBER.peerId].baseUrl = 'http://127.0.0.1:1';
+}
+
+const askFromHub = (hub, text) => hub.server.group.post({
+  peerId: hub.server.store.instanceId,
+  name: 'hub',
+  kind: 'chat',
+  text,
+});
+
+const answersOf = (list) => list.filter((m) => m.from.peerId === MEMBER.peerId && m.kind === 'chat');
+
+test('3a A4 群内 @ 到我 → 一条 chat 答复 + meta.quote（seq 对得上、摘要 ≤80、正文=runner 答复）', async (t) => {
+  const hub = await startHub(t);
+  const runner = answerRunner({ reply: '磁盘还剩 42G' });
+  const member = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, runner, name: 'nas-box',
+  });
+  await pullNow(member); // bootstrap
+  disablePush(hub);
+
+  const question = askFromHub(hub, '@nas-box 磁盘还剩多少');
+  assert.equal(question.seq, 1);
+  const out = await pullNow(member);
+  assert.equal(out.ok, true, JSON.stringify(out));
+  await member.server.group.waitAnswers();
+
+  assert.equal(runner.asks.length, 1, '@ 到我 → 恰好一次 runner 调用');
+  assert.equal(runner.asks[0].wanted, '', '第一次提问要新建常驻会话（没有记录）');
+  assert.match(runner.asks[0].prompt, /【群内提问 · 致本机】/, '提示词必须带群内提问前言');
+  assert.match(runner.asks[0].prompt, /@nas-box 磁盘还剩多少/, '原文要进提示词');
+
+  const messages = hubMessages(hub);
+  const answers = answersOf(messages);
+  assert.equal(answers.length, 1, '必须恰好一条答复消息');
+  assert.equal(answers[0].text, '磁盘还剩 42G', '答复正文 = runner 回复');
+  assert.equal(answers[0].meta.quote.seq, 1, 'quote.seq 必须是被回答那条的 seq');
+  assert.equal(answers[0].meta.quote.from, 'hub');
+  assert.equal(answers[0].meta.quote.excerpt, '@nas-box 磁盘还剩多少');
+  assert.ok(answers[0].meta.quote.excerpt.length <= 80);
+
+  // 常驻会话落盘了：<stateDir>/group-resident.json 里就是这个群的这条会话
+  const resident = readJson(path.join(member.stateDir, 'group-resident.json'));
+  const key = Object.keys(resident.groups)[0];
+  assert.equal(resident.groups[key].sessionId, runner.asks[0].sessionId);
+  assert.ok(resident.groups[key].lastUsedAt > 0);
+});
+
+test('3a A3 单飞：两条 @ 同时在飞 → 串行、顺序= 到达顺序、第二问复用同一条常驻会话', async (t) => {
+  const hub = await startHub(t);
+  const runner = answerRunner({ reply: '收到', delayMs: 20 });
+  const member = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, runner, name: 'nas-box',
+  });
+  await pullNow(member);
+  disablePush(hub);
+
+  askFromHub(hub, '@nas-box 第一问');
+  askFromHub(hub, '@nas-box 第二问');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  assert.equal(runner.asks.length, 2, '两条 @ 各一次 runner 调用');
+  assert.deepEqual(runner.events, ['ask:1', 'done:1', 'ask:2', 'done:2'],
+    'A8 非空断言：没有单飞守卫时这里会是 ask:1, ask:2, done:1, done:2');
+  assert.equal(runner.asks[1].wanted, runner.asks[0].sessionId, '第二问必须复用同一个常驻会话');
+  assert.equal(runner.asks[1].reused, true, 'runner 确认续上');
+
+  const answers = answersOf(hubMessages(hub));
+  assert.deepEqual(answers.map((m) => m.meta.quote.seq), [1, 2], '两条答复按顺序引用各自的问题');
+  assert.deepEqual(answers.map((m) => m.text), ['收到', '收到']);
+});
+
+test('3a A5 空/错答案：不发帖、只记一行、日志不带正文、常驻会话之后仍可用', async (t) => {
+  const hub = await startHub(t);
+  const logs = [];
+  const runner = answerRunner({ fail: true });
+  const member = await startMember(t, {
+    hubBaseUrl: hub.baseUrl,
+    hubInstanceId: hub.server.store.instanceId,
+    runner,
+    name: 'nas-box',
+    logger: (line) => logs.push(String(line)),
+  });
+  await pullNow(member);
+  disablePush(hub);
+
+  askFromHub(hub, '@nas-box 第一问');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  assert.equal(answersOf(hubMessages(hub)).length, 0, 'runner 报错 → 一条消息都不发');
+  const skipped = logs.filter((line) => line.includes('[group] answer skipped'));
+  assert.equal(skipped.length, 1, '失败只记一行');
+  assert.match(skipped[0], /seq=\d+ reason=empty-reply/, '一行里只有 seq 与稳定 reason');
+  assert.equal(skipped[0].includes('第一问'), false, '日志绝不带正文');
+
+  // 常驻会话没有写坏：换成会答的 runner，再问一次 → 复用同一条会话并正常发帖
+  runner.state.fail = false;
+  runner.state.reply = '这次答了';
+  askFromHub(hub, '@nas-box 第二问');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  assert.equal(runner.asks.length, 2);
+  assert.equal(runner.asks[1].wanted, runner.asks[0].sessionId, '失败不改变常驻会话记录');
+  const answers = answersOf(hubMessages(hub));
+  assert.equal(answers.length, 1, '第二次有答案 → 一条答复');
+  assert.equal(answers[0].meta.quote.seq, 2);
+  assert.equal(answers[0].text, '这次答了');
+});
+
+test('3a A6 meta 白名单：quote 收下并收窄，未知键照旧丢掉（静默过滤，无错误码）', async (t) => {
+  // 纯函数层：quote 是唯一的结构化例外，其余仍是标量白名单
+  assert.deepEqual(
+    sanitizeGroupMeta({ quote: { seq: 3, from: 'hub-box', excerpt: 'x'.repeat(120) }, peer: 'p' }),
+    { quote: { seq: 3, from: 'hub-box', excerpt: 'x'.repeat(79) + '…' }, peer: 'p' },
+  );
+  assert.deepEqual(sanitizeGroupMeta({ evil: 'x' }), {}, '不在 GROUP_META_FIELDS 里的键直接丢弃');
+  assert.deepEqual(sanitizeGroupMeta({ quote: { seq: 0, excerpt: 'y' } }), {}, 'seq 非正整数 = 非法 quote');
+
+  // 线层：带 quote 的帖子必须被接收（老对端会拒 —— 0.10.0 的既定破坏性变更）
+  const hub = await startHub(t);
+  hub.server.group.addMember(MEMBER.peerId, MEMBER.name);
+  const posted = await postAs(hub, MEMBER, '带引用', 'chat');
+  assert.equal(posted.status, 201, posted.text);
+  const withQuote = await request(hub.baseUrl, {
+    method: 'POST',
+    path: '/v1/group/post',
+    peerId: MEMBER.peerId,
+    secret: MEMBER.inboundSecret,
+    body: { kind: 'chat', text: '带引用', meta: { quote: { seq: 1, from: 'x', excerpt: 'y' }, evil: 'z' } },
+  });
+  assert.equal(withQuote.status, 201, withQuote.text);
+  const stored = hubMessages(hub).at(-1);
+  assert.deepEqual(stored.meta, { quote: { seq: 1, from: 'x', excerpt: 'y' } }, 'quote 收下、evil 丢掉');
+});

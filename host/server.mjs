@@ -161,6 +161,17 @@ import {
   verifyCertificate,
   verifyMessage,
 } from '../lib/group-identity.mjs';
+// 0.10.0-α slice 3a：群内 @ 必答的常驻会话层（存储 + 判定 + 单飞队列，全部纯逻辑）
+import {
+  ResidentSessionStore,
+  addressedToNode,
+  buildResidentPrompt,
+  createAnswerQueue,
+  mentionAliases,
+  quoteExcerpt,
+  resolveResidentUse,
+  sanitizeQuoteMeta,
+} from '../lib/group-resident.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -385,6 +396,8 @@ export const GROUP_META_FIELDS = Object.freeze([
   'transport',
   'elapsedMs',
   'replyChars',
+  // 0.10.0-α slice 3a：群内 @ 必答时带上被回答消息的引用（对象，见 sanitizeQuoteMeta）
+  'quote',
 ]);
 
 /** meta 里的字符串字段上限（防止有人用 meta 夹带大块数据） */
@@ -444,6 +457,13 @@ export const GROUP_AUTH_ALLOWED_PATHS = GROUP_AUTH_PATHS;
 /** S2：成员副本的重试节奏与默认拉取间隔（配置项 group.replicaPullMs 覆盖后者） */
 export const GROUP_REPLICA_RETRY_MS = 2_000;
 export const GROUP_GROUP_DEFAULT_REPLICA_PULL_MS = GROUP_DEFAULT_REPLICA_PULL_MS;
+
+/**
+ * 0.10.0-α slice 3a：群内 @ 必答的轮询节奏与上限。
+ * 回答作业在后台跑，答案超时/出错一律「不发帖、只记一行」，绝不把错误当正文发进群。
+ */
+export const GROUP_ANSWER_POLL_MS = 250;
+export const GROUP_ANSWER_TIMEOUT_MS = 120_000;
 
 /** S3 v0.7.0：角色文件、角色取值与未提交区的 TTL（与 lib/group-client.mjs 同一份常量） */
 export const GROUP_ROLE_KINDS = GROUP_ROLES;
@@ -1189,10 +1209,17 @@ export class StateStore {
 // §3/§4 v0.5.0 群消息 meta 白名单
 // ---------------------------------------------------------------------------
 
-/** 只保留契约列出的字段；值限定 JSON 标量，字符串再卡一道长度 */
+/**
+ * 只保留契约列出的字段；值限定 JSON 标量，字符串再卡一道长度。
+ * 唯一的例外是 meta.quote（0.10.0-α slice 3a）：它是 {seq, from, excerpt} 对象，
+ * 走 sanitizeQuoteMeta 单独收窄（seq 必须是正整数，excerpt 截到 80）。
+ * 不在白名单里的键照旧**静默丢弃** —— 没有任何错误码，就是过滤（见 A6）。
+ */
 export function sanitizeGroupMeta(meta) {
   const out = {};
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return out;
+  const quote = sanitizeQuoteMeta(meta.quote);
+  if (quote !== null) out.quote = quote;
   for (const field of GROUP_META_FIELDS) {
     const value = meta[field];
     if (value == null) continue;
@@ -5417,12 +5444,20 @@ export function createPeerServer(overrides = {}) {
         `[group] replicate dropped n=${dropped} from=${shortPeerId(auth.peerId)} reason=unknown-author`,
       );
     }
+    const beforeSeq = replicaStore.state().lastSeq;
     const applied = replicaStore.append({
       groupId,
       epoch: Math.floor(epoch),
       leaderPeerId: String(body.leaderPeerId ?? ''),
       messages,
     });
+    // 0.10.0-α slice 3a：推来的新消息里 @ 了本机的，同样要回答（排队，不阻塞复制）
+    if (applied.added > 0) {
+      dispatchGroupAnswers(
+        replicaStore.messages({ sinceSeq: beforeSeq, limit: GROUP_HISTORY_MAX_LIMIT }),
+        groupId,
+      );
+    }
     if (config.logger) {
       config.logger(
         `[group] replicate from=${shortPeerId(auth.peerId)} n=${applied.added} lastSeq=${applied.lastSeq}`,
@@ -7194,7 +7229,155 @@ export function createPeerServer(overrides = {}) {
     grantWatchTimer.unref?.();
   }
 
+  // -------------------------------------------------------------------------
+  // 0.10.0-α slice 3a：群内 @ 必答（每群一个常驻会话 + 引用 + 单飞）
+  //
+  // 用户决定：每台成员机每个群保留**一个**常驻会话做群问答；被 @ 到就必须回答，
+  // 回答带被答消息的引用；其他人继续自由聊天。「没有 @ 时谁都可以答」是 slice 3b。
+  // 会话复用不另起一套：runner.ask 的 {sessionId, reused} 就是既有复用机器，
+  // 这里只记住「这个群用哪个会话 id」并处理「记录里的 id 已经不在了」。
+  // 日志只写 seq / 字符数 / 短 id —— 正文与完整 id 一律不落日志。
+  // -------------------------------------------------------------------------
+
+  /** 本机可被 @ 的名字：显示名 / peerId / 面板里同名成员的 name-短id */
+  function selfMentionAliases() {
+    const peerId = String(store.instanceId ?? '');
+    return mentionAliases({ name: String(config.name ?? ''), peerId, shortId: shortPeerId(peerId) });
+  }
+
+  const residentSessions = new ResidentSessionStore({ stateDir: config.stateDir, now: config.now });
+  const groupAnswerQueue = createAnswerQueue();
+  /** 在飞的答案作业（门面 group.waitAnswers 用它把测试/CLI 变成确定性的） */
+  const groupAnswersInFlight = new Set();
+
+  /** 这条消息是不是「@ 我问了一句」：kind/自己发的/`/task` 都在纯函数里否决 */
+  function isQuestionToSelf(message) {
+    const from = message?.from && typeof message.from === 'object' ? message.from : {};
+    return addressedToNode({
+      text: message?.text,
+      kind: message?.kind,
+      fromPeerId: String(from.peerId ?? ''),
+      selfPeerId: String(store.instanceId ?? ''),
+      aliases: selfMentionAliases(),
+    });
+  }
+
+  /** 轮询常驻会话到终态：done → 正文；error/超时 → ''（调用方据此「什么都不发」） */
+  async function waitResidentReply(runnerSessionId, { timeoutMs = GROUP_ANSWER_TIMEOUT_MS } = {}) {
+    const deadline = config.now() + Math.max(1000, Number(timeoutMs) || GROUP_ANSWER_TIMEOUT_MS);
+    while (config.now() < deadline) {
+      let result = null;
+      try {
+        result = await runner.poll(runnerSessionId);
+      } catch {
+        return '';
+      }
+      const status = String(result?.status ?? '');
+      if (status === 'done') return String(result?.reply ?? '');
+      if (status === 'error') return '';
+      await sleep(GROUP_ANSWER_POLL_MS);
+    }
+    return '';
+  }
+
+  /** 一条 @ 消息的回答作业：常驻会话（没有就建、陈旧就换）+ 成功才发帖 + 失败只记一行 */
+  async function answerGroupQuestion(message, groupId) {
+    const seq = Number(message?.seq) || 0;
+    const from = message?.from && typeof message.from === 'object' ? message.from : {};
+    const record = residentSessions.read(groupId);
+    const prompt = buildResidentPrompt({
+      senderName: String(from.name ?? ''),
+      text: String(message?.text ?? ''),
+    });
+    let asked = null;
+    try {
+      asked = normalizeRunnerAnswer(await runner.ask(
+        prompt,
+        record && record.sessionId !== '' ? { sessionId: record.sessionId } : undefined,
+      ));
+    } catch {
+      if (config.logger) config.logger('[group] answer skipped seq=' + seq + ' reason=runner-error');
+      return { ok: false, reason: 'runner-error' };
+    }
+    const use = resolveResidentUse({ record, asked });
+    if (use.sessionId === '') {
+      if (config.logger) config.logger('[group] answer skipped seq=' + seq + ' reason=no-session');
+      return { ok: false, reason: 'no-session' };
+    }
+    // 用完（无论成败）就刷新 lastUsedAt：这是「这个群的常驻会话」唯一的账本
+    residentSessions.save({ groupId, sessionId: use.sessionId, at: config.now() });
+    if (config.logger) {
+      config.logger('[group] answer session=' + (use.reuse ? 'reuse' : 'new')
+        + ' reason=' + use.reason
+        + (use.stale ? ' stale=1' : '')
+        + ' group=' + shortPeerId(groupId));
+    }
+    const reply = await waitResidentReply(use.sessionId);
+    if (reply.trim() === '') {
+      if (config.logger) config.logger('[group] answer skipped seq=' + seq + ' reason=empty-reply');
+      return { ok: false, reason: 'empty-reply' };
+    }
+    const quote = sanitizeQuoteMeta({
+      seq,
+      from: String(from.name ?? ''),
+      excerpt: String(message?.text ?? ''),
+    });
+    let posted = null;
+    try {
+      posted = await Promise.resolve(groupPostFacade({
+        kind: 'chat',
+        text: reply,
+        meta: quote === null ? {} : { quote },
+      }));
+    } catch {
+      posted = null;
+    }
+    if (config.logger) {
+      config.logger('[group] answer posted seq=' + seq + ' chars=' + reply.length
+        + ' quote=' + (quote === null ? 'none' : String(quote.seq))
+        + (posted === null ? ' post=failed' : ''));
+    }
+    return { ok: posted !== null, answeredSeq: seq, seq: posted?.seq ?? null, chars: reply.length };
+  }
+
+  /**
+   * 新到的群消息 → 排回答作业。单飞机制 = **每群一条 Promise 链**：
+   * 第二条 @ 消息排在第一条后面（顺序 = 到达顺序），同一时刻只有一个 runner 调用在飞。
+   * 返回排进队列的条数（0 = 这批里没有问到我）。
+   */
+  function dispatchGroupAnswers(messages, groupId) {
+    const list = Array.isArray(messages) ? messages : [];
+    const key = String(groupId ?? '');
+    let queued = 0;
+    for (const message of list) {
+      if (!isQuestionToSelf(message)) continue;
+      queued += 1;
+      const job = groupAnswerQueue.enqueue(key, () => answerGroupQuestion(message, key));
+      groupAnswersInFlight.add(job);
+      const clear = () => { groupAnswersInFlight.delete(job); };
+      void job.then(clear, clear);
+    }
+    return queued;
+  }
+
+  /** 门面：等所有答案作业落定（测试/CLI 用；生产路径不依赖它） */
+  function waitGroupAnswers() {
+    return Promise.allSettled([...groupAnswersInFlight]);
+  }
+
+  /**
+   * 群问答的门面（hub 与成员同形）：只读观察 + 确定性等待。
+   * resident 只回「这个群用的会话 id 与最后使用时间」，不参与任何决策。
+   */
+  const answerFacade = {
+    waitAnswers: () => waitGroupAnswers(),
+    answerPending: (groupId = '') => groupAnswerQueue.pending(String(groupId)),
+    resident: (groupId = '') => residentSessions.read(groupId),
+    residentFile: () => residentSessions.filePath,
+  };
+
   /** 成员每一轮：确保有密钥 → 向 leader 补差 → 收下并去重 */
+
   async function memberTick() {
     if (groupRole !== 'member' || memberInFlight) return { ok: false, reason: 'skipped' };
     // S3：自己已经当上 leader 时，本机就是顺序源，不该再去向（可能已死的）原 hub 补差
@@ -7256,6 +7439,13 @@ export function createPeerServer(overrides = {}) {
         leaderPeerId: String(page.leaderPeerId ?? ''),
         messages: Array.isArray(page.messages) ? page.messages : [],
       });
+      // 0.10.0-α slice 3a：补差补到的新 chat 里 @ 了本机 → 排一条回答作业（单飞，不阻塞补差）
+      if (applied.added > 0) {
+        dispatchGroupAnswers(
+          replicaStore.messages({ sinceSeq, limit: GROUP_HISTORY_MAX_LIMIT }),
+          String(ctx.groupId),
+        );
+      }
       if (Array.isArray(page.memberIds) && page.memberIds.length > 0) {
         replaceGroupMembers(page.memberIds, ctx.members, page.memberAcceptDispatch ?? null);
       }
@@ -8644,6 +8834,8 @@ export function createPeerServer(overrides = {}) {
           ...s3Facade,
           ...discoveryFacade,
           ...dispatchFacade,
+          // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
+          ...answerFacade,
           state: (options = {}) => groupStore.state(options),
           members: () => groupMembersView(),
           addMember: (peerId, name) => groupStore.addMember(peerId, name),
@@ -8690,6 +8882,8 @@ export function createPeerServer(overrides = {}) {
           ...s3Facade,
           ...discoveryFacade,
           ...dispatchFacade,
+          // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
+          ...answerFacade,
           // S2 成员侧：本地副本 + 拉取/推送入口（hub 端点仍在 hub 那边）。
           // v0.8.0：副本可能因「按名入群」在运行期才出现（role 从 off 提升成 member），
           // 所以这里必须是 getter —— 否则门面永远拿到初始化那一刻的 null。
