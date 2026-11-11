@@ -628,6 +628,175 @@ test('3a A5 空/错答案：不发帖、只记一行、日志不带正文、常�
   assert.equal(answers[0].text, '这次答了');
 });
 
+// ---------------------------------------------------------------------------
+// 真机失败回归（0.10.0 桌面节点「群里 @ 了却不答」）
+//
+// 真机事实：常驻应答**确实起了 turn**（controller.create + prompt 都成功，会话里也写下了
+// 答复正文「收到」），但答复永远不落地 —— 因为真机 projection 的 turnOutline 是
+// `{ turns: [...] }`（ver:2），而 runner-ctx 按裸数组取下标，`outline[undefined]` 恒为
+// undefined → poll 一直回 running → 120 s 打满 → empty-reply。
+//
+// 下面三条用例喂的是**真 runner**（createCtxRunner）＋ 照真机 projection 缓存形状造的
+// controller：把 runner-ctx 的 turnOutlineTurns 改回 `outline[outline.length-1]`，
+// T1 第一条断言（恰好一条答复）立刻 0 !== 1 —— 这就是非空断言。
+// ---------------------------------------------------------------------------
+
+/** runner-ctx 在模块加载时读 LAN_PEERS_DEBUG，先把它指到临时目录再动态导入 */
+async function loadCtxRunner(dir) {
+  process.env.LAN_PEERS_DEBUG = path.join(dir, 'lan-peers-debug.log');
+  const mod = await import('../../lib/runner-ctx.mjs');
+  return mod.createCtxRunner;
+}
+
+/**
+ * 照真机造一个 sessionController：
+ *   - `list()` 的 turnOutline 是 `{ turns: [...] }`，permissions 是 `{preset,sandbox,approval}`；
+ *   - 一轮提问要跑满 `steps` 次 poll 才收工（running 翻 false 并把正文写回最后一条 turn），
+ *     即「turn 只有被 poll 观察到过才产出答复」。
+ */
+function liveController({ reply = '收到', steps = 3 } = {}) {
+  const sessions = new Map();
+  const events = [];
+  const prompts = [];
+  const state = { reply, steps };
+  let created = 0;
+  return {
+    sessions,
+    events,
+    prompts,
+    state,
+    async create() {
+      const sessionId = 'live-' + (++created);
+      sessions.set(sessionId, { sessionId, turns: [], running: false, pending: 0, reply: '' });
+      return { sessionId };
+    },
+    async prompt(request) {
+      const session = sessions.get(request.sessionId);
+      if (!session) throw new Error('session-not-found');
+      const text = (request.content || []).map((block) => String(block?.text ?? '')).join('\n');
+      session.turns.push(text);
+      session.running = true;
+      session.pending = state.steps;
+      session.reply = state.reply;
+      prompts.push({ sessionId: session.sessionId, text });
+      events.push('prompt:' + session.turns.length);
+      return {};
+    },
+    async list() {
+      for (const session of sessions.values()) {
+        if (!session.running) continue;
+        session.pending -= 1;
+        if (session.pending > 0) continue;
+        session.running = false;
+        events.push('done:' + session.turns.length);
+      }
+      return {
+        items: [...sessions.values()].map((session) => {
+          const last = session.turns.length - 1;
+          return {
+            sessionId: session.sessionId,
+            running: session.running,
+            projections: {
+              values: {
+                turnOutline: {
+                  turns: session.turns.map((prompt, index) => ({
+                    turn: index + 1,
+                    prompt,
+                    response: index === last && !session.running ? session.reply : '',
+                  })),
+                },
+                permissions: { preset: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
+              },
+            },
+          };
+        }),
+      };
+    },
+  };
+}
+
+/** 一个「成员 + 真 runner」的脚手架：返回 { hub, member, controller, runner } */
+async function startLiveMember(t, options = {}) {
+  const hub = await startHub(t);
+  const dir = makeTempStateDir('dsh-ctx-group-');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const controller = liveController(options);
+  const createCtxRunner = await loadCtxRunner(dir);
+  const runner = createCtxRunner(controller, { workspace: dir });
+  const member = await startMember(t, {
+    hubBaseUrl: hub.baseUrl, hubInstanceId: hub.server.store.instanceId, runner, name: 'nas-box',
+  });
+  await pullNow(member);
+  disablePush(hub);
+  return { hub, member, controller, runner };
+}
+
+test('0.10.0 真机 T1：{turns} 形状的 projection + 真 runner → @ 到我恰好一条带 meta.quote 的答复', async (t) => {
+  const { hub, member, controller } = await startLiveMember(t, { reply: '磁盘还剩 42G' });
+
+  const question = askFromHub(hub, '@nas-box 磁盘还剩多少');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  const answers = answersOf(hubMessages(hub));
+  assert.equal(answers.length, 1, '恰好一条答复（0 = 答复读不到，2 = 重复发帖）');
+  assert.equal(answers[0].kind, 'chat');
+  assert.equal(answers[0].text, '磁盘还剩 42G', '答复正文 = 会话最后一条助手消息');
+  assert.equal(answers[0].meta.quote.seq, question.seq, 'quote.seq 必须是被回答那条的 seq');
+  assert.equal(answers[0].meta.quote.excerpt, '@nas-box 磁盘还剩多少');
+  assert.equal(controller.sessions.size, 1, '一轮提问只建一条常驻会话');
+  assert.equal(controller.prompts.length, 1, 'runner 只被提问一次');
+  assert.match(controller.prompts[0].text, /【群内提问 · 致本机】/, '提示词带群内提问前言');
+  assert.match(controller.prompts[0].text, /@nas-box 磁盘还剩多少/, '原文进提示词');
+});
+
+test('0.10.0 真机 T2：空答复 → 不发帖、只记一行、常驻会话仍可用（认领没有永久泄漏）', async (t) => {
+  const logs = [];
+  const { hub, member, controller } = await startLiveMember(t, { reply: '' });
+  // 把 logger 换成一个会收集行的（server 已建好，直接用 config.logger 覆盖同一份引用）
+  member.server.config.logger = (line) => logs.push(String(line));
+
+  askFromHub(hub, '@nas-box 第一问');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  assert.equal(answersOf(hubMessages(hub)).length, 0, '空答复 → 一条消息都不发');
+  const skipped = logs.filter((line) => line.includes('[group] answer skipped'));
+  assert.equal(skipped.length, 1, '失败只记一行');
+  assert.match(skipped[0], /seq=\d+ reason=empty-reply/);
+  assert.equal(skipped[0].includes('第一问'), false, '日志绝不带正文');
+
+  // 同一条常驻会话接着问：认领已还、会话可用、答复照常落地
+  controller.state.reply = '这次答了';
+  askFromHub(hub, '@nas-box 第二问');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  assert.equal(controller.sessions.size, 1, '空答复不换会话');
+  assert.equal(controller.prompts.length, 2, '第二问确实打进了同一个会话');
+  assert.equal(controller.prompts[1].sessionId, controller.prompts[0].sessionId);
+  const answers = answersOf(hubMessages(hub));
+  assert.equal(answers.length, 1, '第二问一条答复');
+  assert.equal(answers[0].meta.quote.seq, 2);
+  assert.equal(answers[0].text, '这次答了');
+});
+
+test('0.10.0 真机 T3：单飞（真 runner 形状）→ 两条 @ 串行、按到达顺序各一条答复', async (t) => {
+  const { hub, member, controller } = await startLiveMember(t, { reply: '收到', steps: 2 });
+
+  askFromHub(hub, '@nas-box 第一问');
+  askFromHub(hub, '@nas-box 第二问');
+  await pullNow(member);
+  await member.server.group.waitAnswers();
+
+  assert.deepEqual(controller.events, ['prompt:1', 'done:1', 'prompt:2', 'done:2'],
+    '单飞：第二条必须等第一条读到达成之后才提交（否则是 prompt:1, prompt:2, done:1, done:2）');
+  assert.equal(controller.sessions.size, 1, '两问共用同一条常驻会话');
+  const answers = answersOf(hubMessages(hub));
+  assert.deepEqual(answers.map((m) => m.meta.quote.seq), [1, 2], '两条答复按顺序引用各自的问题');
+  assert.deepEqual(answers.map((m) => m.text), ['收到', '收到']);
+});
+
 test('3a A6 meta 白名单：quote 收下并收窄，未知键照旧丢掉（静默过滤，无错误码）', async (t) => {
   // 纯函数层：quote 是唯一的结构化例外，其余仍是标量白名单
   assert.deepEqual(

@@ -8365,19 +8365,39 @@ export function createPeerServer(overrides = {}) {
       : '';
   }
 
-  /** 轮询常驻会话到终态：done → 正文；error/超时 → ''（调用方据此「什么都不发」） */
+  /**
+   * 群内常驻提问的**提交层**：与入站 ask（createAskSession:4155）**同一条**调用形状 ——
+   * 同一个 `runner.ask`、同一份 `normalizeRunnerAnswer` 归一化，只有会话来源不同
+   * （本机自己记的常驻会话 id，不是对端带来的 dmSessionId）。
+   * 不点名时会话由 runner 新建；点名时在同一形状里带上 sessionId 续聊。
+   */
+  async function askResidentTurn({ prompt, sessionId = '' }) {
+    const wanted = String(sessionId ?? '').trim();
+    return normalizeRunnerAnswer(await runner.ask(
+      prompt,
+      wanted === '' ? undefined : { sessionId: wanted },
+    ));
+  }
+
+  /**
+   * 轮询常驻会话到终态：**读答复走入站 ask 的同一份实现** `answerFor`
+   * （runner.poll + deadline + 空答复宽限 + settled 结算都在那里），
+   * 本函数只负责「一直等到 deadline」这一件事。
+   * done → 正文；error/超时 → ''（调用方据此「什么都不发」）。
+   */
   async function waitResidentReply(runnerSessionId, { timeoutMs = GROUP_ANSWER_TIMEOUT_MS } = {}) {
-    const deadline = config.now() + Math.max(1000, Number(timeoutMs) || GROUP_ANSWER_TIMEOUT_MS);
-    while (config.now() < deadline) {
-      let result = null;
-      try {
-        result = await runner.poll(runnerSessionId);
-      } catch {
-        return '';
-      }
-      const status = String(result?.status ?? '');
-      if (status === 'done') return String(result?.reply ?? '');
-      if (status === 'error') return '';
+    const nowMs = config.now();
+    // 与 createAskSession 里那条会话记录同形（只要 answerFor 用到的那几个键）
+    const session = {
+      runnerSessionId,
+      deadline: nowMs + Math.max(1000, Number(timeoutMs) || GROUP_ANSWER_TIMEOUT_MS),
+      settled: false,
+      lastUsedAt: nowMs,
+    };
+    while (config.now() < session.deadline) {
+      const outcome = await answerFor(session);
+      if (outcome.status === 'done') return String(outcome.reply ?? '');
+      if (outcome.status === 'error') return '';
       await sleep(GROUP_ANSWER_POLL_MS);
     }
     return '';
@@ -8405,10 +8425,8 @@ export function createPeerServer(overrides = {}) {
     });
     let asked = null;
     try {
-      asked = normalizeRunnerAnswer(await runner.ask(
-        prompt,
-        record && record.sessionId !== '' ? { sessionId: record.sessionId } : undefined,
-      ));
+      // 与入站 ask 共用提交层：常驻会话 id 只是「这一问要在哪个会话里续」，调用形状不变
+      asked = await askResidentTurn({ prompt, sessionId: record?.sessionId ?? '' });
     } catch {
       if (config.logger) config.logger('[group] answer skipped seq=' + seq + ' reason=runner-error');
       return { ok: false, reason: 'runner-error' };
