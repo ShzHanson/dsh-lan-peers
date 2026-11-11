@@ -189,6 +189,20 @@ import {
   normalizeNotesValue,
   notesSummary,
 } from '../lib/group-notes.mjs';
+// 0.10.0-α slice 4b-1：群表决状态机（纯模块）。hub 只负责落盘、走线、定时器与 hub-only 门。
+import {
+  MAX_ROUNDS,
+  ROUND_MS,
+  advance,
+  castBallot,
+  makeProposal,
+  mergeVotesReplica,
+  normalizeVotePlane,
+  openRound,
+  settleRound,
+  summarize,
+  votesSummary,
+} from '../lib/group-vote.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -395,6 +409,12 @@ const GROUP_FILE = 'group.json';
  * 永不回写（用户决定：hub 单写、成员只读 —— 4b 才谈提议/表决）。
  */
 const GROUP_NOTES_FILE = 'group-notes.json';
+
+/**
+ * 0.10.0-α slice 4b-1：表决平面文件（<stateDir>/group-votes.json，0600 原子写）。
+ * **只有 hub 写这个文件**；成员把 pull 同步来的平面落在自己的 group-replica.json 里，永不回写。
+ */
+const GROUP_VOTES_FILE = 'group-votes.json';
 
 /** 尾部斜杠（地址归一化共用；写成常量是为了别在正则字面量里反复转义） */
 const TRAILING_SLASHES = /\/+$/;
@@ -1973,6 +1993,133 @@ export class GroupNotesStore {
 }
 
 // ---------------------------------------------------------------------------
+// 0.10.0-α slice 4b-1 · hub 侧表决平面：<stateDir>/group-votes.json（0600 原子写）
+// ---------------------------------------------------------------------------
+
+/**
+ * hub 单写的表决平面存储（成员只读同步，本类不上成员节点）。
+ *
+ * 形状 `{rev, proposals:[…], votes:{<proposalId>: vote}, shelved:[…]}`：
+ *   - rev 只由本类的写入口前进、**永不回退**（成员靠它判「谁的视图更新」，与纪要同一套）；
+ *   - 提案 id 是 `p<序号>` 短号（日志只允许 ≤8 字符的 id；号不复用，超出上限只丢最旧的）；
+ *   - 一轮的表决记录**整份**存在 votes[proposalId] 里 —— 轮次/冻结名单/票都在那一格里，不另开表。
+ */
+export class GroupVotesStore {
+  #stateDir;
+
+  #now;
+
+  #data = null;
+
+  constructor({ stateDir, now = Date.now }) {
+    this.#stateDir = expandHome(stateDir);
+    this.#now = typeof now === 'function' ? now : Date.now;
+  }
+
+  get votesPath() {
+    return path.join(this.#stateDir, GROUP_VOTES_FILE);
+  }
+
+  #load() {
+    if (this.#data) return this.#data;
+    this.#data = normalizeVotePlane(readJsonFile(this.votesPath));
+    return this.#data;
+  }
+
+  #save(plane) {
+    this.#data = normalizeVotePlane(plane);
+    writeJson0600(this.votesPath, this.#data);
+    return this.#data;
+  }
+
+  /** 只读视图（网络/面板/CLI 共用；normalizeVotePlane 已复制，调用方改不动内存） */
+  plane() {
+    return normalizeVotePlane(this.#load());
+  }
+
+  proposals() {
+    return this.plane().proposals;
+  }
+
+  proposal(proposalId) {
+    const id = String(proposalId ?? '');
+    return this.plane().proposals.find((entry) => entry.id === id) ?? null;
+  }
+
+  vote(proposalId) {
+    return this.plane().votes[String(proposalId ?? '')] ?? null;
+  }
+
+  shelved() {
+    return this.plane().shelved;
+  }
+
+  /** 状态行用的便宜摘要：rev / 提案数 / 开着的轮数 / shelved 数（不含正文） */
+  summary() {
+    return votesSummary(this.#load());
+  }
+
+  /** 下一条提案 id：`p<已有最大序号+1>`（短、稳定、可读；日志里不会出现 36 位 uuid） */
+  #nextProposalId(plane) {
+    let max = 0;
+    for (const entry of plane.proposals) {
+      const matched = /^p(\d+)$/.exec(entry.id);
+      if (matched) max = Math.max(max, Number(matched[1]));
+    }
+    return 'p' + (max + 1);
+  }
+
+  /** 收下一条补充/反对。返回 {ok:true, proposal, rev} 或 {ok:false, error} */
+  addProposal({ kind = '', target = null, text = '', author = '' } = {}) {
+    const current = this.#load();
+    const made = makeProposal({
+      id: this.#nextProposalId(current),
+      kind,
+      target,
+      text,
+      author,
+      createdAt: this.#now(),
+    });
+    if (!made.ok) return { ok: false, error: made.error };
+    const saved = this.#save({
+      ...current,
+      rev: Math.max(0, current.rev) + 1,
+      proposals: [...current.proposals, made.proposal],
+    });
+    return { ok: true, proposal: made.proposal, rev: saved.rev };
+  }
+
+  /** 落一轮表决记录（开轮/投票/结算/推进都走这里，每次 rev +1） */
+  putVote(vote) {
+    const current = this.#load();
+    const key = String(vote?.proposalId ?? '');
+    if (key === '') return null;
+    const saved = this.#save({
+      ...current,
+      rev: Math.max(0, current.rev) + 1,
+      votes: { ...current.votes, [key]: vote },
+    });
+    return saved.votes[key];
+  }
+
+  /** 把一条提案记进 shelved 集（第 MAX_ROUNDS 轮还没过，交人裁决）；重复登记不算新事件 */
+  markShelved({ proposalId = '', rounds = MAX_ROUNDS } = {}) {
+    const current = this.#load();
+    const id = String(proposalId ?? '');
+    if (id === '') return { ok: false, error: 'proposal-id-required' };
+    if (current.shelved.some((entry) => entry.proposalId === id)) {
+      return { ok: true, shelved: current.shelved, duplicate: true };
+    }
+    const saved = this.#save({
+      ...current,
+      rev: Math.max(0, current.rev) + 1,
+      shelved: [...current.shelved, { proposalId: id, rounds, at: this.#now() }],
+    });
+    return { ok: true, shelved: saved.shelved, duplicate: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // S2 v0.6.0 成员副本：<stateDir>/group-replica.json（0600）
 // ---------------------------------------------------------------------------
 
@@ -2120,6 +2267,31 @@ export class GroupReplicaStore {
       this.#save(data);
     }
     return { rev: merged.rev, count: merged.notes.length, adopted };
+  }
+
+  /**
+   * 0.10.0-α slice 4b-1：同步来的表决平面（只读视图）。
+   * 成员的表决平面**不是**本机写的：它只是 hub 那份的缓存，形状 {rev, proposals, votes, shelved}。
+   */
+  votes() {
+    return normalizeVotePlane(this.#load().votes);
+  }
+
+  /**
+   * 收下一份表决平面快照（pull 响应里的 votePlane 字段）。
+   * 只认 rev 更大的那份（mergeVotesReplica）：本地见过更新的视图时绝不因对端更旧而丢掉它。
+   * 返回 {rev, proposals, adopted}；adopted=false 表示这次什么都没落盘。
+   */
+  setVotes(value) {
+    const data = this.#load();
+    const current = normalizeVotePlane(data.votes);
+    const merged = mergeVotesReplica(current, value);
+    const adopted = merged.rev !== current.rev;
+    if (adopted) {
+      data.votes = merged;
+      this.#save(data);
+    }
+    return { rev: merged.rev, proposals: merged.proposals.length, adopted };
   }
 
   /** bootstrap 时写入/校正头部字段（groupId/epoch/leader），不动消息与 lastSeq */
@@ -2751,6 +2923,265 @@ export function createPeerServer(overrides = {}) {
     return replicaStore ? replicaStore.notes() : { rev: 0, notes: [] };
   }
 
+  // -------------------------------------------------------------------------
+  // 0.10.0-α slice 4b-1 · 表决平面（hub 单写、成员只读同步）
+  //
+  // 用户定的规则落地在这几行里：
+  //   · 只有**群纪要/决议**这一层可表决（Q&A 与派单没有投票入口 —— 上面没有它们的路径）；
+  //   · 反对自动开票；补充默认采纳（不投票）；
+  //   · 一轮 10 分钟，轮次开始时**冻结**名单 = 那一刻在线的成员；
+  //   · 过不了就进下一轮（名单重新冻结），第 3 轮还过不了 → shelved 交人裁决。
+  // -------------------------------------------------------------------------
+
+  /** 表决平面的权威存储只有 hub 有：成员那侧只有 pull 同步来的副本 */
+  const votesStore = groupStore
+    ? new GroupVotesStore({ stateDir: config.stateDir, now: config.now })
+    : null;
+
+  /** 一轮的实际时长：生产就是 ROUND_MS（10 分钟）；测试用 overrides.groupVote.roundMs 缩短 */
+  const voteRoundMs = Number.isFinite(Number(overrides.groupVote?.roundMs)) && Number(overrides.groupVote.roundMs) > 0
+    ? Math.floor(Number(overrides.groupVote.roundMs))
+    : ROUND_MS;
+
+  /**
+   * 每个开着的轮**恰好一个**定时器：proposalId → Timeout。
+   *
+   * 三条纪律（上一片被 re-arm 的定时器吊住进程，这里不重犯）：
+   *   1. 起之前先清同一个 id 的旧定时器 —— 换新，不叠加；
+   *   2. 一关轮 / 一 shelved 就清；close() 里整表清；
+   *   3. 一律 unref()：即使某一处漏清也不吊住进程（双保险，不是替代品）。
+   */
+  const voteTimers = new Map();
+
+  /** 日志里的 id 一律 ≤8 字符（提案 id 本来就是 p<序号>，这里再兜一次底） */
+  const shortVoteId = (id) => String(id ?? '').slice(0, 8);
+
+  /** 冻结名单 = 此刻在线的成员（hub 自己永远在线）；排序去重交给 lib，这里只管「谁在线」 */
+  function voteRoster() {
+    if (!groupStore) return [store.instanceId];
+    const nowMs = config.now();
+    const members = groupStore.state().members ?? {};
+    const roster = [];
+    for (const peerId of Object.keys(members)) {
+      if (peerId === store.instanceId) {
+        roster.push(peerId);
+        continue;
+      }
+      const seenAt = Date.parse(store.getPeer(peerId)?.lastSeen ?? '');
+      if (Number.isFinite(seenAt) && nowMs - seenAt <= GROUP_ONLINE_WINDOW_MS) roster.push(peerId);
+    }
+    // 兜底：成员表连自己都没有时也别开一轮「没人能投」的票（hub 永远在线）
+    if (roster.length === 0) roster.push(store.instanceId);
+    return roster;
+  }
+
+  /** 表决平面只读视图：hub 读权威文件，成员读自己同步来的副本（永不回写） */
+  function votePlaneView() {
+    if (votesStore) return votesStore.plane();
+    return replicaStore ? replicaStore.votes() : { rev: 0, proposals: [], votes: {}, shelved: [] };
+  }
+
+  /**
+   * 提案在**当前平面**上的状态（派生量，不落盘 —— 落两份状态就会漂）：
+   *   1. 有表决记录 → 就取那条记录的状态（open/passed/failed/shelved）；
+   *   2. 没有记录的补充 → adopted（用户定的「默认采纳、不投票」）；
+   *      但**有人反对它**（反对指着这条补充，或指着它想改的同一条正文/提案）→ contested，
+   *      因为「默认采纳」的前提正是「没人反对」；
+   *   3. 没有记录的反对 → pending（正常不会有：反对一到就开票）。
+   */
+  function proposalStatus(proposal, plane) {
+    const vote = plane.votes[proposal.id];
+    if (vote) return vote.status;
+    if (proposal.kind !== 'supplement') return 'pending';
+    const contested = plane.proposals.some((other) => {
+      if (other.kind !== 'objection' || other.id === proposal.id) return false;
+      const target = other.target ?? {};
+      // 直接反对这条补充
+      if (target.type === 'supplement' && target.id === proposal.id) return true;
+      // 反对的是这条补充想改的那条东西：它一过，这条补充就不能照原样生效
+      return target.type === proposal.target.type && target.id === proposal.target.id;
+    });
+    return contested ? 'contested' : 'adopted';
+  }
+
+  /** 摊平给网络/面板的提案视图：正文 + 派生状态 + 本轮摘要（日志绝不走这里） */
+  function proposalsView(plane = votePlaneView()) {
+    return plane.proposals.map((proposal) => {
+      const vote = plane.votes[proposal.id];
+      return {
+        ...proposal,
+        status: proposalStatus(proposal, plane),
+        vote: vote ? summarize(vote) : null,
+      };
+    });
+  }
+
+  /** 清掉某个提案的定时器（关轮/shelved/重开前都调它；重复调用安全） */
+  function clearVoteTick(proposalId) {
+    const key = String(proposalId ?? '');
+    const timer = voteTimers.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    voteTimers.delete(key);
+  }
+
+  /** 清掉全部表决定时器（close() 的唯一入口） */
+  function clearVoteTicks() {
+    for (const timer of voteTimers.values()) clearTimeout(timer);
+    voteTimers.clear();
+  }
+
+  /**
+   * 给一轮排**一个**定时器：到 closesAt 自己醒来结算。
+   *
+   * 关停闸（closing）是这里的第二条命门：close() 清过一次的定时器若被后续动作重新点亮，
+   * 进程就再也等不到空转 —— 那正是上一片「断言全过、进程不退出」的形状。
+   */
+  function scheduleVoteTick(vote) {
+    if (!votesStore || closing || !vote) return;
+    const proposalId = String(vote.proposalId ?? '');
+    if (proposalId === '') return;
+    clearVoteTick(proposalId);
+    const delay = Math.max(0, Number(vote.closesAt) - config.now());
+    const timer = setTimeout(() => {
+      voteTimers.delete(proposalId);
+      closeVoteRound(proposalId);
+    }, delay);
+    timer.unref?.();
+    voteTimers.set(proposalId, timer);
+  }
+
+  /**
+   * 结算一轮并推进状态机。**幂等**：只有「open → 结算」的那一次会 advance ——
+   * 定时器重复触发、网络重放、hub 重启补结算都不会把同一个信号推进两轮（V6 的 hub 一半）。
+   */
+  function closeVoteRound(proposalId) {
+    if (!votesStore) return { ok: false, error: 'votes-hub-only' };
+    const id = String(proposalId ?? '');
+    const current = votesStore.vote(id);
+    if (!current) return { ok: false, error: 'vote-not-found' };
+    if (current.status !== 'open') {
+      clearVoteTick(id);
+      return { ok: true, outcome: current.status, already: true, vote: current };
+    }
+    const settled = settleRound({ vote: current, now: config.now() });
+    if (!settled.closed) return { ok: true, outcome: 'still-open', closed: false, vote: settled.vote };
+    votesStore.putVote(settled.vote);
+    clearVoteTick(id);
+    const counts = summarize(settled.vote);
+    if (config.logger) {
+      // 只记计数与短 id：提案正文一个字都不进日志（与群消息同一口径）
+      config.logger(
+        `[group] vote close id=${shortVoteId(id)} round=${settled.vote.round} yes=${counts.yes} no=${counts.no} outcome=${settled.outcome}`,
+      );
+    }
+    const next = advance({
+      proposal: votesStore.proposal(id),
+      vote: settled.vote,
+      now: config.now(),
+      // 新一轮的名单是**重新冻结**的：此刻在线的人，不是上一轮那份
+      roster: voteRoster(),
+      roundMs: voteRoundMs,
+    });
+    if (next.outcome === 'round-open') {
+      votesStore.putVote(next.vote);
+      scheduleVoteTick(next.vote);
+      if (config.logger) {
+        config.logger(
+          `[group] vote open id=${shortVoteId(id)} round=${next.vote.round} roster=${next.vote.roster.length}`,
+        );
+      }
+    } else if (next.outcome === 'shelved') {
+      // 第 MAX_ROUNDS 轮还没过：摘出 open，记进 shelved 集交人裁决（4b-2 的面板负责端给用户）
+      votesStore.putVote(next.vote);
+      votesStore.markShelved({ proposalId: id, rounds: next.vote.round });
+      if (config.logger) config.logger(`[group] vote shelved id=${shortVoteId(id)} rounds=${next.vote.round}`);
+    }
+    return { ok: true, outcome: settled.outcome, closed: true, vote: settled.vote };
+  }
+
+  /** 开一轮（hub 唯一的开轮入口：提案入库后由**策略**调它，成员没有这条路径） */
+  function openVoteRound({ proposal, round = 1 }) {
+    if (!votesStore) return { ok: false, error: 'votes-hub-only' };
+    const vote = openRound({
+      proposal,
+      roster: voteRoster(),
+      now: config.now(),
+      round,
+      roundMs: voteRoundMs,
+    });
+    votesStore.putVote(vote);
+    scheduleVoteTick(vote);
+    if (config.logger) {
+      config.logger(`[group] vote open id=${shortVoteId(vote.proposalId)} round=${vote.round} roster=${vote.roster.length}`);
+    }
+    return { ok: true, vote };
+  }
+
+  /**
+   * 收下一条提案（hub 侧唯一的入库入口）。
+   *
+   * **用户定的那两条策略就在这几行**：反对自动开票；补充默认采纳（不投票）。
+   * 反对指向什么由提交者说（target.type/id），hub 不去猜「它想改哪一条」。
+   */
+  function submitProposalLocal({ kind = '', target = null, text = '', author = '' } = {}) {
+    if (!votesStore) return { ok: false, error: 'votes-hub-only' };
+    const added = votesStore.addProposal({ kind, target, text, author });
+    if (!added.ok) return added;
+    const proposal = added.proposal;
+    if (config.logger) {
+      // 只记短 id 与种类/目标种类：正文、目标 id 的正文语义都不上日志
+      config.logger(
+        `[group] proposal in id=${shortVoteId(proposal.id)} kind=${proposal.kind} target=${proposal.target.type}`,
+      );
+    }
+    const opened = proposal.kind === 'objection' ? openVoteRound({ proposal }) : null;
+    return {
+      ok: true,
+      proposal,
+      vote: opened && opened.ok ? opened.vote : null,
+      status: proposalStatus(proposal, votesStore.plane()),
+    };
+  }
+
+  /** 收一张票（hub 侧唯一的计票入口）：名单外/迟到/坏票面一律 accepted:false + 可读原因 */
+  function castBallotLocal({ proposalId = '', peerId = '', ballot = '' } = {}) {
+    if (!votesStore) return { ok: false, error: 'votes-hub-only' };
+    const id = String(proposalId ?? '');
+    const current = votesStore.vote(id);
+    if (!current) return { ok: false, error: 'vote-not-found' };
+    const out = castBallot({ vote: current, peerId, ballot, now: config.now() });
+    if (!out.accepted) {
+      if (config.logger) {
+        config.logger(`[group] vote refused id=${shortVoteId(id)} from=${shortPeerId(peerId)} reason=${out.reason}`);
+      }
+      return { ok: true, accepted: false, reason: out.reason, vote: summarize(out.vote) };
+    }
+    votesStore.putVote(out.vote);
+    // 收下就顺手结算一次：够票立刻关、没救立刻关 —— 定时器只负责「到点」那一半
+    const closed = closeVoteRound(id);
+    return {
+      ok: true,
+      accepted: true,
+      reason: '',
+      vote: summarize(votesStore.vote(id)),
+      closed: closed.closed === true,
+      outcome: closed.outcome ?? '',
+    };
+  }
+
+  /**
+   * hub 重启后把**还开着**的轮重新挂上定时器：否则上一段进程留下的 open 轮会永远开着
+   * （没人投票就没人叫醒它）。过点的按 0 延迟立刻结算。
+   */
+  function resumeVoteTicks() {
+    if (!votesStore || closing) return;
+    for (const vote of Object.values(votesStore.plane().votes)) {
+      if (vote.status !== 'open') continue;
+      scheduleVoteTick(vote);
+    }
+  }
+
   /** 真实监听端口（listen 时才知道）；S1 的地址探测要用 */
   let boundAddress = null;
 
@@ -2891,6 +3322,18 @@ export function createPeerServer(overrides = {}) {
    */
   const GROUP_NOTES_PATHS = Object.freeze(['/v1/group/notes']);
 
+  /**
+   * 0.10.0-α slice 4b-1：表决平面的五条路径，与纪要同一个机制（契约 §7 的 11 条冻结，不改）。
+   * 开轮/推进/写权限由 handler 判，与这份白名单无关 —— 成员必须能提交与读，但绝不能开轮。
+   */
+  const GROUP_VOTE_PATHS = Object.freeze([
+    '/v1/group/proposal',
+    '/v1/group/proposals',
+    '/v1/group/vote',
+    '/v1/group/vote/open',
+    '/v1/group/vote/advance',
+  ]);
+
   /** 头分流：'group' | 'group-v2' | ''（缺失或其它值 = 现有 per-peer 签名路径） */
   function groupAuthModeOf(req) {
     const value = headerValue(req, GROUP_AUTH_HEADER.toLowerCase());
@@ -2910,7 +3353,8 @@ export function createPeerServer(overrides = {}) {
   function isGroupAuthPath(pathname) {
     return GROUP_AUTH_PATHS.includes(pathname)
       || GROUP_IDENTITY_PATHS.includes(pathname)
-      || GROUP_NOTES_PATHS.includes(pathname);
+      || GROUP_NOTES_PATHS.includes(pathname)
+      || GROUP_VOTE_PATHS.includes(pathname);
   }
 
   /** legacy 告警：只记 peer 前 8 位，同一 peer 60 秒最多一条 */
@@ -5587,6 +6031,9 @@ export function createPeerServer(overrides = {}) {
         // 0.10.0-α slice 4a：群纪要搭**同一次 pull** 回来（不新增轮询）。
         // 成员拿到后只落副本（replicaStore.setNotes），永不回写 hub —— 纪要 hub 单写。
         notes: notesView(),
+        // 0.10.0-α slice 4b-1：表决平面也搭**同一次 pull** 回来（与纪要同一个理由：不新增轮询）。
+        // 成员拿到只落副本（replicaStore.setVotes），永不回写 hub —— hub 是唯一写者。
+        votePlane: votePlaneView(),
         // 成员靠它把成员表刷新到最新（新成员加进来后不会一直判 not-a-member）
         memberIds: Object.keys(ctx.members),
         memberAcceptDispatch: groupMemberAcceptMask(ctx),
@@ -5637,6 +6084,177 @@ export function createPeerServer(overrides = {}) {
       return { status: 400, body: { ok: false, error: out.error }, peerId: auth.peerId };
     }
     return { status: 201, body: { ok: true, rev: out.rev, note: out.note }, peerId: auth.peerId };
+  }
+
+  // -------------------------------------------------------------------------
+  // 0.10.0-α slice 4b-1 · 表决端点（群级鉴权）
+  //
+  // hub-only 的门在这一层，**不在路径白名单**里（白名单只回答「这条路径认不认群签名」）：
+  //   · POST /v1/group/proposal、POST /v1/group/vote —— **成员可以提交**：这是「输入」，不是「状态」。
+  //     但输入只能落到 hub：成员节点上没有权威存储，收到就 403 votes-hub-only；
+  //   · POST /v1/group/vote/open|advance —— 开轮/推进/结算**只有 hub 自己能叫**：
+  //     判据 = 本机有权威存储 **且** 签名者就是本机 instanceId，其余一律 403 votes-hub-only；
+  //   · GET /v1/group/proposals、GET /v1/group/vote —— 成员允许（只读同步的那一半）。
+  // -------------------------------------------------------------------------
+
+  /** hub 自己的写门：本机是 hub（有权威存储）且签名者就是本机（与纪要的写门同一套判据） */
+  function votesHubOnly(auth) {
+    return Boolean(votesStore) && String(auth?.peerId ?? '') === store.instanceId;
+  }
+
+  /** GET /v1/group/proposals —— 提案 + 派生状态 + shelved 集（成员允许） */
+  function groupProposalsRead(req, rawBody, url, auth) {
+    const plane = votePlaneView();
+    if (config.logger) {
+      config.logger(
+        `[group] proposals read from=${shortPeerId(auth.peerId)} rev=${plane.rev} n=${plane.proposals.length}`,
+      );
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        groupId: String(auth.ctx.groupId),
+        rev: plane.rev,
+        proposals: proposalsView(plane),
+        shelved: plane.shelved,
+        summary: votesSummary(plane),
+      },
+      peerId: auth.peerId,
+    };
+  }
+
+  /** GET /v1/group/vote?proposalId=… —— 一轮的计数与票面（成员允许；不含任何正文） */
+  function groupVoteRead(req, rawBody, url, auth) {
+    const proposalId = String(url.searchParams.get('proposalId') ?? '');
+    const plane = votePlaneView();
+    const vote = plane.votes[proposalId];
+    if (!vote) return { status: 404, body: { ok: false, error: 'vote-not-found' }, peerId: auth.peerId };
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        groupId: String(auth.ctx.groupId),
+        vote: summarize(vote),
+        // 名单与票面是表决的**台账**（谁投了什么），不是正文；面板要靠它解释结果
+        roster: vote.roster,
+        ballots: vote.ballots,
+      },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * POST /v1/group/proposal —— 提交补充/反对。
+   * 提交者是**签名者**：body 里自称的 author 不被采纳（否则谁都能冒名提交）。
+   */
+  function groupProposalSubmit(req, rawBody, url, auth) {
+    if (!votesStore) {
+      if (config.logger) {
+        config.logger(`[group] proposal refused from=${shortPeerId(auth.peerId)} reason=votes-hub-only`);
+      }
+      return { status: 403, body: { ok: false, error: 'votes-hub-only' }, peerId: auth.peerId };
+    }
+    let body;
+    try {
+      body = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const out = submitProposalLocal({
+      kind: body.kind == null ? '' : String(body.kind),
+      target: body.target ?? null,
+      text: body.text == null ? '' : String(body.text),
+      author: groupMemberName(auth.peerId),
+    });
+    if (!out.ok) return { status: 400, body: { ok: false, error: out.error }, peerId: auth.peerId };
+    return {
+      status: 201,
+      body: { ok: true, proposal: out.proposal, status: out.status, vote: out.vote ? summarize(out.vote) : null },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * POST /v1/group/vote —— 投一票。
+   * 票只能记在**签名者**名下（body 里的 peerId 不认）；被拒也回 200 + accepted:false，
+   * 让成员能读到原因（vote-not-eligible / vote-closed / vote-ballot-invalid）。
+   */
+  function groupVoteCast(req, rawBody, url, auth) {
+    if (!votesStore) {
+      if (config.logger) {
+        config.logger(`[group] vote refused from=${shortPeerId(auth.peerId)} reason=votes-hub-only`);
+      }
+      return { status: 403, body: { ok: false, error: 'votes-hub-only' }, peerId: auth.peerId };
+    }
+    let body;
+    try {
+      body = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const out = castBallotLocal({
+      proposalId: body.proposalId == null ? '' : String(body.proposalId),
+      peerId: auth.peerId,
+      ballot: body.ballot == null ? '' : String(body.ballot),
+    });
+    if (!out.ok) {
+      return { status: out.error === 'vote-not-found' ? 404 : 400, body: { ok: false, error: out.error }, peerId: auth.peerId };
+    }
+    return { status: 200, body: out, peerId: auth.peerId };
+  }
+
+  /** POST /v1/group/vote/open —— 手动开一轮（hub only；成员点了也是 votes-hub-only） */
+  function groupVoteOpen(req, rawBody, url, auth) {
+    if (!votesHubOnly(auth)) {
+      if (config.logger) {
+        config.logger(`[group] vote open refused from=${shortPeerId(auth.peerId)} reason=votes-hub-only`);
+      }
+      return { status: 403, body: { ok: false, error: 'votes-hub-only' }, peerId: auth.peerId };
+    }
+    let body;
+    try {
+      body = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const proposal = votesStore.proposal(String(body.proposalId ?? ''));
+    if (!proposal) return { status: 404, body: { ok: false, error: 'proposal-not-found' }, peerId: auth.peerId };
+    const current = votesStore.vote(proposal.id);
+    if (current && current.status === 'open') {
+      // 已经开着的轮不许再开一次：那会把冻结名单和计时器一起换掉
+      return { status: 409, body: { ok: false, error: 'vote-already-open', vote: summarize(current) }, peerId: auth.peerId };
+    }
+    const opened = openVoteRound({ proposal });
+    if (!opened.ok) return { status: 400, body: { ok: false, error: opened.error }, peerId: auth.peerId };
+    return { status: 201, body: { ok: true, vote: summarize(opened.vote) }, peerId: auth.peerId };
+  }
+
+  /** POST /v1/group/vote/advance —— 结算并推进（hub only；幂等：已结算的轮不会再推进一轮） */
+  function groupVoteAdvance(req, rawBody, url, auth) {
+    if (!votesHubOnly(auth)) {
+      if (config.logger) {
+        config.logger(`[group] vote advance refused from=${shortPeerId(auth.peerId)} reason=votes-hub-only`);
+      }
+      return { status: 403, body: { ok: false, error: 'votes-hub-only' }, peerId: auth.peerId };
+    }
+    let body;
+    try {
+      body = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, error: 'bad-request' }, peerId: auth.peerId };
+    }
+    const id = String(body.proposalId ?? '');
+    if (id === '') return { status: 400, body: { ok: false, error: 'proposal-id-required' }, peerId: auth.peerId };
+    const out = closeVoteRound(id);
+    if (!out.ok) {
+      return { status: out.error === 'vote-not-found' ? 404 : 400, body: { ok: false, error: out.error }, peerId: auth.peerId };
+    }
+    return {
+      status: 200,
+      body: { ok: true, outcome: out.outcome, already: out.already === true, vote: summarize(votesStore.vote(id)) },
+      peerId: auth.peerId,
+    };
   }
 
   function groupReplicate(req, rawBody, url, auth) {
@@ -7090,6 +7708,13 @@ export function createPeerServer(overrides = {}) {
       // 0.10.0-α slice 4a：纪要读（成员允许）/ 写（hub only，门在 handler 里）
       'GET /v1/group/notes': groupNotes,
       'POST /v1/group/notes': groupNotesAppend,
+      // 0.10.0-α slice 4b-1：表决平面（成员可提交/可读；开轮/推进/结算 hub only）
+      'GET /v1/group/proposals': groupProposalsRead,
+      'POST /v1/group/proposal': groupProposalSubmit,
+      'GET /v1/group/vote': groupVoteRead,
+      'POST /v1/group/vote': groupVoteCast,
+      'POST /v1/group/vote/open': groupVoteOpen,
+      'POST /v1/group/vote/advance': groupVoteAdvance,
       // S1 查询 leader（GET）/ S3 心跳（POST）共用这一条路径，方法区分
       'GET /v1/group/leader': groupLeader,
       'POST /v1/group/leader': groupHeartbeat,
@@ -7867,6 +8492,10 @@ export function createPeerServer(overrides = {}) {
       // 0.10.0-α slice 4a：纪要搭同一次 pull 回来 —— 不新增轮询、不多发请求。
       // 成员只把它落进副本（rev 更大的才采纳），**永不回写** hub：纪要 hub 单写。
       const synced = page.notes && typeof page.notes === 'object' ? replicaStore.setNotes(page.notes) : null;
+      // 0.10.0-α slice 4b-1：表决平面同样只落副本（rev 更大的才采纳），永不回写 hub
+      const syncedVotes = page.votePlane && typeof page.votePlane === 'object'
+        ? replicaStore.setVotes(page.votePlane)
+        : null;
       memberLastError = '';
       // hub 在 pull 响应里自报地址（X-Peer-Base 同一口径）：按名入群的节点本地没有 hub 的
       // 配对记录，靠这一条把地址写进 group-key.json 的成员表（选举/提案要用）。
@@ -7889,6 +8518,9 @@ export function createPeerServer(overrides = {}) {
       }
       if (synced && synced.adopted && config.logger) {
         config.logger(`[group] notes sync rev=${synced.rev} n=${synced.count}`);
+      }
+      if (syncedVotes && syncedVotes.adopted && config.logger) {
+        config.logger(`[group] votes sync rev=${syncedVotes.rev} n=${syncedVotes.proposals}`);
       }
       return { ok: true, added: applied.added, lastSeq: applied.lastSeq };
     } catch (error) {
@@ -9287,6 +9919,18 @@ export function createPeerServer(overrides = {}) {
           notesSummary: () => notesSummary(notesView()),
           appendNote: (input) => appendLocalNote(input ?? {}),
           notesCap: () => NOTES_LIMIT,
+          // 0.10.0-α slice 4b-1：表决平面（hub 是唯一写者；成员那侧只有同步来的副本）
+          votes: () => votePlaneView(),
+          proposals: () => proposalsView(),
+          shelved: () => votePlaneView().shelved,
+          submitProposal: (input) => submitProposalLocal(input ?? {}),
+          castVote: (input) => castBallotLocal(input ?? {}),
+          // 收字符串 id 或 {proposalId} 两种形状（面板/CLI/测试都会用到）
+          closeVote: (input) => closeVoteRound(
+            input && typeof input === 'object' ? input.proposalId : input,
+          ),
+          // 测试/排障可见：还挂着几个表决定时器（关轮与 close() 之后必须是 0）
+          voteTimers: () => voteTimers.size,
           // 与 /v1/group/history 同一个渲染口径：同名成员在这里就已经带上短 id 后缀
           history: (options = {}) => decoratedMessages(options),
           // §18：归档索引 / 人工删除 / 游标落在归档区间的判定（管理接口与面板走这里）
@@ -9334,6 +9978,15 @@ export function createPeerServer(overrides = {}) {
           notesSummary: () => notesSummary(notesView()),
           appendNote: () => ({ ok: false, error: 'notes-hub-only' }),
           notesCap: () => NOTES_LIMIT,
+          // 0.10.0-α slice 4b-1：成员的表决平面**只读**（pull 同步来的副本）；
+          // 开轮/推进/表决一律拒 —— 不是「还没实现」，是成员永远没有这条写路径。
+          votes: () => votePlaneView(),
+          proposals: () => proposalsView(),
+          shelved: () => votePlaneView().shelved,
+          submitProposal: () => ({ ok: false, error: 'votes-hub-only' }),
+          castVote: () => ({ ok: false, error: 'votes-hub-only' }),
+          closeVote: () => ({ ok: false, error: 'votes-hub-only' }),
+          voteTimers: () => 0,
           // 契约 §4 的门面在成员节点也要在：不带新字段时走既有回执通道（hub / 群级签名）
           post: (input) => groupPostFacade(input),
           advertiseBaseUrl: () => localAdvertiseBaseUrl(),
@@ -9381,6 +10034,8 @@ export function createPeerServer(overrides = {}) {
       fileStore.start();
       // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
       dispatchPending.start();
+      // 0.10.0-α slice 4b-1：上一段进程遗留的 open 轮重新挂上定时器（过点的立刻结算）
+      resumeVoteTicks();
       // v0.8.0 契约 §2a：已入群节点启动后广播一次（延迟到地址已知；节流在广播里生效）
       scheduleStartupAdvertise();
       // v0.8.0：role=off 的节点观察「按名入群」的授权文件（拿到就原地变成员）
@@ -9422,6 +10077,8 @@ export function createPeerServer(overrides = {}) {
         clearInterval(replicaRetryTimer);
         replicaRetryTimer = null;
       }
+      // 0.10.0-α slice 4b-1：表决定时器整表清掉（关停后 scheduleVoteTick 的 closing 闸也不再起新的）
+      clearVoteTicks();
       if (!httpServer.listening) return;
       const closed = new Promise((resolve) => httpServer.close(resolve));
       httpServer.closeAllConnections?.();

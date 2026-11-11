@@ -17,8 +17,8 @@ import { createPeerServer, GroupReplicaStore, sanitizeGroupMeta } from '../serve
 import { deriveGroupKeys, decryptGroupJson, encryptGroupBody, groupAuthHeaders } from '../../lib/group-client.mjs';
 import { fileMode, makeTempStateDir, peerFixture, readJson, request, seedPeers, writeJson0600 } from './helpers.mjs';
 // 0.10.0-α slice 4a：纪要的群级 HTTP 读口/写口 + 真集群脚手架
-import { fetchGroupNotes, postGroupNote } from '../../lib/group-client.mjs';
-import { startCluster } from './group-cluster.mjs';
+import { fetchGroupNotes, groupCall, postGroupNote } from '../../lib/group-client.mjs';
+import { startCluster, waitFor } from './group-cluster.mjs';
 
 const MEMBER = peerFixture('peer-replica-1');
 const MEMBER2 = peerFixture('peer-replica-2');
@@ -26,7 +26,7 @@ const MEMBER2 = peerFixture('peer-replica-2');
 const DAY = 86_400_000;
 
 /** hub：stateDir 由调用方持有，便于「杀掉再重启」 */
-async function startHub(t, { stateDir = makeTempStateDir(), group = {}, runner, name, logger } = {}) {
+async function startHub(t, { stateDir = makeTempStateDir(), group = {}, runner, name, logger, voteRoundMs } = {}) {
   seedPeers(stateDir, [MEMBER, MEMBER2]);
   const server = createPeerServer({
     listenHost: '127.0.0.1',
@@ -40,6 +40,8 @@ async function startHub(t, { stateDir = makeTempStateDir(), group = {}, runner, 
     ...(runner ? { runner } : {}),
     ...(name ? { name } : {}),
     ...(logger ? { logger } : {}),
+    // 0.10.0-α slice 4b-1：表决轮的时长（生产固定 10 分钟；测试缩短，别真等）
+    ...(voteRoundMs ? { groupVote: { roundMs: voteRoundMs } } : {}),
   });
   const info = await listenOnRandomPort(server);
   t.after(async () => { await server.close(); });
@@ -972,4 +974,189 @@ test('4a N5：纪要随 pull 同步到成员副本；成员没有任何写路径
   // 门面这一侧也一样（面板/CLI 走的是同一条门面）
   assert.deepEqual(member.server.group.appendNote({ text: '成员要写' }), { ok: false, error: 'notes-hub-only' });
   assert.equal(fs.existsSync(memberNotesFile), false, '成员侧没有任何写纪要文件的代码路径');
+});
+
+
+// ---------------------------------------------------------------------------
+// 0.10.0-α slice 4b-1：群表决平面（hub 单写、成员只读同步）
+//
+// V7：成员能**提交**提案/投票（输入），但开轮/推进/结算只有 hub 能叫（403 votes-hub-only）；
+//     权威文件只有 hub 有，成员那份只是 pull 同步来的副本。
+// V8：一轮恰好一个定时器；关轮与 close() 都清掉（进程能自己退出，不吊住句柄）。
+// ---------------------------------------------------------------------------
+
+/** 群级调用：一律走 lib/group-client 的 groupCall（与 CLI/成员侧同一套签名） */
+const groupCallTo = (cluster, senderId, apiPath, body, method = 'POST') => groupCall({
+  baseUrl: cluster.hub.baseUrl,
+  groupKey: cluster.groupKey,
+  groupId: cluster.groupId,
+  senderId,
+  apiPath,
+  method,
+  ...(body === undefined ? {} : { body }),
+});
+
+test('4b-1 V7：成员可提交提案/投票，开轮与推进一律 403 votes-hub-only；权威文件只在 hub', async (t) => {
+  const cluster = await startCluster(t, { count: 2 });
+  const [hub, member] = cluster.nodes;
+  const hubVotesFile = path.join(hub.dir, 'group-votes.json');
+  const memberVotesFile = path.join(member.dir, 'group-votes.json');
+  // 「轮内新来的人」那一侧：它是**群成员**（群签名有效），但 peers.json 里根本没有它
+  // → lastSeen 永远是 null → 永远在冻结名单之外。用它证明「上线晚的人进不了本轮」。
+  const ghost = { peerId: 'peer-ghost', name: 'ghost' };
+  hub.server.group.addMember(ghost.peerId, ghost.name);
+
+  // 1) 成员提交「补充」：入库 + 默认采纳（没有异议就不开票）
+  const supplement = await groupCallTo(cluster, member.peerId, '/v1/group/proposal', {
+    // body 里自称的作者一律不认：作者永远是**签名者**
+    kind: 'supplement', target: { type: 'body', id: 'n1' }, text: '十月计划再补一条', author: '有人冒名',
+  });
+  assert.equal(supplement.ok, true);
+  assert.equal(supplement.proposal.kind, 'supplement');
+  assert.equal(supplement.status, 'adopted', '补充默认采纳：不该为它开票');
+  assert.equal(supplement.vote, null);
+  assert.equal(fs.existsSync(hubVotesFile), true, 'hub 有自己的表决平面文件');
+  assert.equal(fs.existsSync(memberVotesFile), false, '成员侧根本没有写权威文件的路径');
+  if (process.platform !== 'win32') assert.equal(fileMode(hubVotesFile), 0o600, '表决平面必须 0600');
+
+  // 2) 成员提交「反对」→ **自动开票**（第 1 轮，名单在这一刻冻结）
+  const objection = await groupCallTo(cluster, member.peerId, '/v1/group/proposal', {
+    kind: 'objection', target: { type: 'supplement', id: supplement.proposal.id }, text: '这条我不认同',
+  });
+  assert.equal(objection.status, 'open', '反对一到就开票');
+  assert.equal(objection.vote.round, 1);
+  const voteId = objection.proposal.id;
+  const opened = hub.server.group.votes().votes[voteId];
+  assert.equal(opened.status, 'open');
+  assert.equal(hub.server.group.voteTimers(), 1, '开着一轮就恰好挂一个定时器');
+
+  // 3) 成员读：提案列表与单轮台账都允许（只读同步的那一半）
+  const listed = await groupCallTo(cluster, member.peerId, '/v1/group/proposals', undefined, 'GET');
+  assert.equal(listed.proposals.length, 2);
+  assert.deepEqual(listed.shelved, []);
+  assert.deepEqual(listed.summary.proposals, 2);
+  // 「默认采纳」的前提是没人反对：被反对指着的那条补充不能再自称 adopted
+  assert.equal(listed.proposals.find((entry) => entry.id === supplement.proposal.id).status, 'contested');
+  assert.equal(listed.proposals.find((entry) => entry.id === voteId).status, 'open');
+  const ledger = await groupCallTo(cluster, member.peerId, '/v1/group/vote?proposalId=' + voteId, undefined, 'GET');
+  assert.equal(ledger.vote.proposalId, voteId);
+  assert.deepEqual(ledger.roster, opened.roster, '台账里的冻结名单就是开轮那一刻的那份');
+
+  // 4) 冻结名单：从没上线的第 3 台成员投不了（原因写进返回值）
+  const rejected = await groupCallTo(cluster, ghost.peerId, '/v1/group/vote', { proposalId: voteId, ballot: 'yes' });
+  assert.equal(rejected.accepted, false);
+  assert.equal(rejected.reason, 'vote-not-eligible', '名单外的人不许投票：' + JSON.stringify(rejected));
+  assert.deepEqual(hub.server.group.votes().votes[voteId].ballots, {}, '被拒的票一个字都没落盘');
+
+  // 5) 成员**不能**开轮/推进/结算（Z3 的拒绝码 votes-hub-only）
+  for (const apiPath of ['/v1/group/vote/open', '/v1/group/vote/advance']) {
+    await assert.rejects(
+      () => groupCallTo(cluster, member.peerId, apiPath, { proposalId: voteId }),
+      (error) => {
+        assert.equal(error.status, 403, apiPath + ' 必须 403，实测 ' + String(error.message));
+        assert.equal(error.code, 'votes-hub-only');
+        return true;
+      },
+    );
+  }
+  // 成员门面同样没有写路径（不是「还没实现」，是成员永远没有）
+  assert.deepEqual(
+    member.server.group.submitProposal({ kind: 'supplement', target: { type: 'body', id: 'n1' }, text: 'x' }),
+    { ok: false, error: 'votes-hub-only' },
+  );
+  assert.deepEqual(member.server.group.closeVote(voteId), { ok: false, error: 'votes-hub-only' });
+  assert.equal(member.server.group.voteTimers(), 0);
+
+  // 6) 名单上的人全投 yes → 够票立刻关（passed），定时器随之清掉
+  for (const peerId of opened.roster) {
+    const cast = hub.server.group.castVote({ proposalId: voteId, peerId, ballot: 'yes' });
+    assert.equal(cast.accepted, true, peerId + ' 的票必须被收下：' + cast.reason);
+  }
+  const settled = hub.server.group.votes().votes[voteId];
+  assert.equal(settled.status, 'passed', opened.roster.length + ' 人名单全 yes 必须通过');
+  assert.equal(hub.server.group.voteTimers(), 0, '关轮必须清掉定时器');
+
+  // 7) 幂等：hub 自己再推进一次 = no-op（不许双推进）
+  const advanced = await groupCallTo(cluster, hub.peerId, '/v1/group/vote/advance', { proposalId: voteId });
+  assert.equal(advanced.already, true, '已结算的轮重复推进必须 no-op');
+  assert.equal(advanced.vote.round, 1, '不许把 passed 推成下一轮');
+  assert.equal(advanced.vote.status, 'passed');
+
+  // 8) 成员只读同步：搭同一次 pull 回来，落进**副本**（权威文件在成员侧始终不存在）
+  const hubPlaneNow = hub.server.group.votes();
+  const pulled = await pullNow(member);
+  assert.equal(pulled?.ok, true, '成员这一轮 pull 必须真跑起来：' + JSON.stringify(pulled));
+  const replicaPlane = member.server.group.votes();
+  assert.ok(replicaPlane.rev >= 1, '表决平面必须搭同一次 pull 回来');
+  assert.equal(replicaPlane.rev, hubPlaneNow.rev, '成员副本停在与 hub 同一份 rev 上');
+  assert.deepEqual(replicaPlane.proposals.map((entry) => entry.id), ['p1', voteId]);
+  assert.equal(replicaPlane.votes[voteId].status, 'passed');
+  assert.equal(readJson(replicaFileOf(member.dir)).votes.votes[voteId].status, 'passed', '平面存在成员自己的副本里');
+  assert.equal(fs.existsSync(memberVotesFile), false, '成员不许写权威文件（那本是 hub 的）');
+  // hub 那份仍是唯一权威：成员提交的那两条都在，作者是成员名
+  const hubPlane = readJson(hubVotesFile);
+  assert.equal(hubPlane.proposals.length, 2);
+  const author = hubPlane.proposals[0].author;
+  const hubMemberName = hub.server.group.members().find((entry) => entry.peerId === member.peerId)?.name ?? '';
+  assert.equal(author === '有人冒名', false, 'body 里自称的作者必须被忽略');
+  assert.ok(author.length > 0, '作者口径必须来自 hub 记的成员名，不能为空');
+  assert.ok(
+    hubMemberName.startsWith(author) || author.startsWith(hubMemberName),
+    `作者应是 hub 记的那个成员（同名时带短 id 后缀）：${author} vs ${hubMemberName}`,
+  );
+});
+
+test('4b-1 V8：一轮一个定时器；关轮与 close() 都清掉（进程能自己退出）', async (t) => {
+  const lines = [];
+  // 轮时长压到 400ms：既不真等 10 分钟，又给同步断言留足余量（不会和定时器抢跑）
+  const hub = await startHub(t, { voteRoundMs: 400, logger: (line) => lines.push(String(line)) });
+  const g = hub.server.group;
+  assert.equal(g.voteTimers(), 0, '一开始没有表决定时器');
+
+  const opened = g.submitProposal({ kind: 'objection', target: { type: 'body', id: 'n1' }, text: '这条要表决', author: 'hub-box' });
+  assert.equal(opened.ok, true, JSON.stringify(opened));
+  const voteId = opened.proposal.id;
+  assert.equal(g.voteTimers(), 1, '开一轮 → 恰好一个定时器');
+  assert.equal(g.votes().votes[voteId].round, 1);
+
+  // 到点自己关（**没有流量也要关**）：第 1 轮 failed，第 2 轮用新冻结的名单重开
+  const secondRound = await waitFor(() => (g.votes().votes[voteId].round === 2 ? g.votes().votes[voteId] : null));
+  assert.ok(secondRound, '到点必须自己关轮：' + JSON.stringify(g.votes().votes[voteId]));
+  assert.equal(secondRound.status, 'open');
+  assert.equal(g.voteTimers(), 1, '换轮不叠加定时器：仍然只有一个');
+
+  // 第 2 轮：名单上唯一的成员投 no → 剩下的人全 yes 也够不到 → **提前关**（不等 closesAt）
+  const roster = g.votes().votes[voteId].roster;
+  assert.equal(roster.length, 1, 'startHub 的群成员只有 hub 自己');
+  const no = g.castVote({ proposalId: voteId, peerId: roster[0], ballot: 'no' });
+  assert.equal(no.accepted, true, '名单上的票必须被收下：' + no.reason);
+  assert.equal(no.closed, true, '没救了就该立刻关：' + JSON.stringify(no));
+  assert.equal(g.votes().votes[voteId].round, 3, '第 2 轮失败 → 第 3 轮（不是被推两轮）');
+  assert.equal(g.voteTimers(), 1, '第 3 轮重新挂定时器');
+
+  // 第 3 轮也过不了 → shelved、进 shelved 集、不再开第 4 轮、不留定时器
+  const third = g.castVote({ proposalId: voteId, peerId: roster[0], ballot: 'no' });
+  assert.equal(third.closed, true);
+  assert.equal(g.votes().votes[voteId].status, 'shelved');
+  assert.deepEqual(g.shelved().map((entry) => entry.proposalId), [voteId], 'shelved 集里必须有它（交人裁决）');
+  assert.equal(g.shelved()[0].rounds, 3);
+  assert.equal(g.voteTimers(), 0, 'shelved 之后不许再留定时器');
+  const againCall = g.closeVote(voteId);
+  assert.equal(againCall.already, true, '已结算/已 shelved 的轮重复推进必须 no-op');
+  assert.equal(g.votes().votes[voteId].round, 3, '绝不开第 4 轮');
+
+  // 日志口径：每条状态迁移一行，id ≤8 字符，且**绝不带提案正文**
+  const voteLines = lines.filter((line) => line.startsWith('[group] vote ') || line.startsWith('[group] proposal '));
+  assert.ok(voteLines.some((line) => /^\[group\] vote open id=\S{1,8} round=1 roster=\d+$/.test(line)), voteLines.join('\n'));
+  assert.ok(voteLines.some((line) => /^\[group\] vote close id=\S{1,8} round=1 yes=0 no=0 outcome=failed$/.test(line)), voteLines.join('\n'));
+  assert.ok(voteLines.some((line) => /^\[group\] vote close id=\S{1,8} round=2 yes=0 no=1 outcome=failed$/.test(line)), voteLines.join('\n'));
+  assert.ok(voteLines.some((line) => /^\[group\] vote shelved id=\S{1,8} rounds=3$/.test(line)), voteLines.join('\n'));
+  assert.equal(lines.some((line) => line.includes('这条要表决')), false, '日志里绝不许出现提案正文');
+
+  // 再开一轮，然后 close()：定时器必须被清掉（上一片的吊死就是这里漏了）
+  const another = g.submitProposal({ kind: 'objection', target: { type: 'body', id: 'n2' }, text: '再开一轮', author: 'hub-box' });
+  assert.equal(another.status, 'open');
+  assert.equal(g.voteTimers(), 1);
+  await hub.server.close();
+  assert.equal(g.voteTimers(), 0, 'close() 必须清掉表决定时器（否则进程吊死）');
 });
