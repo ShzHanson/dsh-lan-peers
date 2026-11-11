@@ -2004,6 +2004,65 @@ export class GroupNotesStore {
  *   - 提案 id 是 `p<序号>` 短号（日志只允许 ≤8 字符的 id；号不复用，超出上限只丢最旧的）；
  *   - 一轮的表决记录**整份**存在 votes[proposalId] 里 —— 轮次/冻结名单/票都在那一格里，不另开表。
  */
+/**
+ * 0.10.0-α slice 4b-2：**人裁决**（shelved 交人决定）只存一处 —— 表决平面自己。
+ *
+ * 为什么以 `verdicts` 这个**兄弟键**落盘：平面过 normalizeVotePlane 时提案形状是严格白名单
+ * （id/kind/target/text/author/createdAt），贴在提案上的自造字段一读盘就会被清掉，
+ * 于是「hub 说采纳、成员那边还在搁置」——两台机器各说一套。存兄弟键、视图层贴回
+ * `proposal.verdict`，好处是：**rev 照样由 setVerdict 前进**，pull 的既有复制与
+ * mergeVotesReplica（rev 大者胜）一字不改就把裁决带到成员侧，权威仍然只有一份。
+ */
+const VERDICT_DECISIONS = Object.freeze(['adopt', 'reject']);
+const VERDICT_REASON_MAX = 200;
+
+/** 裁决归一化：坏条目逐条丢掉（坏文件不该让表决平面起不来） */
+function normalizeVerdicts(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const table = {};
+  for (const [proposalId, entry] of Object.entries(source)) {
+    const id = String(proposalId ?? '').trim();
+    const decision = String(entry?.decision ?? '').trim();
+    if (id === '' || !VERDICT_DECISIONS.includes(decision)) continue;
+    const at = Number(entry?.at);
+    table[id] = {
+      decision,
+      reason: String(entry?.reason ?? '').slice(0, VERDICT_REASON_MAX),
+      at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0,
+      by: String(entry?.by ?? ''),
+    };
+  }
+  return table;
+}
+
+/** 从任意一份平面原值里取裁决：优先兄弟键，其次提案上贴着的 verdict（兼容老/手改文件） */
+function verdictsOfPlane(raw) {
+  const direct = normalizeVerdicts(raw?.verdicts);
+  if (Object.keys(direct).length > 0) return direct;
+  const harvested = {};
+  for (const entry of Array.isArray(raw?.proposals) ? raw.proposals : []) {
+    const id = String(entry?.id ?? '');
+    const verdict = entry?.verdict;
+    if (id === '' || !verdict || typeof verdict !== 'object') continue;
+    harvested[id] = verdict;
+  }
+  return normalizeVerdicts(harvested);
+}
+
+/** 值对象：平面 + 贴回提案的 `verdict`（面板/网络/CLI 看到的就是这一份） */
+function withVerdicts(plane, rawVerdicts) {
+  const table = normalizeVerdicts(rawVerdicts);
+  return {
+    ...plane,
+    verdicts: table,
+    proposals: plane.proposals.map((proposal) => (
+      Object.prototype.hasOwnProperty.call(table, proposal.id)
+        ? { ...proposal, verdict: table[proposal.id] }
+        : proposal
+    )),
+  };
+}
+
 export class GroupVotesStore {
   #stateDir;
 
@@ -2022,19 +2081,22 @@ export class GroupVotesStore {
 
   #load() {
     if (this.#data) return this.#data;
-    this.#data = normalizeVotePlane(readJsonFile(this.votesPath));
+    const raw = readJsonFile(this.votesPath);
+    // 裁决是兄弟键：规范化只认白名单提案，所以这里把 verdicts 单独接回来（否则一读盘就没了）
+    this.#data = { ...normalizeVotePlane(raw), verdicts: verdictsOfPlane(raw) };
     return this.#data;
   }
 
   #save(plane) {
-    this.#data = normalizeVotePlane(plane);
+    const verdicts = normalizeVerdicts(plane?.verdicts ?? this.#data?.verdicts);
+    this.#data = { ...normalizeVotePlane(plane), verdicts };
     writeJson0600(this.votesPath, this.#data);
     return this.#data;
   }
 
   /** 只读视图（网络/面板/CLI 共用；normalizeVotePlane 已复制，调用方改不动内存） */
   plane() {
-    return normalizeVotePlane(this.#load());
+    return withVerdicts(normalizeVotePlane(this.#load()), this.#load().verdicts);
   }
 
   proposals() {
@@ -2116,6 +2178,36 @@ export class GroupVotesStore {
       shelved: [...current.shelved, { proposalId: id, rounds, at: this.#now() }],
     });
     return { ok: true, shelved: saved.shelved, duplicate: false };
+  }
+
+  /**
+   * 0.10.0-α slice 4b-2：记一条人裁决（**hub 独有**，状态机的轮次规则一个字都不动）。
+   *
+   * 三条规矩：
+   *   1. 只有 shelved 的提案才轮到人裁决（没搁置的提案不该被人一句话改掉）；
+   *   2. 已经裁决过的不再改（决定是终局，改主意要重新走提案，不是覆盖历史）；
+   *   3. **rev +1**：这是复制的那一半 —— 成员 pull 到 rev 更大的平面就采纳（mergeVotesReplica）。
+   */
+  setVerdict({ proposalId = '', decision = '', reason = '', by = '' } = {}) {
+    const id = String(proposalId ?? '');
+    const picked = String(decision ?? '').trim();
+    if (id === '') return { ok: false, error: 'proposal-id-required' };
+    if (!VERDICT_DECISIONS.includes(picked)) return { ok: false, error: 'bad-decision' };
+    const current = this.#load();
+    if (!current.proposals.some((entry) => entry.id === id)) return { ok: false, error: 'proposal-not-found' };
+    if (!current.shelved.some((entry) => entry.proposalId === id)) return { ok: false, error: 'vote-not-shelved' };
+    if (Object.prototype.hasOwnProperty.call(normalizeVerdicts(current.verdicts), id)) {
+      return { ok: false, error: 'already-decided' };
+    }
+    const saved = this.#save({
+      ...current,
+      rev: Math.max(0, current.rev) + 1,
+      verdicts: {
+        ...normalizeVerdicts(current.verdicts),
+        [id]: { decision: picked, reason: String(reason ?? '').slice(0, VERDICT_REASON_MAX), at: this.#now(), by: String(by ?? '') },
+      },
+    });
+    return { ok: true, rev: saved.rev, verdict: normalizeVerdicts(saved.verdicts)[id] };
   }
 }
 
@@ -2274,7 +2366,8 @@ export class GroupReplicaStore {
    * 成员的表决平面**不是**本机写的：它只是 hub 那份的缓存，形状 {rev, proposals, votes, shelved}。
    */
   votes() {
-    return normalizeVotePlane(this.#load().votes);
+    const data = this.#load();
+    return withVerdicts(normalizeVotePlane(data.votes), verdictsOfPlane(data.votes));
   }
 
   /**
@@ -2287,8 +2380,10 @@ export class GroupReplicaStore {
     const current = normalizeVotePlane(data.votes);
     const merged = mergeVotesReplica(current, value);
     const adopted = merged.rev !== current.rev;
-    if (adopted) {
-      data.votes = merged;
+    // 裁决跟着 rev 走：采纳了对端更新的平面，就一并采纳它的裁决表（同一份权威，不另立台账）
+    const verdicts = adopted ? verdictsOfPlane(value) : verdictsOfPlane(data.votes);
+    if (adopted || Object.keys(normalizeVerdicts(data.votes?.verdicts)).length !== Object.keys(verdicts).length) {
+      data.votes = { ...merged, verdicts };
       this.#save(data);
     }
     return { rev: merged.rev, proposals: merged.proposals.length, adopted };
@@ -2990,6 +3085,11 @@ export function createPeerServer(overrides = {}) {
    *   3. 没有记录的反对 → pending（正常不会有：反对一到就开票）。
    */
   function proposalStatus(proposal, plane) {
+    // 0.10.0-α slice 4b-2：人裁决排在最前 —— 它是平面对这条提案的最终说法
+    const verdict = plane.verdicts && Object.prototype.hasOwnProperty.call(plane.verdicts, proposal.id)
+      ? plane.verdicts[proposal.id]
+      : null;
+    if (verdict) return verdict.decision === 'adopt' ? 'adopted' : 'rejected';
     const vote = plane.votes[proposal.id];
     if (vote) return vote.status;
     if (proposal.kind !== 'supplement') return 'pending';
@@ -3142,6 +3242,27 @@ export function createPeerServer(overrides = {}) {
       vote: opened && opened.ok ? opened.vote : null,
       status: proposalStatus(proposal, votesStore.plane()),
     };
+  }
+
+  /**
+   * 0.10.0-α slice 4b-2：人裁决（shelved 的交人决定）。hub 侧唯一的写入口。
+   * 写的是**表决平面自己**（兄弟键 verdicts + rev +1），所以 pull 的既有复制就把它带到成员侧；
+   * 状态机的规则、阈值、定时器一个字都不动。
+   */
+  function adjudicateLocal({ proposalId = '', decision = '', reason = '', by = '' } = {}) {
+    if (!votesStore) return { ok: false, error: 'votes-hub-only' };
+    const out = votesStore.setVerdict({ proposalId, decision, reason, by });
+    if (!out.ok) {
+      if (config.logger) {
+        config.logger(`[group] adjudicate refused id=${shortVoteId(proposalId)} reason=${String(out.error).slice(0, 24)}`);
+      }
+      return out;
+    }
+    if (config.logger) {
+      // 只记短 id / 裁决 / rev：理由正文绝不上日志
+      config.logger(`[group] adjudicate id=${shortVoteId(proposalId)} decision=${String(decision ?? '').slice(0, 8)} rev=${out.rev}`);
+    }
+    return { ok: true, rev: out.rev, decision: String(decision ?? ''), verdict: out.verdict };
   }
 
   /** 收一张票（hub 侧唯一的计票入口）：名单外/迟到/坏票面一律 accepted:false + 可读原因 */
@@ -9925,6 +10046,8 @@ export function createPeerServer(overrides = {}) {
           shelved: () => votePlaneView().shelved,
           submitProposal: (input) => submitProposalLocal(input ?? {}),
           castVote: (input) => castBallotLocal(input ?? {}),
+          // 0.10.0-α slice 4b-2：shelved 交人裁决（hub 独有；裁决落在平面里，随 rev 复制出去）
+          adjudicate: (input) => adjudicateLocal(input ?? {}),
           // 收字符串 id 或 {proposalId} 两种形状（面板/CLI/测试都会用到）
           closeVote: (input) => closeVoteRound(
             input && typeof input === 'object' ? input.proposalId : input,
@@ -9985,6 +10108,8 @@ export function createPeerServer(overrides = {}) {
           shelved: () => votePlaneView().shelved,
           submitProposal: () => ({ ok: false, error: 'votes-hub-only' }),
           castVote: () => ({ ok: false, error: 'votes-hub-only' }),
+          // 成员永远没有裁决口（不是「还没实现」）：决定只能由 hub 的运维者做
+          adjudicate: () => ({ ok: false, error: 'votes-hub-only' }),
           closeVote: () => ({ ok: false, error: 'votes-hub-only' }),
           voteTimers: () => 0,
           // 契约 §4 的门面在成员节点也要在：不带新字段时走既有回执通道（hub / 群级签名）
