@@ -357,7 +357,7 @@ test('S3 取号闸门：pending 占着的号不会被单阶段写（面板/管�
 // 起因：3b 把「群问答」挂到了 hub 的本地单阶段写这条缝上，而这条缝的作者是调用方给的
 // （面板/管理接口没有作者身份 = `from.peerId === ''`）。于是 hub 会抢答**自己刚写下的**
 // 那条面板消息，答出来的那条消息再占走下一个群 seq —— 单阶段写的取号从此不连续。
-// 拆掉 groupAnswerIntent 里的 isGroupMemberAuthor 闸门，这个用例的
+// 拆掉 answerDecision 的 memberAuthor 闸门（server 侧 groupAnswerVerdict），这个用例的
 // `history().length === 1` 会先变 2，`next.seq === panel.seq + 1` 会变 panel.seq + 2。
 test('S3 回归（片 3b）：未知作者的单阶段写不触发抢答，所以不额外占号', async (t) => {
   const cluster = await startCluster(t, { count: 2 });

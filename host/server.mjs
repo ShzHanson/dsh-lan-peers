@@ -162,19 +162,17 @@ import {
 import {
   RESIDENT_TTL_MS,
   ResidentSessionStore,
-  addressedToNode,
   alreadyAnsweredSeq,
+  answerDecision,
   answerJitterMs,
   buildResidentPrompt,
   createAnswerClaimSet,
   createAnswerQueue,
-  isAnswerMessage,
   memberMentionAliases,
   mentionAliases,
   quoteExcerpt,
   resolveResidentUse,
   sanitizeQuoteMeta,
-  undirectedQuestion,
 } from '../lib/group-resident.mjs';
 // 0.10.0-α slice 4a：群纪要（hub 单写、成员只读同步）。纯值对象与三条不变量都在 lib/ 里，
 // 这里只负责落盘与走线。
@@ -7715,6 +7713,10 @@ export function createPeerServer(overrides = {}) {
       }
       void broadcastCommit(st.epoch, seq, message).catch(() => {});
       if (groupStore) enqueueReplication(message);
+      // 群问答：这条缝是 leader（真机上就是 hub）收到**成员 post** 的唯一落盘口。
+      // 少了这一行，hub 在 quorum=majority 下永远不排答案（成员侧靠 commit 广播走
+      // applyCommitted，所以只有 hub 哑火）—— 真机 seq=18 就是这么哑的。
+      dispatchGroupAnswers([message], String(ctx.groupId));
       return { status: 201, body: { seq, ts: message.ts }, peerId: input.peerId };
     }
     dropStaged(seq);
@@ -8189,18 +8191,6 @@ export function createPeerServer(overrides = {}) {
     return answerClaims.release(answerClaimKey(groupId, seq));
   }
 
-  /** 这条消息是不是「@ 我问了一句」：kind/自己发的/`/task` 都在纯函数里否决 */
-  function isQuestionToSelf(message) {
-    const from = message?.from && typeof message.from === 'object' ? message.from : {};
-    return addressedToNode({
-      text: message?.text,
-      kind: message?.kind,
-      fromPeerId: String(from.peerId ?? ''),
-      selfPeerId: String(store.instanceId ?? ''),
-      aliases: selfMentionAliases(),
-    });
-  }
-
   /** 群里所有可被 @ 的名字（成员表 + 自己）：用来判断「这条消息到底点名了谁」 */
   function groupMentionAliases() {
     const ctx = localGroupContext();
@@ -8239,24 +8229,28 @@ export function createPeerServer(overrides = {}) {
     return Object.prototype.hasOwnProperty.call(members, id);
   }
 
-  /** 这条消息要不要答、以什么身份答：''=不答 / 'directed'=点名答 / 'undirected'=抢答 */
-  function groupAnswerIntent(message) {
+  /**
+   * 这条消息要不要答、以什么身份答、不答是因为哪一条。
+   *
+   * 判定本身只有一份（lib/group-resident.mjs 的 answerDecision），这里只做一件事：
+   * 把**本机上下文**喂进去 —— 本机别名表（会被 @ 的名字）、群成员表（点名了谁）、
+   * 作者是不是成员。带 quote 的消息是别人的答案，不是问题（否则两台机器会对着答案
+   * 互相作答，无限乒乓）。
+   */
+  function groupAnswerVerdict(message) {
     const from = message?.from && typeof message.from === 'object' ? message.from : {};
-    // 带 quote 的消息是别人的答案，不是问题（否则两台机器会对着答案互相作答，无限乒乓）
-    if (isAnswerMessage(message?.meta)) return '';
-    if (isQuestionToSelf(message)) return 'directed';
-    // 抢答的前提：作者是群成员（见 isGroupMemberAuthor 的注释）
-    if (!isGroupMemberAuthor(from.peerId)) return '';
-    return undirectedQuestion({
+    const peerId = String(from.peerId ?? '');
+    return answerDecision({
       text: message?.text,
       kind: message?.kind,
-      fromPeerId: String(from.peerId ?? ''),
+      fromPeerId: peerId,
       selfPeerId: String(store.instanceId ?? ''),
+      aliases: selfMentionAliases(),
       knownMentions: groupMentionAliases(),
       meta: message?.meta,
-    })
-      ? 'undirected'
-      : '';
+      // 抢答的前提：作者是群成员（见 isGroupMemberAuthor 的注释）
+      memberAuthor: isGroupMemberAuthor(peerId),
+    });
   }
 
   /**
@@ -8389,9 +8383,17 @@ export function createPeerServer(overrides = {}) {
     let queued = 0;
     pruneResidentSessions();
     for (const message of list) {
-      const intent = groupAnswerIntent(message);
-      if (intent === '') continue;
       const seq = Math.floor(Number(message?.seq) || 0);
+      const verdict = groupAnswerVerdict(message);
+      const intent = verdict.intent;
+      if (intent === '') {
+        // 否决**必须**留一行：静默否决让「从没做过决定」与「决定不答」在日志里长得一样，
+        // 真机上 hub 一次都不答题时根本分不清是哪一道闸门挡的（见 ANSWER_SKIP_REASONS）。
+        if (config.logger) {
+          config.logger('[group] answer skip seq=' + seq + ' reason=' + verdict.reason);
+        }
+        continue;
+      }
       if (seq <= 0) continue;
       if (!claimAnswerSeq(key, seq)) continue;
       // 首答胜的第 (a) 道：本地已知消息里已经有人引用这个 seq 了 → 不排

@@ -125,10 +125,16 @@ export async function startCluster(t, options = {}) {
     electionExtra = {},
     // v0.8.2-α：群配置的额外字段（dispatchRateMs / acceptDispatch 等），逐台透传
     groupExtra = {},
+    // 0.10.1：按下标喂假 runner（群问答用例要能断言「谁被提问了几次」）
+    runners = [],
+    // 0.10.1：按下标指定显示名。默认还是 node-<短id>，但**必须显式传**才能测 @ 点名：
+    // 不传时 config.name 回落到 os.hostname()，同一台机器上的所有节点会报同一个名字，
+    // 成员表里的名字互相覆盖，@ 点名就分不清点的是谁了。
+    names: customNames = null,
   } = options;
 
   const ids = customIds ?? Array.from({ length: count }, (_, index) => `peer-s3-${String.fromCharCode(97 + index)}`);
-  const names = ids.map((id) => `node-${id.slice(-1)}`);
+  const names = customNames ?? ids.map((id) => `node-${id.slice(-1)}`);
   const dirs = ids.map((id, index) => {
     const dir = makeTempStateDir('dsh-lan-peers-s3-');
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -206,6 +212,10 @@ export async function startCluster(t, options = {}) {
       group,
       // 成员补差与复制重试在测试里由用例显式驱动
       groupReplica: { pullIntervalMs: 600_000, retryMs: 600_000 },
+      // 显式给了名字时，config.name 也必须是它：群问答按名字判「@ 到的是谁」，
+      // 缺了这一项 config.name 会回落到 os.hostname()，同机多节点就同名了。
+      ...(customNames ? { name: names[index] } : {}),
+      ...(runners[index] ? { runner: runners[index] } : {}),
       groupElection: {
         heartbeatMs: heartbeatOverride,
         commitTimeoutMs: commitOverride,
