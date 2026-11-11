@@ -40,7 +40,7 @@ async function startBlackhole(t) {
     socket.on('error', () => {});
     socket.on('close', () => sockets.delete(socket));
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(server);
   t.after(() => {
     for (const socket of sockets) socket.destroy();
     server.close();
@@ -131,7 +131,7 @@ test('P3 正常路径：活着的对端照旧成功，且远快于上界', async
       res.end(JSON.stringify({ ok: true, lastSeq: 1 }));
     });
   });
-  await new Promise((resolve) => live.listen(0, '127.0.0.1', resolve));
+  await listenOnRandomPort(live);
   t.after(() => live.close());
   const hub = await startHub(t, { memberBaseUrl: `http://127.0.0.1:${live.address().port}` });
   queueOneMessage(hub);

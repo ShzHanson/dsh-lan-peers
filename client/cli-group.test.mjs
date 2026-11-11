@@ -162,7 +162,14 @@ test('group tail 跟随事件流并逐条打印（期间别人发的消息也收
   assert.equal(out.status, 0, out.stderr);
   assert.match(out.stderr, /订阅群事件 sinceSeq=0/);
   assert.match(out.stdout, /#1 \d{4}-\d{2}-\d{2}T.+\[chat\] 边看边发/);
-  assert.match(out.stderr, /订阅结束 lastSeq=1/);
+  // 片 3a/3b 之后：hub 会对成员这条 chat 抢答（无 @ 抢答），答出来的是一条**新的**群消息
+  // （kind:'chat' + meta.quote.seq=1，作者是 hub 自己），所以事件流是 2 条而不是 1 条。
+  assert.equal(
+    out.stdout.split('\n').filter((line) => line.startsWith('#')).length,
+    2,
+    '两条事件：#1 成员提问 + #2 hub 抢答（两条不同 seq 的消息，不是同一条重放）',
+  );
+  assert.match(out.stderr, /订阅结束 lastSeq=2/);
 });
 
 test('group join 在 hub 未开 autoJoin 时 exit 2 并说明原因', async (t) => {
