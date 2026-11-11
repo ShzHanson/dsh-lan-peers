@@ -90,12 +90,10 @@ import {
   GROUP_APPLICATION_TTL_MS,
   GROUP_AUTH_CLOCK_SKEW_MS,
   GROUP_AUTH_HEADER,
-  GROUP_ACCEPT_HEADER,
   GROUP_AUTH_NONCE_WINDOW_MS,
   GROUP_AUTH_PATHS,
   GROUP_AUTH_VALUE,
   GROUP_BASE_HEADER,
-  GROUP_DEFAULT_ACCEPT_DISPATCH,
   GROUP_DEFAULT_COMMIT_TIMEOUT_MS,
   GROUP_DEFAULT_HEARTBEAT_MS,
   GROUP_DEFAULT_HUB_PRIORITY,
@@ -121,7 +119,6 @@ import {
   // 必须对同一份文件形状达成一致），服务端只调用它并缓存结果，不重写读盘逻辑。
   loadGroupIdentity,
   normalizeGroupName,
-  parseAcceptFlag,
   postGroup,
   postGroupWithGroupKey,
   proposeGroupMessage,
@@ -671,8 +668,6 @@ export function normalizeGroupConfig(raw) {
       ? Math.floor(commitMs)
       : GROUP_DEFAULT_COMMIT_TIMEOUT_MS,
     hubPriority: Number.isFinite(priority) ? Math.floor(priority) : GROUP_DEFAULT_HUB_PRIORITY,
-    // 本机是否接群内派单（缺省 true：老配置与老对端都按接单处理）
-    acceptDispatch: value.acceptDispatch !== false,
   };
 }
 
@@ -1496,11 +1491,11 @@ export class GroupStore {
     data.pending = data.pending.filter((entry) => entry && typeof entry === 'object'
       && Number.isFinite(Number(entry.seq)) && Number(entry.seq) > 0);
     if (typeof data.members !== 'object' || data.members === null || Array.isArray(data.members)) data.members = {};
-    // v0.8.2-α §4：成员的接单开关。读写都只认「显式 false = 关闭」，
-    // 缺失/垃圾值一律按 true（老 group.json 与老对端都是这个口径）。
+    // 0.10.0-α：接单开关随群内派单一起移除。老 group.json 里残留的这条字段就地丢弃 ——
+    // 成员表有原样透传的读口（state()/群上下文），留着它就会继续从线上漏出去；
+    // 老对端送来的同名值也不再被读、不再被消费（缺它、有它，行为完全一样）。
     for (const member of Object.values(data.members)) {
-      if (!member || typeof member !== 'object') continue;
-      if (member.acceptDispatch !== undefined) member.acceptDispatch = member.acceptDispatch !== false;
+      if (member && typeof member === 'object') delete member.acceptDispatch;
     }
     // §18：归档索引 [{ file, fromSeq, toSeq, count, bytes, createdAt }]
     data.archives = (Array.isArray(data.archives) ? data.archives : [])
@@ -1583,25 +1578,6 @@ export class GroupStore {
       this.#save(data);
     }
     return data.members[id];
-  }
-
-  /**
-   * v0.8.2-α §4：记下某个成员自报的接单开关（hub 侧权威落盘）。
-   * 只在该值真的变化时写盘 —— 心跳/拉取是 3s/10s 一次的周期性请求，静默期必须零写入。
-   * 返回是否发生了变更。
-   */
-  setMemberAcceptDispatch(peerId, accept) {
-    const id = String(peerId ?? '');
-    const data = this.#load();
-    const member = data.members[id];
-    if (!member || typeof member !== 'object') return false;
-    const next = accept !== false;
-    // 字段缺失时也写一次：让 group.json 里每个人都有**实数**（运维/面板要看得见）。
-    // 写一次之后值不变就不再落盘 —— 心跳 3s、pull 10s 一级的周期上报不会造成写放大。
-    if (member.acceptDispatch !== undefined && member.acceptDispatch !== false === next) return false;
-    member.acceptDispatch = next;
-    this.#save(data);
-    return true;
   }
 
   /** 这个 peerId 是否被运维移除过（自助 join 必须拒绝） */
@@ -2942,20 +2918,6 @@ export function createPeerServer(overrides = {}) {
   // v0.8.0：role 可以被**运行期提升**（按名入群拿到 grant 后原地变成员），所以是 let
   let groupRole = resolveGroupRole();
 
-  // -------------------------------------------------------------------------
-  // v0.8.2-α §4：本机「接单」开关（wire 字段 members[].acceptDispatch）
-  //
-  // 0.10.0-α 起群内派单能力已移除：运行期切换（面板/CLI 的 group/accept）与
-  // <stateDir>/group-dispatch-prefs.json 都不再存在，这里只剩**配置口径**——
-  // 老对端仍会自报这个字段，成员表与群状态视图照旧读得到它。
-  // -------------------------------------------------------------------------
-  const localAcceptDispatch = config.group.acceptDispatch === false
-    ? false
-    : GROUP_DEFAULT_ACCEPT_DISPATCH;
-
-  /** 本机接单开关（所有自报点与群状态视图都读这里） */
-  const acceptDispatchNow = () => localAcceptDispatch === true;
-
   /** §18：归档触发体积（默认 20 MB；overrides.groupArchive.bytes 只给测试压缩用） */
   const archiveBytesLimit = Number.isFinite(Number(overrides.groupArchive?.bytes))
     ? Math.max(1, Math.floor(Number(overrides.groupArchive.bytes)))
@@ -2973,11 +2935,6 @@ export function createPeerServer(overrides = {}) {
         logger: config.logger,
       })
     : null;
-
-  // v0.8.2-α §4：hub 自己那条成员的接单开关必须**落成实数**。
-  // 它收不到自己的心跳，若不在这里写，group.json 里就永远是 undefined；作者侧读到
-  // undefined 会按向后兼容当 true → not-accepting 永远触发不了（2026-11-01 真机复现）。
-  if (groupStore) groupStore.setMemberAcceptDispatch(store.instanceId, localAcceptDispatch);
 
   /**
    * S2：只有成员落盘副本；hub 的权威日志仍是 group.json。
@@ -3339,11 +3296,9 @@ export function createPeerServer(overrides = {}) {
     if (!keyFile) return null;
     const replica = replicaStore.state();
     const members = { ...keyFile.members };
-    // 自己那一行永远用本机实时开关（group-key.json 是从 hub 抄来的副本，可能是旧的）
     members[store.instanceId] = {
       ...(members[store.instanceId] ?? { name: config.name }),
       name: members[store.instanceId]?.name || config.name,
-      acceptDispatch: acceptDispatchNow(),
     };
     return {
       node: 'member',
@@ -4909,8 +4864,6 @@ export function createPeerServer(overrides = {}) {
         lastSeq: isSelf
           ? groupStore.state().lastSeq
           : (memberProgress.get(peerId)?.lastSeq ?? null),
-        // v0.8.2-α §4：接单开关（老对端缺字段 = true）。自己那一行读本机实时值。
-        acceptDispatch: isSelf ? acceptDispatchNow() : member?.acceptDispatch !== false,
       };
     });
   }
@@ -5854,24 +5807,6 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * v0.8.2-α §4：成员自报的接单开关（心跳 body / probe·pull 的 X-Peer-Accept）。
-   * hub 侧权威落盘进 group.json.members[].acceptDispatch；值缺失/垃圾一律忽略
-   * （「没报」≠「关闭」，也绝不把老对端当成不接单）。
-   */
-  function rememberMemberAcceptDispatch(peerId, raw) {
-    const value = parseAcceptFlag(raw);
-    if (value === null) return false;
-    const id = String(peerId ?? '');
-    if (id === '' || id === store.instanceId) return false;
-    if (!groupStore) return false;
-    const changed = groupStore.setMemberAcceptDispatch(id, value);
-    if (changed && config.logger) {
-      config.logger('[group] accept-dispatch from=' + shortPeerId(id) + ' value=' + (value ? 'on' : 'off'));
-    }
-    return changed;
-  }
-
-  /**
    * S2 成员复制进度（内存，不落盘）：peerId -> {lastSeq, at}。
    * 成员在 probe/pull 的 X-Peer-LastSeq 里自报，hub 只用来算「落后 leader 多少条」。
    * 刻意不写 group.json：每 10s 一次 pull 的写放大不值当，重启后重新上报即可。
@@ -5954,7 +5889,6 @@ export function createPeerServer(overrides = {}) {
         members[peerId] = {
           name: String(member?.name ?? '') || String(previous[peerId]?.name ?? ''),
           baseUrl: String(member?.baseUrl ?? '') || String(previous[peerId]?.baseUrl ?? ''),
-          acceptDispatch: member?.acceptDispatch !== false,
         };
       }
       if (Object.keys(members).length === 0) Object.assign(members, previous);
@@ -6071,7 +6005,6 @@ export function createPeerServer(overrides = {}) {
     const ctx = auth.ctx;
     rememberMemberBaseUrl(auth.peerId, headerValue(req, GROUP_BASE_HEADER.toLowerCase()));
     rememberMemberProgress(auth.peerId, headerValue(req, GROUP_LASTSEQ_HEADER.toLowerCase()));
-    rememberMemberAcceptDispatch(auth.peerId, headerValue(req, GROUP_ACCEPT_HEADER.toLowerCase()));
     const advertiseBaseUrl = localAdvertiseBaseUrl();
     if (config.logger) {
       config.logger(
@@ -6089,8 +6022,6 @@ export function createPeerServer(overrides = {}) {
         leaderPeerId: ctx.leaderPeerId,
         lastSeq: ctx.lastSeq,
         advertiseBaseUrl,
-        // v0.8.2-α §4：本机接单开关（对端据此判断能不能往我这派单）
-        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
@@ -6107,28 +6038,15 @@ export function createPeerServer(overrides = {}) {
         leaderPeerId: ctx.leaderPeerId,
         lastSeq: ctx.lastSeq,
         advertiseBaseUrl: localAdvertiseBaseUrl(),
-        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
-  }
-
-  /** v0.8.2-α §4：成员接单开关掩码（自己那一行用本机实时值，其余读成员表） */
-  function groupMemberAcceptMask(ctx) {
-    const mask = {};
-    for (const [peerId, member] of Object.entries(ctx?.members ?? {})) {
-      mask[peerId] = peerId === store.instanceId ? acceptDispatchNow() : member?.acceptDispatch !== false;
-    }
-    return mask;
   }
 
   function groupPull(req, rawBody, url, auth) {
     const ctx = auth.ctx;
     rememberMemberBaseUrl(auth.peerId, headerValue(req, GROUP_BASE_HEADER.toLowerCase()));
     rememberMemberProgress(auth.peerId, headerValue(req, GROUP_LASTSEQ_HEADER.toLowerCase()));
-    // follower 不心跳（心跳只由 leader 发），它唯一的周期自报渠道就是 pull：
-    // 接单开关也随这里上报，否则「关掉接单」要等下一次选举才传得到 hub。
-    rememberMemberAcceptDispatch(auth.peerId, headerValue(req, GROUP_ACCEPT_HEADER.toLowerCase()));
     const sinceSeq = readGroupSinceSeq(url);
     const limit = readGroupLimit(url);
     // hub 读权威日志，成员读本地副本（成员之间也能互相补差）
@@ -6157,10 +6075,6 @@ export function createPeerServer(overrides = {}) {
         votePlane: votePlaneView(),
         // 成员靠它把成员表刷新到最新（新成员加进来后不会一直判 not-a-member）
         memberIds: Object.keys(ctx.members),
-        memberAcceptDispatch: groupMemberAcceptMask(ctx),
-        // v0.8.2-α §4：接单开关随 pull 下发（只多这一张 id→bool 的小表）。
-        // 少了它，成员本地表永远停在默认值 true —— 作者侧前置检查读到旧值，
-        // 「hub 关单后成员派单」就照常执行（真机现象）。老端忽略该字段。
       },
       peerId: auth.peerId,
     };
@@ -6989,8 +6903,6 @@ export function createPeerServer(overrides = {}) {
       commitSeq: renewed.commitSeq,
       priority: hubPriority,
       selfBaseUrl: localAdvertiseBaseUrl(),
-      // v0.8.2-α §4：接单开关随心跳自报
-      acceptDispatch: acceptDispatchNow(),
       timeoutMs: peerTimeoutMs,
     };
     const results = await Promise.allSettled(targets.map((peerId) => withGroupKey((keyCtx) => sendGroupHeartbeat(withIdentity({
@@ -7178,7 +7090,6 @@ export function createPeerServer(overrides = {}) {
             candidate: store.instanceId,
             priority: hubPriority,
             selfBaseUrl: localAdvertiseBaseUrl(),
-            acceptDispatch: acceptDispatchNow(),
             timeoutMs: peerTimeoutMs,
           })));
           if (Number(reply?.epoch) > epoch && String(reply?.leaderPeerId ?? '') !== '') ahead = reply;
@@ -7466,8 +7377,6 @@ export function createPeerServer(overrides = {}) {
         keyVersion: groupKeyVersion(),
         degraded: isDegraded(),
         advertiseBaseUrl: localAdvertiseBaseUrl(),
-        // v0.8.2-α §4：本机接单开关（排障用，与心跳/probe 同一口径）
-        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
@@ -7491,7 +7400,6 @@ export function createPeerServer(overrides = {}) {
     // 少了这一笔，成员重启换端口后只有下一次 pull（测试里 600s 一次）才会纠正地址，
     // 期间 leader 的提案会打到旧地址上（表现：post 503 quorum-unavailable，而成员明明在线）。
     rememberMemberBaseUrl(auth.peerId, senderBaseUrl);
-    rememberMemberAcceptDispatch(auth.peerId, body.acceptDispatch);
     const st = ensureRole();
     if (!st) return { status: 404, body: { error: 'not-found' }, peerId: auth.peerId };
     // S2：心跳只能为**自己**续租。少了这条，任何握着群密钥的成员发一条心跳就能把
@@ -7559,8 +7467,6 @@ export function createPeerServer(overrides = {}) {
         ok: true,
         epoch: accepted.epoch,
         commitSeq: accepted.commitSeq,
-        // v0.8.2-α §4：本机接单开关（心跳是对端周期性学到它的渠道）
-        acceptDispatch: acceptDispatchNow(),
       },
       peerId: auth.peerId,
     };
@@ -7583,7 +7489,6 @@ export function createPeerServer(overrides = {}) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
     }
     rememberPeerBaseUrl(auth.peerId, headerValue(req, GROUP_BASE_HEADER.toLowerCase()));
-    rememberMemberAcceptDispatch(auth.peerId, body.acceptDispatch);
     peerPriorities.set(candidate, priority);
     const st = ensureRole();
     if (!st) return { status: 404, body: { error: 'not-found' }, peerId: auth.peerId };
@@ -8097,18 +8002,11 @@ export function createPeerServer(overrides = {}) {
    *
    * 名字与地址仍尽量沿用本地已知值（快照里通常没有），但**条目本身以权威快照为准**。
    */
-  function replaceGroupMembers(members, names = {}, accepts = null) {
+  function replaceGroupMembers(members, names = {}) {
     const existing = readGroupKeyFile(config.stateDir);
     if (!existing) return null;
     const previous = existing.members ?? {};
     const next = {};
-    const acceptOf = (id) => {
-      // v0.8.2-α §4：pull 带来的掩码是权威值；掩码没提这个成员就沿用本地已知值。
-      // 少了这一笔，每轮 pull 都会把成员的接单开关重置回默认 true（真机上就是
-      // 「hub 关了单、成员还在照派」）。
-      if (accepts && Object.prototype.hasOwnProperty.call(accepts, id)) return accepts[id] !== false;
-      return previous[id]?.acceptDispatch !== false;
-    };
     for (const peerId of members) {
       const id = String(peerId ?? '');
       if (id === '') continue;
@@ -8118,7 +8016,6 @@ export function createPeerServer(overrides = {}) {
       next[id] = {
         name: String(names[id]?.name ?? previous[id]?.name ?? ''),
         baseUrl,
-        acceptDispatch: acceptOf(id),
       };
     }
     if (Object.keys(next).length === 0) return null;
@@ -8126,7 +8023,6 @@ export function createPeerServer(overrides = {}) {
       next[store.instanceId] = {
         name: config.name,
         baseUrl: String(previous[store.instanceId]?.baseUrl ?? '') || localAdvertiseBaseUrl(),
-        acceptDispatch: acceptDispatchNow(),
       };
     }
     rememberAuthoritativeMembers(Object.keys(next), 'pull');
@@ -8156,8 +8052,6 @@ export function createPeerServer(overrides = {}) {
         members[peerId] = {
           name: String(member?.name ?? ''),
           baseUrl: String(member?.baseUrl ?? ''),
-          // v0.8.2-α §4：hub 的 state.members[].acceptDispatch 是权威值
-          acceptDispatch: member?.acceptDispatch !== false,
         };
       }
       if (!members[hub.peerId]) members[hub.peerId] = { name: hub.name, baseUrl: hub.baseUrl };
@@ -8598,8 +8492,6 @@ export function createPeerServer(overrides = {}) {
         selfBaseUrl: localAdvertiseBaseUrl(),
         // 自报复制进度：hub 的面板据此显示「落后 leader 多少条」
         lastSeq: sinceSeq,
-        // v0.8.2-α §4：follower 的周期自报渠道就是 pull（心跳只由 leader 发）
-        acceptDispatch: acceptDispatchNow(),
         timeoutMs: Math.max(1000, replicaPullMs),
       })));
       if (String(page?.groupId ?? '') !== String(ctx.groupId)) {
@@ -8626,7 +8518,7 @@ export function createPeerServer(overrides = {}) {
         );
       }
       if (Array.isArray(page.memberIds) && page.memberIds.length > 0) {
-        replaceGroupMembers(page.memberIds, ctx.members, page.memberAcceptDispatch ?? null);
+        replaceGroupMembers(page.memberIds, ctx.members);
       }
       // 0.10.0-α slice 4a：纪要搭同一次 pull 回来 —— 不新增轮询、不多发请求。
       // 成员只把它落进副本（rev 更大的才采纳），**永不回写** hub：纪要 hub 单写。
@@ -9973,15 +9865,6 @@ export function createPeerServer(overrides = {}) {
     });
   }
 
-  /**
-   * server.group 的「本机接单」读口（v0.8.2-α 契约 §4）。
-   * 0.10.0-α 起派单能力已移除：这里只保留 members[].acceptDispatch 这条 wire 字段的
-   * 读口径（由 config group.acceptDispatch 决定，运行期不再有切换入口）。
-   */
-  const dispatchFacade = {
-    acceptDispatch: () => acceptDispatchNow(),
-  };
-
   const discoveryFacade = {
     broadcast: (reason = 'manual') => broadcastGroupName({ manual: true, reason }),
     identity: () => localGroupIdentity(),
@@ -10029,7 +9912,6 @@ export function createPeerServer(overrides = {}) {
           isHub: true,
           ...s3Facade,
           ...discoveryFacade,
-          ...dispatchFacade,
           // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
           ...answerFacade,
           state: (options = {}) => groupStore.state(options),
@@ -10096,7 +9978,6 @@ export function createPeerServer(overrides = {}) {
           isHub: false,
           ...s3Facade,
           ...discoveryFacade,
-          ...dispatchFacade,
           // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
           ...answerFacade,
           // S2 成员侧：本地副本 + 拉取/推送入口（hub 端点仍在 hub 那边）。

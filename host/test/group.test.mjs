@@ -13,14 +13,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { makeTempStateDir, peerFixture, request, seedPeers, startServer, writeJson0600 } from './helpers.mjs';
-import { GroupStore } from '../server.mjs';
+import { GroupStore, resolveConfig } from '../server.mjs';
 import { decryptBytes } from '../../lib/wire-crypto.mjs';
 import {
+  decryptGroupJson,
+  deriveGroupKeys,
+  encryptGroupBody,
   fetchGroupHistory,
   fetchGroupState,
+  groupAuthHeaders,
   joinGroup,
   postGroup,
+  probeGroupPeer,
   readGroupEvents,
+  readGroupKeyFile,
+  writeGroupKeyFile,
 } from '../../lib/group-client.mjs';
 
 const MEMBER = peerFixture('peer-group-1');
@@ -695,4 +702,170 @@ test('§3 未知的 /v1/group/* → 404；已知路径用错方法 → 405', asy
   // /v1/health 宣告 group（老对端忽略）
   const health = await request(baseUrl, { path: '/v1/health', signed: false });
   assert.ok(health.json.capability.includes('group'));
+});
+
+// ---------------------------------------------------------------------------
+// 0.10.0-α：接单开关（members[].acceptDispatch / X-Peer-Accept）随群内派单一起移除。
+// 出站一律不再带；入站的老报文必须被**容忍并忽略**（不报错、不落盘、不改变状态）。
+// ---------------------------------------------------------------------------
+
+/** 群级签名请求（自己装配头与信封，好把老对端才会发的额外头注进去） */
+async function groupRequest(baseUrl, options = {}) {
+  const { groupKey, groupId, senderId, method = 'GET', apiPath, body, extraHeaders = {} } = options;
+  const { headers, plain } = groupAuthHeaders({ groupKey, groupId, senderId, method, apiPath, body });
+  const { bodyKey } = deriveGroupKeys(groupKey);
+  const wire = plain.length && method !== 'GET' && method !== 'HEAD'
+    ? Buffer.from(encryptGroupBody(bodyKey, plain), 'utf8')
+    : Buffer.alloc(0);
+  const res = await fetch(new URL(apiPath, baseUrl), {
+    method,
+    headers: { ...headers, ...extraHeaders, 'x-peer-enc': 'v1' },
+    body: wire.length ? wire : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    const parsed = JSON.parse(text);
+    json = parsed && parsed.enc === 'v1' && typeof parsed.data === 'string'
+      ? decryptGroupJson(bodyKey, parsed.data)
+      : parsed;
+  } catch {
+    /* 非 JSON 留给调用方看 text */
+  }
+  return { status: res.status, json, text };
+}
+
+test('C2 出站群请求不再自报接单开关：头里没有 X-Peer-Accept', async (t) => {
+  const { server } = await startHub(t);
+  const groupKey = server.group.state({ includeKey: true }).groupKey;
+  const groupId = server.group.state().groupId;
+
+  // 老调用方可能还在传这个参数（0.10.0-α 前 groupAuthHeaders 收它）：必须被无视，头不许再出现
+  const { headers } = groupAuthHeaders({
+    groupKey, groupId, senderId: MEMBER.peerId, method: 'GET', apiPath: '/v1/group/probe',
+    acceptDispatch: true,
+  });
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(headers, 'X-Peer-Accept'), false,
+    'v1 群级头里不许再有 X-Peer-Accept',
+  );
+
+  // 真实构造一次出站请求（fetch 换掉，只看它发出去的请求头）
+  const seen = [];
+  await probeGroupPeer({
+    baseUrl: 'http://127.0.0.1:1',
+    groupKey,
+    groupId,
+    senderId: MEMBER.peerId,
+    // 同上：老调用点的参数不许穿透到线上
+    acceptDispatch: false,
+    fetchImpl: async (url, init) => {
+      seen.push(init.headers);
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true }) };
+    },
+  });
+  assert.equal(seen.length, 1, 'probe 必须真的发出一次请求');
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(seen[0], 'X-Peer-Accept'), false,
+    '真实出站请求不许自报接单开关',
+  );
+  assert.equal(
+    Object.keys(seen[0]).some((name) => /peer-accept/i.test(name)), false,
+    '任何 accept 头都不该出现：' + Object.keys(seen[0]).join(','),
+  );
+});
+
+test('C3 兼容：老对端的 X-Peer-Accept 与 members[].acceptDispatch 一律被忽略', async (t) => {
+  const { server, baseUrl, stateDir } = await startHub(t);
+  server.group.addMember(MEMBER.peerId, 'member-box');
+  const groupKey = server.group.state({ includeKey: true }).groupKey;
+  const groupId = server.group.state().groupId;
+  const groupFile = path.join(stateDir, 'group.json');
+  const membersOf = () => JSON.parse(fs.readFileSync(groupFile, 'utf8')).members;
+
+  // ① 控制组：不带任何老字段的 probe / pull / post
+  const controlProbe = await groupRequest(baseUrl, { groupKey, groupId, senderId: MEMBER.peerId, apiPath: '/v1/group/probe' });
+  assert.equal(controlProbe.status, 200, controlProbe.text);
+  const controlPull = await groupRequest(baseUrl, { groupKey, groupId, senderId: MEMBER.peerId, apiPath: '/v1/group/pull?sinceSeq=0&limit=5' });
+  assert.equal(controlPull.status, 200, controlPull.text);
+  const controlPost = await groupRequest(baseUrl, { groupKey, groupId, senderId: MEMBER.peerId, method: 'POST', apiPath: '/v1/group/post', body: { kind: 'chat', text: 'control' } });
+  assert.equal(controlPost.status, 201, controlPost.text);
+  const before = JSON.stringify(membersOf());
+
+  // ② 老对端：header 自报「不接单」+ body 里带 members[].acceptDispatch=false
+  const legacyProbe = await groupRequest(baseUrl, {
+    groupKey, groupId, senderId: MEMBER.peerId, apiPath: '/v1/group/probe',
+    extraHeaders: { 'X-Peer-Accept': '0' },
+  });
+  assert.equal(legacyProbe.status, 200, '老对端的 X-Peer-Accept 不许让请求失败');
+  assert.equal(legacyProbe.json.ok, true);
+  assert.equal('acceptDispatch' in legacyProbe.json, false, 'probe 响应不许回灌 acceptDispatch');
+
+  const legacyPull = await groupRequest(baseUrl, {
+    groupKey, groupId, senderId: MEMBER.peerId, apiPath: '/v1/group/pull?sinceSeq=0&limit=5',
+    extraHeaders: { 'X-Peer-Accept': '0' },
+  });
+  assert.equal(legacyPull.status, 200);
+  assert.equal('memberAcceptDispatch' in legacyPull.json, false, 'pull 不再下发接单掩码');
+  assert.deepEqual(legacyPull.json.memberIds, controlPull.json.memberIds, '成员表一字不差');
+
+  const legacyPost = await groupRequest(baseUrl, {
+    groupKey, groupId, senderId: MEMBER.peerId, method: 'POST', apiPath: '/v1/group/post',
+    extraHeaders: { 'X-Peer-Accept': '0' },
+    // 老 hub 的 state/pull 载荷形状：members[].acceptDispatch 就夹在 body 里
+    body: { kind: 'chat', text: 'legacy echo', members: [{ peerId: MEMBER.peerId, acceptDispatch: false }] },
+  });
+  assert.equal(legacyPost.status, 201, '带老字段的 POST 照常受理');
+  assert.equal(typeof legacyPost.json.seq, 'number');
+
+  // ③ 状态一字未变：老字段既不落盘，也不改变任何成员记录
+  assert.equal(JSON.stringify(membersOf()), before, '老字段不许产生任何成员状态写入');
+  assert.equal(fs.readFileSync(groupFile, 'utf8').includes('acceptDispatch'), false, 'group.json 里不许出现 acceptDispatch');
+
+  // ④ 老 hub 的成员表（带 acceptDispatch）走进成员表漏斗后同样不落盘、不回显
+  const dir = makeTempStateDir();
+  try {
+    writeGroupKeyFile(dir, {
+      groupId, key: groupKey, keyVersion: 1,
+      members: { [MEMBER.peerId]: { name: 'old-box', baseUrl: '', acceptDispatch: false } },
+    });
+    assert.equal(
+      fs.readFileSync(path.join(dir, 'group-key.json'), 'utf8').includes('acceptDispatch'), false,
+      '成员表漏斗不许把老字段落盘',
+    );
+    const back = readGroupKeyFile(dir);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(back.members[MEMBER.peerId], 'acceptDispatch'), false,
+      '读回来的成员表也不许带 acceptDispatch',
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('C4 配置容错：group.acceptDispatch=false 照常加载、照常收发（没有任何效果）', async (t) => {
+  // 老配置文件的原文（既有配置里这条键不删）
+  const legacyConfig = JSON.parse('{"enabled":true,"name":"default","autoJoin":false,"retentionDays":7,"quorum":"none","acceptDispatch":false}');
+  const tempDir = makeTempStateDir();
+  try {
+    const config = resolveConfig({ stateDir: tempDir, group: legacyConfig });
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(config.group, 'acceptDispatch'), false,
+      '归一化后的配置不再保留这条键（读了既不抛错也没有效果）',
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+
+  const { server, baseUrl } = await startHub(t, { group: legacyConfig });
+  server.group.addMember(MEMBER.peerId, 'member-box');
+  const posted = await postMessage(baseUrl, { kind: 'chat', text: 'acceptDispatch=false 照常发送' });
+  assert.equal(posted.status, 201, '老配置不许让正常收发失败：' + posted.text);
+  assert.equal(posted.json.seq, 1);
+  for (const [peerId, member] of Object.entries(server.group.state().members)) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(member, 'acceptDispatch'), false,
+      '成员表仍带 acceptDispatch：' + peerId,
+    );
+  }
 });
