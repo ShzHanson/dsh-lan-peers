@@ -97,11 +97,9 @@ import {
   GROUP_BASE_HEADER,
   GROUP_DEFAULT_ACCEPT_DISPATCH,
   GROUP_DEFAULT_COMMIT_TIMEOUT_MS,
-  GROUP_DEFAULT_DISPATCH_RATE_MS,
   GROUP_DEFAULT_HEARTBEAT_MS,
   GROUP_DEFAULT_HUB_PRIORITY,
   GROUP_DEFAULT_REPLICA_PULL_MS,
-  GROUP_DISPATCH_SCOPE_FIELDS,
   GROUP_ELECTION_JITTER_MS,
   GROUP_ID_HEADER,
   GROUP_LASTSEQ_HEADER,
@@ -113,22 +111,17 @@ import {
   broadcastGroupAdvertisement,
   buildGroupCanonical,
   commitGroupMessage,
-  createGroupDispatcher,
   decryptGroupBody,
   deriveGroupKeys,
-  dispatchOptionsView,
   encryptGroupBody,
-  fetchDispatchOptions,
   fetchGroupState,
   groupCall,
-  groupDispatchSummary,
   joinGroup,
   // §8.3 出站接线：identity 的读取实现归客户端侧（同一个文件里 loadGroupIdentity 与 groupCall
   // 必须对同一份文件形状达成一致），服务端只调用它并缓存结果，不重写读盘逻辑。
   loadGroupIdentity,
   normalizeGroupName,
   parseAcceptFlag,
-  parseGroupDispatch,
   postGroup,
   postGroupWithGroupKey,
   proposeGroupMessage,
@@ -371,13 +364,18 @@ const GROUP_FILE = 'group.json';
 /** 尾部斜杠（地址归一化共用；写成常量是为了别在正则字面量里反复转义） */
 const TRAILING_SLASHES = /\/+$/;
 
-/** §3 kind 白名单 */
-export const GROUP_KINDS = Object.freeze(['chat', 'progress', 'result', 'system']);
+/**
+ * §3 kind 白名单。
+ * 0.10.0-α 起群内派单已移除：progress / result 不再被接受（新帖一律 400 bad-request），
+ * 但老群历史与归档里仍有这两种行 —— 读路径（history/pull/面板）必须照旧能渲染它们。
+ */
+export const GROUP_KINDS = Object.freeze(['chat', 'system']);
 
 /**
  * §3 meta 白名单：不在表里的字段在落盘前丢弃。
- * v0.8.2-α 追加 target/by/reason —— 群内派单的 progress/result 靠它们说明
- * 「谁派给谁、为什么没派成」；正文永远不进 meta。
+ * 0.10.0-α 起派单已移除：target/by/reason 与工作区三键不再收新值。
+ * phase/status/transport/elapsedMs/replyChars 保留 —— 老历史里的 progress/result 行
+ * 仍带这些字段，读路径要照旧显示它们。
  */
 export const GROUP_META_FIELDS = Object.freeze([
   'peer',
@@ -387,12 +385,6 @@ export const GROUP_META_FIELDS = Object.freeze([
   'transport',
   'elapsedMs',
   'replyChars',
-  'target',
-  'by',
-  'reason',
-  // 0.8.5-α 契约 §1：派单帖可以点名目标的工作区与权限档。白名单只放
-  // 「id / 名字 / 档位」三种标量 —— 任何像 path 的键都进不了群历史。
-  ...GROUP_DISPATCH_SCOPE_FIELDS,
 ]);
 
 /** meta 里的字符串字段上限（防止有人用 meta 夹带大块数据） */
@@ -416,12 +408,6 @@ export const GROUP_ARCHIVE_INDEX_LIMIT = 200;
 
 /** §18：归档目录名（<stateDir>/group-archive） */
 export const GROUP_ARCHIVE_DIR = 'group-archive';
-
-/**
- * v0.8.2-α §4：本机接单开关的运行期落盘文件（<stateDir>/group-dispatch-prefs.json）。
- * 刻意与 DSH profile 配置分开：profile 是用户手改过的文件，插件不回写。
- */
-export const GROUP_DISPATCH_PREFS_FILE = 'group-dispatch-prefs.json';
 
 /** v0.8.0-β §A1：失败选举的指数退避 base / 上限 / 抖动 */
 export const GROUP_ELECTION_BACKOFF_BASE_MS = 5_000;
@@ -590,8 +576,6 @@ export function normalizeGroupConfig(raw) {
   const heartbeatMs = Number(value.heartbeatMs);
   const commitMs = Number(value.commitTimeoutMs);
   const priority = Number(value.hubPriority);
-  // v0.8.2-α §2/§4：群内派单的两个旋钮（与 lib/group-client.mjs 的同名归一化保持一致）
-  const dispatchRateMs = Number(value.dispatchRateMs);
   return {
     enabled: value.enabled === true,
     hub: String(value.hub ?? '').trim(),
@@ -616,10 +600,6 @@ export function normalizeGroupConfig(raw) {
     hubPriority: Number.isFinite(priority) ? Math.floor(priority) : GROUP_DEFAULT_HUB_PRIORITY,
     // 本机是否接群内派单（缺省 true：老配置与老对端都按接单处理）
     acceptDispatch: value.acceptDispatch !== false,
-    // 同一目标的最小派单间隔；0 = 关闭限流（只允许显式配置成 0）
-    dispatchRateMs: Number.isFinite(dispatchRateMs) && dispatchRateMs >= 0
-      ? Math.floor(dispatchRateMs)
-      : GROUP_DEFAULT_DISPATCH_RATE_MS,
   };
 }
 
@@ -2502,30 +2482,17 @@ export function createPeerServer(overrides = {}) {
   let groupRole = resolveGroupRole();
 
   // -------------------------------------------------------------------------
-  // v0.8.2-α §4：本机「接单」开关（热生效）
+  // v0.8.2-α §4：本机「接单」开关（wire 字段 members[].acceptDispatch）
   //
-  // 配置 group.acceptDispatch 是**默认值来源**；运行期切换（面板/CLI 调
-  // server.group.setAcceptDispatch）落 <stateDir>/group-dispatch-prefs.json，启动时覆盖配置。
-  // 刻意不回写 DSH profile：那是用户手改过的文件，插件写坏一次就要人工修。
+  // 0.10.0-α 起群内派单能力已移除：运行期切换（面板/CLI 的 group/accept）与
+  // <stateDir>/group-dispatch-prefs.json 都不再存在，这里只剩**配置口径**——
+  // 老对端仍会自报这个字段，成员表与群状态视图照旧读得到它。
   // -------------------------------------------------------------------------
-  const groupPrefsPath = path.join(config.stateDir, GROUP_DISPATCH_PREFS_FILE);
+  const localAcceptDispatch = config.group.acceptDispatch === false
+    ? false
+    : GROUP_DEFAULT_ACCEPT_DISPATCH;
 
-  function readAcceptDispatchPref() {
-    try {
-      const raw = JSON.parse(fs.readFileSync(groupPrefsPath, 'utf8'));
-      return parseAcceptFlag(raw?.acceptDispatch);
-    } catch {
-      return null;
-    }
-  }
-
-  let localAcceptDispatch = (() => {
-    const pref = readAcceptDispatchPref();
-    if (pref !== null) return pref;
-    return config.group.acceptDispatch === false ? false : GROUP_DEFAULT_ACCEPT_DISPATCH;
-  })();
-
-  /** 本机接单开关（所有自报点与群状态视图都读这里，切换后立刻生效） */
+  /** 本机接单开关（所有自报点与群状态视图都读这里） */
   const acceptDispatchNow = () => localAcceptDispatch === true;
 
   /** §18：归档触发体积（默认 20 MB；overrides.groupArchive.bytes 只给测试压缩用） */
@@ -4244,6 +4211,8 @@ export function createPeerServer(overrides = {}) {
       return { status: 400, body: { error: 'bad-request' }, peerId };
     }
     const kind = String(body.kind ?? '');
+    // 0.10.0-α 起 progress/result 已不在白名单：老对端继续投这两种回执会被这里挡下，
+    // 返回 400 bad-request（刻意的破坏性变更，见版本说明）。
     if (!GROUP_KINDS.includes(kind)) return { status: 400, body: { error: 'bad-request' }, peerId };
     if (body.text != null && typeof body.text !== 'string') {
       return { status: 400, body: { error: 'bad-request' }, peerId };
@@ -4252,27 +4221,7 @@ export function createPeerServer(overrides = {}) {
     if (Array.from(text).length > GROUP_TEXT_MAX_CHARS) {
       return { status: 413, body: { error: 'payload-too-large' }, peerId };
     }
-    return { body: { kind, text, meta: postMetaOf(body) } };
-  }
-
-  /**
-   * 0.8.5-α 契约 §1：dispatch 帖可以在**顶层**带 workspaceId / permission / workspaceName，
-   * 它们随帖子进群历史（只存 id、名字、档位）。
-   *
-   * 三条口径：
-   *   1. 一个都没带 → 原样返回 body.meta（0.8.4 行为，连对象都不复制）；
-   *   2. 带了 → 并进 meta 的副本，不覆盖调用方显式写进 meta 的同名字段；
-   *   3. 值可以是任意类型：非标量的会被 sanitizeGroupMeta 丢弃（旧成员读到未知字段也只是忽略，
-   *      绝不抛错——这是「未知字段忽略」那条契约的实现位置）。
-   */
-  function postMetaOf(body) {
-    const scoped = GROUP_DISPATCH_SCOPE_FIELDS.some((field) => body[field] !== undefined);
-    if (!scoped) return body.meta;
-    const meta = body.meta && typeof body.meta === 'object' && !Array.isArray(body.meta) ? { ...body.meta } : {};
-    for (const field of GROUP_DISPATCH_SCOPE_FIELDS) {
-      if (body[field] !== undefined && meta[field] === undefined) meta[field] = body[field];
-    }
-    return meta;
+    return { body: { kind, text, meta: body.meta } };
   }
 
   /** S3 §5：写路径串行化（两种鉴权共用）—— 一次只让一条消息走 propose→commit */
@@ -8618,283 +8567,33 @@ export function createPeerServer(overrides = {}) {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // 0.8.5-α 契约 §4：群派单的工作区/权限门面（代理 options + 带范围的 post）
-  // -------------------------------------------------------------------------
-
-  /** 本机 peers.json 里的对端（peerId 优先，其次名字）：派单与代理都要真密钥 */
-  function peerForCall(wanted) {
-    const value = String(wanted ?? '').trim();
-    if (value === '') return null;
-    const list = groupPeersFull();
-    return list.find((peer) => String(peer?.peerId ?? '') === value)
-      ?? list.find((peer) => String(peer?.name ?? '') === value)
-      ?? null;
-  }
-
-  /** 目标写法（peerId / 名字 / 短 id）→ peerId；解析不到返回空串（只用于回填名字） */
-  function resolvePeerIdOf(wanted) {
-    const value = String(wanted ?? '').trim();
-    if (value === '') return '';
-    const peer = peerForCall(value);
-    if (peer) return String(peer.peerId ?? '');
-    const members = groupMembersMap() ?? {};
-    for (const peerId of Object.keys(members)) {
-      if (peerId === value || peerId.slice(0, 8) === value) return peerId;
-    }
-    for (const [peerId, member] of Object.entries(members)) {
-      if (String(member?.name ?? '') === value) return peerId;
-    }
-    return '';
-  }
-
-  /** 目标侧错误 → 协议 token（"403 permission-denied" → "permission-denied"）：绝不带地址 */
-  function shortPeerReason(error) {
-    const text = String(error?.message ?? error ?? '');
-    const match = /^(\d{3})\s*(\S*)/.exec(text);
-    if (!match) return 'unreachable';
-    return String(match[2] ?? '') || ('http-' + match[1]);
-  }
-
   /**
-   * 契约 §4 冻结门面：server.group.dispatchOptions(peerId)
+   * 冻结门面：server.group.post({ kind, text, meta })
    *
-   * 代理**目标**的 /v1/dispatch/options（per-peer 签名，既有通道，没有新信任面），
-   * 返回值再过一次 dispatchOptionsView：只留 id 与名字 —— path 在这一层被丢掉，
-   * 本机永远不知道（也不需要知道）成员的目录。
-   */
-  async function groupDispatchOptions(peerIdRaw) {
-    const peerId = String(peerIdRaw ?? '').trim();
-    const empty = { workspaces: [], defaultWorkspaceId: '', maxPermission: '' };
-    if (peerId === '') return { ok: false, error: 'bad-peer', ...empty };
-    const peer = peerForCall(peerId);
-    const baseUrl = String(peer?.baseUrl ?? '').trim().replace(TRAILING_SLASHES, '');
-    if (!peer || String(peer.secret ?? '') === '' || baseUrl === '') {
-      if (config.logger) config.logger('[group] dispatch options peer=' + shortPeerId(peerId) + ' state=unknown-peer');
-      return { ok: false, error: 'unknown-peer', ...empty };
-    }
-    try {
-      const raw = await fetchDispatchOptions({
-        baseUrl,
-        secret: String(peer.secret),
-        senderId: store.instanceId,
-        timeoutMs: 5_000,
-      });
-      const view = dispatchOptionsView(raw);
-      if (config.logger) {
-        config.logger('[group] dispatch options peer=' + shortPeerId(peerId)
-          + ' state=ok workspaces=' + view.workspaces.length
-          + ' max=' + (view.maxPermission === '' ? 'default' : view.maxPermission));
-      }
-      return { ok: true, ...view };
-    } catch (error) {
-      const reason = shortPeerReason(error);
-      if (config.logger) {
-        config.logger('[group] dispatch options peer=' + shortPeerId(peerId) + ' state=error reason=' + reason);
-      }
-      return { ok: false, error: reason, ...empty };
-    }
-  }
-
-  /**
-   * 工作区**名字**只能问目标本人（hub 也不知道成员的目录）。
-   * 取不到（离线/未接线/未知 id）就返回空串：回执回落显示 id，绝不阻塞派单。
-   */
-  async function workspaceNameOf(peerId, workspaceId) {
-    if (peerId === '' || workspaceId === '') return '';
-    const options = await groupDispatchOptions(peerId);
-    const hit = (options.workspaces ?? []).find((entry) => entry.id === workspaceId);
-    return hit ? String(hit.name ?? '') : '';
-  }
-
-  /**
-   * 契约 §4 冻结门面：server.group.post({ text, target?, workspaceId?, permission? })
-   *
-   * 关键向后兼容：**不带** target/workspaceId/permission 时逐字是 0.8.4 的行为 ——
-   * hub 直接写 group.json 并原样返回那条消息（同步）；既有调用方零改动。
-   * 唯一变化是写入语义补齐：以前只 append（只推进 lastSeq），现在走 commitLocalMessage，
-   * commitSeq 同步推进并进复制队列 —— 否则这条消息在群视图里永远「未提交」（真机 seq 74）。
-   * 带新字段才进「发帖 + 派单」链路，帖子与两条回执的 meta 都只带 id/名字/档位。
+   * 0.10.0-α 起群内派单已移除：即便老调用方还带 target/workspaceId/permission，
+   * 这三个字段也不再被读 —— 帖子照常落盘，返回值照旧是那条消息，没有任何派单副作用。
+   * 写入走 commitLocalMessage：commitSeq 同步推进并进复制队列 —— 否则这条消息在群视图里
+   * 永远「未提交」（真机 seq 74）。
    */
   function groupPostFacade(input = {}) {
     const value = input && typeof input === 'object' ? input : {};
-    const wantsDispatch = value.target !== undefined
-      || value.workspaceId !== undefined
-      || value.permission !== undefined;
-    if (!wantsDispatch) {
-      if (groupStore) return commitLocalMessage(value, { flush: false });
-      return postGroupReceipt({
-        peerId: store.instanceId,
-        name: config.name,
-        kind: String(value.kind ?? 'chat') || 'chat',
-        text: String(value.text ?? ''),
-        meta: value.meta ?? null,
-      });
-    }
-    return groupPostWithScope(value);
-  }
-
-  async function groupPostWithScope(input = {}) {
-    if (groupRole === 'off') {
-      return {
-        ...dispatchFacadeOff(),
-        seq: null,
-        workspace: null,
-        permission: null,
-        appliedPermission: null,
-        permissionHonored: false,
-        approvalId: null,
-      };
-    }
-    const workspaceId = typeof input.workspaceId === 'string' ? input.workspaceId.trim() : '';
-    const permission = typeof input.permission === 'string' ? input.permission.trim() : '';
-    const wantedTarget = String(input.target ?? '').trim();
-    const kind = String(input.kind ?? 'chat') || 'chat';
-    const text = String(input.text ?? '');
-    const targetId = resolvePeerIdOf(wantedTarget);
-    // 名字只能来自目标本人：拿不到就留空（回执显示 id），也绝不写 path
-    const workspaceName = await workspaceNameOf(targetId, workspaceId);
-    // 1. 发帖：dispatch 帖把自己的范围写进群历史（只此一次，回执也一样只带三键）
-    let seq = null;
-    let postError = null;
-    try {
-      const posted = await postGroupReceipt({
-        kind,
-        text,
-        meta: {
-          ...(targetId === '' ? {} : { target: targetId }),
-          ...(workspaceId === '' ? {} : { workspaceId }),
-          ...(workspaceName === '' ? {} : { workspaceName }),
-          ...(permission === '' ? {} : { permission }),
-        },
-      });
-      seq = posted?.seq ?? null;
-    } catch (error) {
-      // 帖子没发出去也照常派单：回执通道与帖子通道是两条，别让一条拖死另一条
-      postError = shortPeerReason(error);
-      if (config.logger) config.logger('[group] post failed kind=' + kind + ' reason=' + postError);
-    }
-    // 2. 派单（前置检查、透传 /v1/ask、两条回执都在派单器里）。
-    // 调用方点名了目标时要把任务正文从「@!目标 任务」里切出来：派单器拿到显式 target 后
-    // 就不再自己解析 @!，正文原样传过去会把标记一起发走。
-    const parsed = parseGroupDispatch(text, []);
-    const task = parsed.matched ? parsed.task : text;
-    const full = await dispatchFacade.dispatchWithReply({
-      text,
-      ...(wantedTarget === '' ? {} : { target: wantedTarget, task }),
-      ...(workspaceId === '' ? {} : { workspaceId }),
-      ...(workspaceName === '' ? {} : { workspaceName }),
-      ...(permission === '' ? {} : { permission }),
+    if (groupStore) return commitLocalMessage(value, { flush: false });
+    return postGroupReceipt({
+      peerId: store.instanceId,
+      name: config.name,
+      kind: String(value.kind ?? 'chat') || 'chat',
+      text: String(value.text ?? ''),
+      meta: value.meta ?? null,
     });
-    const summary = groupDispatchSummary(full);
-    return { ...summary, seq, ...(postError === null ? {} : { postError }) };
-  }
-
-  let groupDispatcher = null;
-
-  /** 派单器单例：限流表与 dispatchState 必须全进程一份 */
-  function dispatcher() {
-    if (!groupDispatcher) {
-      groupDispatcher = createGroupDispatcher({
-        config,
-        peers: () => groupPeersFull(),
-        self: () => ({ instanceId: store.instanceId, name: config.name }),
-        post: (payload) => postGroupReceipt(payload),
-        memberView: () => groupMembersMap(),
-        log: config.logger,
-        now: () => config.now(),
-      });
-    }
-    return groupDispatcher;
-  }
-
-  /** 本机群功能是否可用（关闭时派单直接回 group-disabled，而不是静默什么都不做） */
-  function dispatchFacadeOff() {
-    return {
-      status: 'failed',
-      reason: 'group-disabled',
-      target: null,
-      targetName: null,
-      elapsedMs: 0,
-      replyChars: 0,
-    };
   }
 
   /**
-   * v0.8.2-α §4：切换本机接单开关（热生效）。
-   * 落 <stateDir>/group-dispatch-prefs.json —— 写成功即 persisted=true；
-   * 写不了也必须在**本进程**立刻生效，并如实回 persisted=false。
+   * server.group 的「本机接单」读口（v0.8.2-α 契约 §4）。
+   * 0.10.0-α 起派单能力已移除：这里只保留 members[].acceptDispatch 这条 wire 字段的
+   * 读口径（由 config group.acceptDispatch 决定，运行期不再有切换入口）。
    */
-  function setAcceptDispatch(value) {
-    const next = value === true || value === 1 || String(value).trim().toLowerCase() === 'true';
-    localAcceptDispatch = next;
-    config.group.acceptDispatch = next;
-    if (groupStore) groupStore.setMemberAcceptDispatch(store.instanceId, next);
-    // hub 自己也是成员：本机切换必须立刻落进自己那条 members[]，
-    // 否则别的节点（经 pull 掩码 / 群状态）永远读不到这次关闭。
-    let persisted = false;
-    try {
-      writeJson0600(groupPrefsPath, { acceptDispatch: next, updatedAt: new Date(config.now()).toISOString() });
-      persisted = true;
-    } catch (error) {
-      if (config.logger) {
-        config.logger('[group] accept-dispatch persist failed: ' + String(error?.message ?? error));
-      }
-    }
-    if (config.logger) {
-      config.logger('[group] accept-dispatch local=' + (next ? 'on' : 'off') + ' persisted=' + persisted);
-    }
-    return { acceptDispatch: next, persisted };
-  }
-
   const dispatchFacade = {
-    /**
-     * **冻结签名**（Lane Y 的面板/CLI 消费）：
-     * dispatch({ target, task }) 或 dispatch({ text })（作者侧解析 @!）
-     *   → { status: 'done'|'failed'|'skipped', reason, target, targetName, elapsedMs, replyChars }
-     * **只返回摘要**：reply 正文在这里被剥掉，群历史里也只有摘要。
-     */
-    dispatch: async (input = {}) => {
-      if (groupRole === 'off') return dispatchFacadeOff();
-      return groupDispatchSummary(await dispatcher().dispatch(input ?? {}));
-    },
-    /**
-     * 内部入口：返回**含 reply** 的完整结果。
-     * 只允许 lan_group_ask 工具使用 —— 不得经由任何管理接口或 HTTP 路由暴露；
-     * 面板与 CLI 只能拿到 dispatch() 的摘要（契约 §3：正文只回发起方）。
-     */
-    dispatchWithReply: async (input = {}) => {
-      if (groupRole === 'off') {
-        return {
-          dispatched: false,
-          ok: false,
-          status: 'failed',
-          reason: 'group-disabled',
-          target: null,
-          targetName: null,
-          sessionId: '',
-          reply: '',
-          replyChars: 0,
-          elapsedMs: 0,
-          multiTarget: false,
-          unknownTarget: false,
-          group: { progressSeq: null, resultSeq: null, error: 'group-disabled' },
-        };
-      }
-      return dispatcher().dispatch(input ?? {});
-    },
-    /** 冻结签名：{ lastTarget, lastAt, inFlight }（只读；群关闭时是空快照） */
-    dispatchState: () => (groupRole === 'off'
-      ? { lastTarget: null, lastAt: 0, inFlight: false }
-      : dispatcher().state()),
-    setAcceptDispatch: (value) => setAcceptDispatch(value),
-    /** 本机接单开关（面板/群状态同一口径） */
     acceptDispatch: () => acceptDispatchNow(),
-    /**
-     * 契约 §4：代理**目标**的派单设置（只有 id 与名字，无 path）。
-     * 入参是 peerId 或名字；出参 { ok, workspaces, defaultWorkspaceId, maxPermission }。
-     */
-    dispatchOptions: (peerId) => groupDispatchOptions(peerId),
   };
 
   const discoveryFacade = {

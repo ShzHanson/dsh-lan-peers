@@ -21,7 +21,6 @@ import {
   GROUP_AUTH_VALUE,
   GROUP_ID_HEADER,
   GROUP_BASE_HEADER,
-  createGroupMirror,
   decryptGroupJson,
   deriveGroupKeys,
   encryptGroupBody,

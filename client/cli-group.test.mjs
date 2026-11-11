@@ -126,14 +126,14 @@ test('group post 发消息、group history 取回来（--since / --limit 生效�
   assert.equal(first.status, 0, first.stderr);
   assert.match(first.stdout, /^已发送 seq=1 ts=\d{4}-\d{2}-\d{2}T/m);
 
-  const second = await runAsync(['group', 'post', '--text', '第二条', '--kind', 'progress', '--peer', 'hub', '--state-dir', dir]);
+  const second = await runAsync(['group', 'post', '--text', '第二条', '--kind', 'system', '--peer', 'hub', '--state-dir', dir]);
   assert.equal(second.status, 0, second.stderr);
   assert.match(second.stdout, /已发送 seq=2/);
 
   const history = await runAsync(['group', 'history', '--peer', 'hub', '--state-dir', dir]);
   assert.equal(history.status, 0, history.stderr);
   assert.match(history.stdout, /^#1 \d{4}-\d{2}-\d{2}T[\d:.]+Z .+ \[chat\] 第一条 CLI 消息$/m);
-  assert.match(history.stdout, /\[progress\] 第二条/);
+  assert.match(history.stdout, /\[system\] 第二条/);
   assert.match(history.stderr, /2 条 · lastSeq=2/);
 
   const since = await runAsync(['group', 'history', '--since', '1', '--peer', 'hub', '--state-dir', dir]);
@@ -247,7 +247,7 @@ test('group 参数与配置错误：缺 --peer、未知对端、超长 text、�
 
   const badKind = await runAsync(['group', 'post', '--text', 'hi', '--kind', 'shout', '--peer', 'hub', '--state-dir', dir]);
   assert.equal(badKind.status, 1);
-  assert.match(badKind.stderr, /--kind 必须是 chat \/ progress \/ result \/ system/);
+  assert.match(badKind.stderr, /--kind 必须是 chat \/ system/);
 
   const badSub = runFailing(['group', 'nope', '--state-dir', dir]);
   assert.equal(badSub.status, 1);

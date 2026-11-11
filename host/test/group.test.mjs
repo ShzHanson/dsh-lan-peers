@@ -16,7 +16,6 @@ import { makeTempStateDir, peerFixture, request, seedPeers, startServer, writeJs
 import { GroupStore } from '../server.mjs';
 import { decryptBytes } from '../../lib/wire-crypto.mjs';
 import {
-  createGroupMirror,
   fetchGroupHistory,
   fetchGroupState,
   joinGroup,
@@ -207,7 +206,7 @@ test('§3 post 校验：非法 kind 400、text 超 4000 → 413、meta 只留白
   assert.equal(exact.status, 201, '正好 4000 字符必须放行');
 
   const meta = await postMessage(baseUrl, {
-    kind: 'result',
+    kind: 'chat',
     text: 'done/12ms/3字',
     meta: {
       peer: 'nas-box',
@@ -230,6 +229,20 @@ test('§3 post 校验：非法 kind 400、text 超 4000 → 413、meta 只留白
   ]);
   assert.equal(stored.meta.elapsedMs, 12);
   assert.deepEqual(Object.keys(stored).sort(), ['from', 'kind', 'meta', 'seq', 'text', 'ts']);
+});
+
+test('§3 0.10.0-α：progress / result 已不在 kind 白名单 → 400 bad-request（老行仍可读）', async (t) => {
+  const { baseUrl } = await startHub(t, { group: { enabled: true, autoJoin: true } });
+  await asMember(baseUrl, { method: 'POST', path: '/v1/group/join', body: {} });
+
+  for (const kind of ['progress', 'result']) {
+    const refused = await postMessage(baseUrl, { kind, text: '' });
+    assert.equal(refused.status, 400, kind + ' 必须被拒（破坏性变更，见版本说明）');
+    assert.equal(refused.json.error, 'bad-request');
+  }
+  // 一条都没落盘：被拒的帖子不会进群历史
+  const history = await asMember(baseUrl, { path: '/v1/group/history' });
+  assert.equal(history.json.messages.length, 0);
 });
 
 test('§3 加密门控：未带 X-Peer-Enc → 400；带了 → 成员响应是 enc 信封且可解密', async (t) => {
@@ -588,7 +601,7 @@ test('§3 /v1/group/events：逐帧可解密、seq 递增、每 10s 有 ping 帧
   });
 
   // 流开着的时候再发一条：既验证「先补发历史」，也验证「轮询追加」
-  const live = await postMessage(baseUrl, { kind: 'progress', meta: { phase: 'start', status: 'running' } });
+  const live = await postMessage(baseUrl, { kind: 'chat', text: '流开着时的新消息' });
   assert.equal(live.status, 201, live.text);
 
   const frames = await readFrames(res, MEMBER.inboundSecret, { wantPing: true });
@@ -596,7 +609,7 @@ test('§3 /v1/group/events：逐帧可解密、seq 递增、每 10s 有 ping 帧
   assert.ok(messages.length >= 2, '历史 + 新消息都要出现');
   assert.deepEqual(messages.map((message) => message.seq), messages.map((message) => message.seq).slice().sort((a, b) => a - b));
   assert.equal(messages[0].text, '历史里的旧消息');
-  assert.equal(messages.at(-1).kind, 'progress');
+  assert.equal(messages.at(-1).kind, 'chat');
   assert.ok(frames.some((frame) => frame.event === 'ping'), '要有 ping 心跳帧（带加密载荷）');
 
   // 断流后用 sinceSeq 续传：只补没见过的
@@ -659,107 +672,6 @@ test('§3 lib/group-client：state/post/history/readGroupEvents 端到端（真 
   const bounded = await readGroupEvents({ ...target, sinceSeq: live.seq, untilSeq: live.seq + 1, timeoutMs: 3000 });
   assert.equal(bounded.ok, true);
   assert.equal(bounded.lastSeq, live.seq + 1);
-});
-
-// ---------------------------------------------------------------------------
-// §6 进度镜像
-// ---------------------------------------------------------------------------
-
-test('§6 进度镜像：start/finish 两条落进群，且不含 prompt 原文与回复全文', async (t) => {
-  const hubState = makeTempStateDir();
-  seedPeers(hubState, [MEMBER]);
-  const { baseUrl: hubUrl, server: hub } = await startServer(t, {
-    stateDir: hubState,
-    allowRemotePrompts: true,
-    // S3：镜像用例同样固定 quorum:none（写本地即提交，与 v0.5 语义一致）
-    group: { enabled: true, autoJoin: true, quorum: 'none' },
-  });
-  hub.group.addMember(MEMBER.peerId, MEMBER.name);
-
-  // 成员侧 state-dir：identity + 到 hub 的配对记录（hub 用 MEMBER.inboundSecret 验签）
-  const memberDir = makeTempStateDir();
-  t.after(() => fs.rmSync(memberDir, { recursive: true, force: true }));
-  writeJson0600(path.join(memberDir, 'state.json'), {
-    instanceId: MEMBER.peerId,
-    name: MEMBER.name,
-    createdAt: new Date().toISOString(),
-  });
-  writeJson0600(path.join(memberDir, 'peers.json'), {
-    peers: {
-      [hub.store.instanceId]: {
-        name: 'hub',
-        baseUrl: hubUrl,
-        secret: MEMBER.inboundSecret,
-        inboundSecret: 'unused',
-        addedAt: new Date().toISOString(),
-        lastSeen: null,
-      },
-    },
-  });
-
-  const logged = [];
-  const mirror = createGroupMirror({
-    config: { stateDir: memberDir, group: { enabled: true, hub: 'hub' } },
-    peers: [{ peerId: hub.store.instanceId, name: 'hub', baseUrl: hubUrl, secret: MEMBER.inboundSecret }],
-    self: { instanceId: MEMBER.peerId, name: MEMBER.name },
-    log: (line) => logged.push(String(line)),
-  });
-  assert.equal(mirror.enabled, true, 'group.enabled 且配了 hub 才启用镜像');
-  assert.equal(mirror.hub.name, 'hub');
-
-  const started = await mirror.start({ peer: 'nas-box', sessionId: 'session-1' });
-  assert.equal(started.ok, true);
-  const finished = await mirror.finish({
-    peer: 'nas-box',
-    sessionId: 'session-1',
-    status: 'done',
-    transport: 'sse',
-    elapsedMs: 1227,
-    replyChars: 142,
-  });
-  assert.equal(finished.ok, true);
-
-  const messages = hub.group.history({ sinceSeq: 0, limit: 10 });
-  assert.deepEqual(messages.map((message) => message.kind), ['progress', 'result']);
-  assert.deepEqual(messages[0].meta, { peer: 'nas-box', sessionId: 'session-1', phase: 'start', status: 'running' });
-  assert.equal(messages[0].text, '', '开始那条不带 text');
-  assert.equal(messages[1].text, 'done/1227ms/142字');
-  assert.deepEqual(messages[1].meta, {
-    peer: 'nas-box',
-    sessionId: 'session-1',
-    status: 'done',
-    transport: 'sse',
-    elapsedMs: 1227,
-    replyChars: 142,
-  });
-  // 契约 §6：绝不发 prompt 原文与回复全文 —— 两条消息的正文里都没有它们
-  const serialized = JSON.stringify(messages);
-  assert.ok(!serialized.includes('把这段原文'), '不能出现 prompt 原文');
-  assert.equal(logged.length, 0, '成功时不该有失败日志');
-
-  // 投递失败只记日志，不抛：未知 hub → 不启用；不可达 hub → {ok:false} + 一行日志
-  const unconfigured = createGroupMirror({
-    config: { group: { enabled: true, hub: 'nobody' } },
-    peers: [],
-    self: { instanceId: MEMBER.peerId },
-    log: (line) => logged.push(String(line)),
-  });
-  assert.equal(unconfigured.enabled, false);
-  assert.equal((await unconfigured.start({ peer: 'x', sessionId: 'y' })).ok, false);
-  assert.equal((await unconfigured.finish({ peer: 'x', sessionId: 'y', status: 'done', elapsedMs: 1 })).ok, false);
-
-  const failing = createGroupMirror({
-    config: { group: { enabled: true, hub: 'dead' } },
-    peers: [{ peerId: 'dead', name: 'dead', baseUrl: 'http://127.0.0.1:1', secret: 'S' }],
-    self: { instanceId: MEMBER.peerId },
-    log: (line) => logged.push(String(line)),
-    timeoutMs: 500,
-  });
-  assert.equal(failing.enabled, true);
-  const failed = await failing.finish({ peer: 'x', sessionId: 'y', status: 'error', elapsedMs: 5, replyChars: 0 });
-  assert.equal(failed.ok, false);
-  assert.equal(logged.length, 1, '失败只记一行日志');
-  assert.match(logged[0], /^\[group\] mirror failed kind=result: /);
 });
 
 // ---------------------------------------------------------------------------

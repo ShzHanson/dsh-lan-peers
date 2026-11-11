@@ -30,9 +30,7 @@ import {
   SESSION_REUSE_MS_MIN,
   SESSION_REUSE_TTL_KEY,
 } from '../lib/session-reuse-prefs.mjs';
-// v0.8.2-α（契约 §1/§5）：@! 的解析口径与面板共用一份 —— 解析属于协议，不属于某一端。
 // 面板在管理接口里解析，CLI 在发完消息后解析，两边落在同一个函数上。
-import { parseGroupDispatchCommand } from '../lib/admin.mjs';
 import {
   GROUP_APPLY_POLL_INTERVAL_MS,
   GROUP_APPLY_POLL_TIMEOUT_MS,
@@ -644,77 +642,7 @@ async function cmdGroupState(dir, args) {
   console.log(L('cli.group.groupKeyLine', { value: L('cli.group.groupKeyOnDisk') }));
 }
 
-/**
- * 契约 §3 的回执摘要（CLI 口径，与面板同形）：派单 → 目标：done/failed（reason / 耗时 / 字数）。
- * skipped 是第三种终态：这条消息没有 @! 目标 —— 零消息写入，不能说成完成也不能说成失败。
- */
-function formatDispatchLine(dispatch) {
-  const data = dispatch && typeof dispatch === 'object' ? dispatch : {};
-  const status = String(data.status ?? '');
-  const who = String(data.targetName ?? '') || String(data.target ?? '') || '—';
-  if (status === 'skipped') return L('cli.group.dispatchSkipped', { reason: String(data.reason ?? 'no-target') });
-  // M1：同名歧义是「用户得先选一个」，不是网络错误 —— 给出可操作的重发语法。
-  if (status === 'failed' && String(data.reason ?? '') === 'ambiguous') {
-    return L('cli.group.dispatchAmbiguous', { who });
-  }
-  const parts = [];
-  // done 也可能带 reason（契约 §1：多个 @! 只取第一个，reason=multi-target-ignored）。
-  const reason = String(data.reason ?? '');
-  if (reason !== '') parts.push(reason);
-  else if (status !== 'done') parts.push('error');
-  const elapsed = Number(data.elapsedMs);
-  if (Number.isFinite(elapsed) && elapsed >= 0) parts.push(Math.round(elapsed) + 'ms');
-  const chars = Number(data.replyChars);
-  if (Number.isFinite(chars) && chars >= 0) parts.push(L('cli.group.dispatchChars', { chars: Math.round(chars) }));
-  return L('cli.group.dispatchLine', {
-    who,
-    status: status === 'done' ? 'done' : 'failed',
-    detail: parts.length ? L('cli.group.dispatchDetail', { parts: parts.join(' / ') }) : '',
-  });
-}
-
-/**
- * 契约 §5：作者侧派单的执行口 = 本机回环的 POST /api/lan-peers/group/dispatch。
- * 派单要开 1:1 会话、要往群里写 progress/result，只有本机 host 做得到；CLI 直连 hub
- * 发消息，所以这里必须再打一次本机管理接口。
- *
- * 本机没有 host（纯 CLI 节点、host 没起）→ **如实报错并 exit 2**：
- * 静默把 "@!X 任务" 当成一条普普通通的群消息发出去，是最坏的一种失败。
- */
-async function triggerDispatch(args, command) {
-  let url = '';
-  let out;
-  try {
-    url = resolveAdminUrl(stateDir(args), args);
-    out = await adminCall(url, 'group/dispatch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        target: command.target,
-        task: command.task,
-        extraTargets: command.extraTargets,
-      }),
-    }, stateDir(args));
-  } catch (error) {
-    const reason = String(error?.message ?? error);
-    process.stderr.write(L('cli.group.dispatchNotTriggered', {
-      url: url || L('cli.common.localAdmin'),
-      reason,
-    }) + '\n');
-    process.exitCode = 2;
-    return;
-  }
-  const dispatch = out && out.dispatch && typeof out.dispatch === 'object' ? out.dispatch : null;
-  if (!dispatch) {
-    process.stderr.write(L('cli.group.dispatchNoSummary') + '\n');
-    process.exitCode = 2;
-    return;
-  }
-  console.log(formatDispatchLine(dispatch));
-  if (dispatch.status === 'failed') process.exitCode = 1;
-}
-
-/** 发一条群消息（post 与 dispatch 共用）；作者侧在 POST 之后按契约 §1 解析 @! 并派单。 */
+/** 发一条群消息（作者侧只负责投递；0.10.0-α 起群内派单已移除，不再有派单副作用）。 */
 async function postGroupText(dir, args, text) {
   if (!text) throw new Error(L('cli.help.group'));
   if (Array.from(text).length > GROUP_TEXT_MAX_CHARS) {
@@ -738,58 +666,11 @@ async function postGroupText(dir, args, text) {
     ts: new Date(Number(sent.ts)).toISOString(),
     channel: channel.mode === 'group' ? L('cli.group.sentViaGroupKey', { baseUrl: channel.key.baseUrl }) : '',
   }));
-  // 只有 chat 参与解析：progress/result 本身就是回执，再解析一遍等于自己派自己。
-  if (kind !== 'chat') return;
-  const command = parseGroupDispatchCommand(text);
-  if (!command) return;
-  await triggerDispatch(args, command);
 }
 
 async function cmdGroupPost(dir, args) {
   const text = String(args.text ?? args._.slice(1).join(' ') ?? '').trim();
   await postGroupText(dir, args, text);
-}
-
-/** 契约 §5：显式入口 —— 等价发一条 "@!目标 任务" 再派单（消息先入库，回执摘要打印出来）。 */
-async function cmdGroupDispatch(dir, args) {
-  const target = String(args._[1] ?? '').trim();
-  const task = args._.slice(2).join(' ').trim() || String(args.text ?? '').trim();
-  if (target === '' || task === '') {
-    throw new Error(L('cli.group.dispatchUsage') + '\n' + L('cli.help.group'));
-  }
-  await postGroupText(dir, args, '@!' + target + ' ' + task);
-}
-
-/** 契约 §4/§5：切换本机接单开关（写 profile 配置、热生效；结果以 host 回的为准）。 */
-async function cmdGroupAccept(dir, args) {
-  const wanted = String(args._[1] ?? '').trim().toLowerCase();
-  const value = wanted === 'on' ? true : (wanted === 'off' ? false : null);
-  if (value === null) {
-    throw new Error(L('cli.group.acceptUsage') + '\n' + L('cli.help.group'));
-  }
-  let url = '';
-  let out;
-  try {
-    url = resolveAdminUrl(dir, args);
-    out = await adminCall(url, 'group/accept', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ acceptDispatch: value }),
-    }, dir);
-  } catch (error) {
-    const reason = String(error?.message ?? error);
-    process.stderr.write(L('cli.group.acceptFailed', {
-      url: url || L('cli.common.localAdmin'),
-      reason,
-    }) + '\n');
-    process.exitCode = /^(40[39]|501)\b/.test(reason) ? 2 : 1;
-    return;
-  }
-  const applied = !(out && out.acceptDispatch === false);
-  console.log(L('cli.group.acceptLine', {
-    state: applied ? L('cli.group.acceptOn') : L('cli.group.acceptOff'),
-    extra: out && out.persisted === false ? L('cli.group.acceptEphemeral') : '',
-  }));
 }
 
 async function cmdGroupHistory(dir, args) {
@@ -1469,8 +1350,6 @@ async function cmdGroup(args) {
   const handlers = {
     state: cmdGroupState,
     post: cmdGroupPost,
-    dispatch: cmdGroupDispatch,
-    accept: cmdGroupAccept,
     history: cmdGroupHistory,
     tail: cmdGroupTail,
     join: cmdGroupJoin,
