@@ -40,6 +40,42 @@ const POLL_BACKOFF_BASE_MS = 500;
 const POLL_BACKOFF_CAP_MS = 4_000;
 /** 4xx 里仍然可重试的：408 超时说话不算话，429 就是让你退避重试。 */
 const RETRYABLE_4XX = new Set([408, 429]);
+/**
+ * 「对端现在就不在」这一类：重试不会变好，只会把 1s 的报错拖成 5~15 分钟的假死，
+ * 用户看到的就是「lan_peer 卡住了」。连续这么多次就收手：第一次吸收毛刺
+ * （对端刚重启、一次丢包），第二次还拒就连共识都算不上——它就是不在了。
+ */
+const DEAD_PEER_STREAK = 2;
+const OFFLINE_CODES = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EPIPE',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENETDOWN',
+  'EADDRNOTAVAIL',
+]);
+
+/**
+ * 传输层分类：返回让这次失败「确定性」的那个 errno，没有就返回 null（= 值得重试）。
+ * 只被 callPeer 抛出的错误调用；带 status 的已经是 HTTP 层，交给 fatal 分支。
+ */
+function offlineCodeOf(error) {
+  if (Number(error?.status)) return null;
+  const codes = [];
+  for (let e = error, hop = 0; e && hop < 4; e = e.cause, hop += 1) {
+    if (e.code) codes.push(String(e.code));
+    // happy-eyeballs 失败时 cause 是 AggregateError，每个地址一个 code
+    if (Array.isArray(e.errors)) for (const inner of e.errors.slice(0, 4)) if (inner?.code) codes.push(String(inner.code));
+  }
+  return (
+    codes.find(
+      (code) => OFFLINE_CODES.has(code) || /^(ERR_TLS_|CERT_|UNABLE_TO_|ERR_SSL_|EPROTO)/.test(code),
+    ) ?? null
+  );
+}
 const PROBE_TTL_MS = 30_000;
 const probeCache = new Map();
 
@@ -229,6 +265,7 @@ export async function awaitPeerAnswer({
   let attempts = 0;
   let lastError = null;
   let sawRunning = false;
+  let offlineStreak = 0;
   let backoffMs = 0;
   // first 保证：流没给出确定答案时，即使已经过了 deadline 也务必问一次 /v1/answer。
   for (let first = true; first || Date.now() < deadline; first = false) {
@@ -265,6 +302,23 @@ export async function awaitPeerAnswer({
           terminal: true,
         };
       }
+      // 确定性掉线（ECONNREFUSED / DNS / 主机不可达 / TLS）：连续 DEAD_PEER_STREAK
+      // 次就认定对端不在，立刻报错，不要拿整份预算陪它耗。
+      const offlineCode = offlineCodeOf(error);
+      if (offlineCode) {
+        offlineStreak += 1;
+        if (offlineStreak >= DEAD_PEER_STREAK) {
+          return {
+            status: 'error',
+            error: `${message(error) || 'peer-offline'} (${offlineCode})`,
+            elapsedMs: Date.now() - startedAt,
+            transport,
+            sessionId,
+            attempts,
+            offline: true,
+          };
+        }
+      }
       // 只有传输层故障和 408/429 走重试；退避封顶，快失败的服务端也打不穿。
       lastError = message(error);
       backoffMs = backoffMs ? Math.min(backoffMs * 2, POLL_BACKOFF_CAP_MS) : POLL_BACKOFF_BASE_MS;
@@ -274,6 +328,8 @@ export async function awaitPeerAnswer({
       await sleep(Math.min(backoffMs, left), signal);
       continue;
     }
+    // 拿到任何一次真实响应就说明对端活着：掉线计数清零（中途掉线照样享有完整重试）。
+    offlineStreak = 0;
     const took = Date.now() - startedCall;
     const elapsedMs = Number(answer?.elapsedMs) || Date.now() - startedAt;
     if (answer?.status === 'done') {

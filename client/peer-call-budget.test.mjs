@@ -173,3 +173,74 @@ test('T7 常量与不变量自检（供 B1 引用）', () => {
   assert.equal(STREAM_RESERVE_MS, 30_000);
   assert.equal(STREAM_CAP_MS, 300_000);
 });
+
+// ---- 掉线回归：确定性失败连续 N 次就收手，别拿整份预算陪死对端 ----
+
+/** 仿 undici：TypeError('fetch failed', { cause: <errno> })。 */
+const offlineError = (code = 'ECONNREFUSED') => {
+  const inner = Object.assign(new Error(`connect ${code} 127.0.0.1:1`), { code });
+  return Object.assign(new TypeError('fetch failed'), { cause: inner });
+};
+
+test('E1 确定性掉线连续 N 次即报错，远早于 deadline', async () => {
+  const budget = 8000; // 若没有 N 上限，这里会被退避耗到 deadline
+  const startedAt = Date.now();
+  const { fetchImpl, calls } = recorder(() => {
+    throw offlineError('ECONNREFUSED');
+  });
+
+  const out = await awaitPeerAnswer({ ...base, timeoutMs: budget, mode: 'poll', pollIntervalMs: 10, fetchImpl });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(calls.answer, 2, `连续掉线只准试 N=2 次，实际 ${calls.answer}`); // E6-a
+  assert.equal(out.attempts, 2);
+  assert.equal(out.status, 'error');
+  assert.match(out.error, /ECONNREFUSED/, '错误必须点名底层 errno');
+  assert.equal(out.offline, true);
+  assert.equal(out.sessionId, 'sess-budget');
+  assert.ok(elapsed < 3000, `掉线必须在 ~1s 内报错，实际 ${elapsed}ms（预算 ${budget}ms）`);
+});
+
+test('E2 单次掉线后恢复：不算掉线，正常返回', async () => {
+  let n = 0;
+  const { fetchImpl, calls } = recorder(() => {
+    n += 1;
+    if (n === 1) throw offlineError('ECONNREFUSED');
+    return json({ status: 'done', reply: 'back-alive', elapsedMs: 1 });
+  });
+
+  const out = await awaitPeerAnswer({ ...base, timeoutMs: 8000, mode: 'poll', pollIntervalMs: 10, fetchImpl });
+
+  assert.equal(calls.answer, 2, '一次失败之后必须还有下一枪');
+  assert.equal(out.status, 'done', '单次掉线不得触发掉线判定');
+  assert.equal(out.reply, 'back-alive');
+  assert.deepEqual(Object.keys(out).sort(), ['elapsedMs', 'reply', 'status', 'transport']);
+});
+
+test('E3 成功后掉线：计数已清零，仍享有完整 N 次重试', async () => {
+  // 序列：掉线 → running（成功，清零）→ 掉线 → 掉线（第 2 次才收手）
+  const plan = ['offline', 'running', 'offline', 'offline'];
+  let n = 0;
+  const { fetchImpl, calls } = recorder(() => {
+    const step = plan[n] ?? 'offline';
+    n += 1;
+    if (step === 'running') return json({ status: 'running', elapsedMs: 5 });
+    throw offlineError('ECONNREFUSED');
+  });
+
+  const out = await awaitPeerAnswer({ ...base, timeoutMs: 8000, mode: 'poll', pollIntervalMs: 10, fetchImpl });
+
+  assert.equal(calls.answer, 4, `成功后应从 0 重新计数（1+1+N=4），实际 ${calls.answer}`); // E6-b
+  assert.equal(out.status, 'error');
+  assert.equal(out.attempts, 4);
+});
+
+test('E4 瞬态失败（503）仍然退避重试到 deadline', async () => {
+  const { fetchImpl, calls } = recorder(() => json({ error: 'unavailable' }, 503));
+
+  const out = await awaitPeerAnswer({ ...base, timeoutMs: 6000, mode: 'poll', pollIntervalMs: 10, fetchImpl });
+
+  assert.ok(calls.answer > 2, `瞬态 5xx 必须继续重试（> N=2），实际 ${calls.answer}`);
+  assert.equal(out.status, 'error');
+  assert.equal(out.offline, undefined, '5xx 不属于掉线类');
+});
