@@ -122,6 +122,27 @@ npx dsh-lan-peers ask --peer my-nas "在 /data/project 执行 pwd" --timeout 120
 
 对端会在自己的 `workspace` 里建真实会话、由对端模型执行，然后把最终回复加密回传。
 
+## 版本互通
+
+同一个群里允许混版本，但 **0.10 与 0.9.x / 0.8.4 之间有两条硬断裂**。下表是「两端各自正常工作时，用户实际看到的结果」。
+
+| 组合 | 私聊 ask | 群聊 chat | 群内派单 | 群纪要 | 群表决 | 引用行 |
+|---|---|---|---|---|---|---|
+| 0.10.x ↔ 0.9.x | WORKING | WORKING | BROKEN：老节点发的 `progress`/`result` 被 0.10 hub 判 `400 {"error":"bad-request"}`，群里没有「开始/结果」回执 | DEGRADED：老 hub 的 pull 不带 `notes`，成员面板一直空白、不报错 | DEGRADED：同理；成员提提案/投票打到老 hub 得 `404 {"error":"not-found"}` | DEGRADED：老 hub 的 meta 白名单没有 `quote`，静默丢弃，只少「引用 …」那一行 |
+| 0.10.x ↔ 0.8.4 | WORKING | WORKING | BROKEN：同上（0.8.4 的回执同样是 `progress`/`result`） | DEGRADED：同上 | DEGRADED：同上 | DEGRADED：同上 |
+
+**变在哪、为什么断**
+
+- **两条硬断裂**：① 群内派单整条线在 0.10.0 删除（`lan_group_ask`、管理面 `group/dispatch-options` / `group/accept`、执行器、回执），`GROUP_KINDS` 只剩 `['chat','system']`；② 于是老对端继续投 `progress`/`result` 回执一律 `400 {"error":"bad-request"}` —— 老节点那边只留一行 `[group] dispatch receipt failed …` 日志，群里从此看不到派单进度。**历史不会丢**：已有聊天记录里的 `progress`/`result` 仍照常显示成一行系统行。
+- **一条软断裂**：`meta.quote` 是 0.10 新增字段，老 hub 的 meta 白名单没有它，**静默丢弃、不报错**（HTTP 仍是 200）。代价是引用行消失，以及「首答胜」的去重判据在跨版本时失效。
+- **身份面不是断裂**：0.8.4 只有 v1 群级鉴权（`X-Peer-Auth: group` + groupKey HMAC），0.9 起有 v2（证书 + ed25519），0.10 默认两种都收（`allowLegacyGroupAuth` 默认 true）。
+- **私聊 ask 形状没变**：`/v1/answer` 三代一直是 `{status, reply|error, elapsedMs}`；0.10 只多一个错误码 `empty-reply`（对端跑完却没给正文），老调用方按 `peer error: …` 呈报即可。
+- `acceptDispatch` 双向安全：0.10 出站不再发 `X-Peer-Accept`，入站遇到老字段直接丢弃；老 hub 缺这个字段按「接单」处理。
+
+**升级口径**：hub 与所有成员**在同一个窗口内一起升到 0.10** —— 跨 0.10 线的群内派单双向都不工作，纪要与表决也要 hub 先到 0.10 才有数据。
+
+> 证据：每格都能追到代码或用例（`host/server.mjs`、`lib/group-*.mjs`、`host/test/group.test.mjs`、`lib/panel-group.test.mjs`）。`interop/run-interop.mjs` 的六行 A–F 目前只覆盖 **0.3.1 基线 ↔ 当前版本**，**不含**上面两组组合 —— 所以本表是代码路径结论，不是互通实跑结论。
+
 ## 安全模型
 
 - 配对码 6 位、10 分钟、一次性；每个伙伴两条独立密钥（我签给你的 / 你签给我的）。
