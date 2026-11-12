@@ -1310,6 +1310,99 @@ test('4b-1 V7：成员可提交提案/投票，开轮与推进一律 403 votes-h
   );
 });
 
+test('4b-2 V9：成员的 admin 路由把提案/投票转给 hub（身份只认签名；hub 独有路径仍 403）', async (t) => {
+  // V7 走的是**群级 HTTP**（groupCall 直连 hub）；这里走的是**成员自己的管理面板**：
+  // 成员的 /api/lan-peers/group/proposal|vote 必须把输入转给 hub（memberVoteCall → groupCall），
+  // 本机照旧只读。这条缝以前只有桩（lib/admin-group-vote.test.mjs），坏了在生产里是静默的。
+  const { createAdmin } = await import('../../lib/admin.mjs');
+  // 显式给名字：同机多节点会把 config.name 都回落到 hostname，成员名互相覆盖（作者口径就分不清了）
+  const cluster = await startCluster(t, { count: 2, names: ['hub-box', 'member-box'] });
+  const [hub, member] = cluster.nodes;
+  const memberAdmin = createAdmin({ server: member.server });
+  const hubVotesFile = path.join(hub.dir, 'group-votes.json');
+  const memberVotesFile = path.join(member.dir, 'group-votes.json');
+  /** hub 记的那个成员名（作者口径的唯一来源） */
+  const nameOnHub = (peerId) => hub.server.group.members().find((entry) => entry.peerId === peerId)?.name ?? '';
+
+  // 1) 成员面板提交「补充」→ 201，body 带回 hub 判的结果 + 本机只读的平面摘要；
+  //    正文里自称的作者是 hub 的名字，**必须被忽略**（作者 = 签名者）。
+  const created = await hitAdmin(memberAdmin, 'POST', '/api/lan-peers/group/proposal', {
+    kind: 'supplement', target: { type: 'body', id: 'n1' }, text: '十月计划再补一条', author: nameOnHub(hub.peerId),
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.json));
+  assert.equal(created.json.ok, true);
+  assert.equal(created.json.proposal.kind, 'supplement');
+  assert.equal(created.json.status, 'adopted', '补充默认采纳：这是 hub 判的，不是成员猜的');
+  assert.equal(created.json.vote, null);
+  // 摘要来自本机副本（成员只读，此刻还没 pull），但两个键与计数必须都在且自洽
+  assert.equal(created.json.votePlane.rev, member.server.group.votes().rev, 'body 里的平面是成员副本');
+  assert.equal(created.json.voteSummary.rev, created.json.votePlane.rev);
+  assert.equal(created.json.voteSummary.proposals, created.json.votePlane.proposals.length);
+  // 权威文件：hub 那份有了，成员那份**根本没有**
+  assert.equal(fs.existsSync(hubVotesFile), true, 'hub 有自己的表决平面文件');
+  assert.equal(fs.existsSync(memberVotesFile), false, '成员的提交没有在本机写权威文件');
+  const hubPlane = readJson(hubVotesFile);
+  const supplementId = created.json.proposal.id;
+  assert.equal(hubPlane.proposals.length, 1, JSON.stringify(hubPlane.proposals));
+  assert.equal(hubPlane.proposals[0].id, supplementId, 'body 里回的 id 就是 hub 落盘的那条');
+  assert.equal(hubPlane.proposals[0].author, nameOnHub(member.peerId), '作者是签名者，body 里自称的 hub 名字不算数');
+
+  // 2) 成员面板提交「反对」→ hub 自动开票（第 1 轮），body 带回那一轮
+  const objection = await hitAdmin(memberAdmin, 'POST', '/api/lan-peers/group/proposal', {
+    kind: 'objection', target: { type: 'supplement', id: supplementId }, text: '这条我不认同',
+  });
+  assert.equal(objection.status, 201, JSON.stringify(objection.json));
+  assert.equal(objection.json.status, 'open', '反对一到 hub 就开票');
+  assert.equal(objection.json.vote.round, 1);
+  assert.equal(objection.json.vote.status, 'open');
+  const voteId = objection.json.proposal.id;
+  assert.equal(hub.server.group.votes().votes[voteId].status, 'open', '开轮发生在 hub，不在成员');
+  assert.equal(hub.server.group.voteTimers(), 1, 'hub 侧恰好挂一个定时器');
+
+  // 3) 成员面板投票 → 200 + accepted:true，票落在 hub 的台账里
+  const cast = await hitAdmin(memberAdmin, 'POST', '/api/lan-peers/group/vote', { proposalId: voteId, ballot: 'yes' });
+  assert.equal(cast.status, 200, JSON.stringify(cast.json));
+  assert.equal(cast.json.accepted, true, '这一票必须被收下：' + JSON.stringify(cast.json));
+  assert.equal(cast.json.reason, '');
+  assert.equal(hub.server.group.votes().votes[voteId].ballots[member.peerId], 'yes', '票记在签名者名下');
+
+  // 4) 身份不可冒名：body 里自称是 hub 的人 → hub 侧的记录仍然是签名者
+  const spoofed = await hitAdmin(memberAdmin, 'POST', '/api/lan-peers/group/vote', {
+    proposalId: voteId, ballot: 'yes', peerId: hub.peerId, author: nameOnHub(hub.peerId), senderId: hub.peerId,
+  });
+  assert.equal(spoofed.status, 200, JSON.stringify(spoofed.json));
+  assert.equal(spoofed.json.accepted, true);
+  const ballots = hub.server.group.votes().votes[voteId].ballots;
+  assert.deepEqual(Object.keys(ballots), [member.peerId], 'body 里自称的 peerId 一个都不认（也绝不留下第二个投票人）');
+  assert.equal(ballots[hub.peerId], undefined, '冒名 hub 的那一票不许记到 hub 名下');
+  assert.equal(ballots[member.peerId], 'yes');
+
+  // 5) hub 独有路径（人裁决）：成员面板照样 403 votes-hub-only，且 hub 平面一点不动
+  const revBefore = hub.server.group.votes().rev;
+  const refused = await hitAdmin(memberAdmin, 'POST', '/api/lan-peers/group/adjudicate', {
+    proposalId: voteId, decision: 'adopt',
+  });
+  assert.equal(refused.status, 403, JSON.stringify(refused.json));
+  assert.deepEqual(refused.json, { ok: false, error: 'votes-hub-only' });
+  assert.equal(hub.server.group.votes().rev, revBefore, '被拒的那次没有动 hub 平面');
+
+  // 6) 副本收敛：一次 pull 之后成员副本的 rev 与 hub 相等，提案/票都在副本里
+  const pulled = await pullNow(member);
+  assert.equal(pulled?.ok, true, '成员这一轮 pull 必须真跑起来：' + JSON.stringify(pulled));
+  const hubRev = hub.server.group.votes().rev;
+  const replicaPlane = member.server.group.votes();
+  assert.ok(hubRev >= 2, '平面 rev 至少被上面几次输入推进过：' + String(hubRev));
+  assert.equal(replicaPlane.rev, hubRev, '成员副本停在与 hub 同一份 rev 上');
+  assert.deepEqual(replicaPlane.proposals.map((entry) => entry.id), [supplementId, voteId]);
+  assert.equal(replicaPlane.votes[voteId].ballots[member.peerId], 'yes', '经成员面板投的那一票同步得回来');
+  assert.equal(fs.existsSync(memberVotesFile), false, '成员侧始终没有权威文件的写路径');
+  // 「更新的摘要」是从这条既有的只读读口拿到的：成员 GET group 与 hub 同步
+  const state = await hitAdmin(memberAdmin, 'GET', '/api/lan-peers/group?sinceSeq=0');
+  assert.equal(state.json.voteSummary.rev, hubRev, JSON.stringify(state.json.voteSummary));
+  assert.equal(state.json.voteSummary.proposals, 2);
+  assert.ok(state.json.votePlane.proposals.some((entry) => entry.id === voteId));
+});
+
 test('4b-1 V8：一轮一个定时器；关轮与 close() 都清掉（进程能自己退出）', async (t) => {
   const lines = [];
   // 轮时长压到 400ms：既不真等 10 分钟，又给同步断言留足余量（不会和定时器抢跑）
