@@ -488,6 +488,18 @@ export const GROUP_EVENTS_PING_INTERVAL_MS = 10_000;
 export const GROUP_ONLINE_WINDOW_MS = 90_000;
 
 /**
+ * 0.10.0-α slice 4b-3：**shelved 提案的重提醒间隔** = 6 小时。
+ *
+ * 为什么是 6 小时，不是分钟级也不是每天一次：
+ *   · 这条提醒落在**全体成员**的群历史里 —— 一分钟一条就是刷屏，而人裁决本来不是分钟级的事；
+ *   · 6 小时 = 一条搁置提案一天至多 4 条：不沉默，也不吵；
+ *   · 重启**不会**立刻补发（resumeVoteTicks 重新挂的是**一整个**间隔），
+ *     所以「反复重启」这种最常见的抖动不会变成刷屏。
+ * 只提醒，绝不替人做决定：本文件里没有任何 TTL / 默认裁决 —— 交给人，不是交给时钟。
+ */
+export const SHELVED_REMINDER_MS = 6 * 60 * 60 * 1000;
+
+/**
  * S1 v0.6.0：群级鉴权白名单（与 lib/group-client.mjs 同一份常量）。
  * 只有这四条路径认 X-Peer-Auth: group；其它路径带该头一律 401 group-auth-scope。
  */
@@ -3106,6 +3118,135 @@ export function createPeerServer(overrides = {}) {
     voteTimers.set(proposalId, timer);
   }
 
+  // -------------------------------------------------------------------------
+  // 0.10.0-α slice 4b-3 · shelved 的**提醒**（只提醒，不裁决）
+  //
+  // 症状：一条提案第 3 轮还没过就 shelved，而它唯一的出口是面板的群页签 ——
+  // 从不打开那个页签的运维者就永远不知道有决定在等他。这里补一条**声音**，
+  // 一个字都不改状态机：没有 TTL、没有默认裁决、没有「到点自动生效」。
+  // -------------------------------------------------------------------------
+
+  /**
+   * shelved 提案的**重提醒**定时器：proposalId → Timeout（纪律逐条照抄 voteTimers）。
+   *
+   * 为什么不并进 voteTimers：那张表的语义是「**开着的轮**」—— 面板/测试都按这个读
+   * （`group-replica` 断言 shelved 之后它必须是 0），而提醒的到点是「上一次提醒 + 一个间隔」，
+   * 与 closesAt 不同源。混一张表会让两边的清理互相看不见（关轮清掉提醒、或提醒清掉轮），
+   * 所以另起一张表，纪律一样：
+   *   1. 起之前先清同一个 id 的旧定时器 —— 换新，不叠加（一条提案至多一个待触发提醒）；
+   *   2. 人裁决 / close() 都清；
+   *   3. 一律 unref()：漏清一处也不吊住进程（双保险，不是替代品）。
+   */
+  const shelvedReminders = new Map();
+
+  /** 上一次提醒的 config.now()：同一窗口内的第二次触发是空操作（定时器重放不刷屏） */
+  const shelvedReminderAt = new Map();
+
+  /** 提醒间隔：生产 6 小时；测试用 overrides.groupVote.reminderMs 缩短（与 roundMs 同一口子） */
+  const shelvedReminderMs =
+    Number.isFinite(Number(overrides.groupVote?.reminderMs)) && Number(overrides.groupVote.reminderMs) > 0
+      ? Math.floor(Number(overrides.groupVote.reminderMs))
+      : SHELVED_REMINDER_MS;
+
+  /**
+   * 这条提案**此刻**还在等 hub 运维者裁决吗？
+   * 返回 null = 不必提醒（没有 shelved 记录 / 已经裁决 / 表决记录已不是 shelved）。
+   * 这就是「绝不为已采纳/已否决的提案发提醒」的唯一判据 —— 提醒前现读平面，不缓存。
+   */
+  function shelvedPending(proposalId) {
+    if (!votesStore) return null;
+    const id = String(proposalId ?? '');
+    if (id === '') return null;
+    const plane = votePlaneView();
+    const entry = (plane.shelved ?? []).find((item) => item.proposalId === id);
+    if (!entry) return null;
+    if (plane.verdicts && Object.prototype.hasOwnProperty.call(plane.verdicts, id)) return null;
+    const vote = plane.votes[id];
+    if (vote && vote.status !== 'shelved') return null;
+    return { entry, vote };
+  }
+
+  /**
+   * 提醒正文：**只有**「搁置 / 种类 / 轮数 / 只有 hub 运维者能裁决」。
+   * 提案正文与备注一个字都不进去 —— 这条线落在全体成员的群历史里；id 只留 ≤8 字符。
+   */
+  function shelvedReminderText({ id = '', kind = '', rounds = 0 } = {}) {
+    return '[group] vote shelved: proposal ' + shortVoteId(id)
+      + ' kind=' + String(kind).slice(0, 16)
+      + ' rounds=' + Math.max(0, Math.floor(Number(rounds) || 0))
+      + ' — only the hub operator can decide; open the panel group tab to adjudicate';
+  }
+
+  /** 清掉某条提案的重提醒（裁决/关停/换间隔都调它；重复调用安全） */
+  function clearShelvedReminder(proposalId) {
+    const key = String(proposalId ?? '');
+    const timer = shelvedReminders.get(key);
+    if (!timer) return;
+    clearTimeout(timer);
+    shelvedReminders.delete(key);
+  }
+
+  /** 清掉全部重提醒定时器（close() 的唯一入口） */
+  function clearShelvedReminders() {
+    for (const timer of shelvedReminders.values()) clearTimeout(timer);
+    shelvedReminders.clear();
+    shelvedReminderAt.clear();
+  }
+
+  /**
+   * 发**一次**提醒（定时器、resume、搁置当场三处共用这一个落点）。
+   *
+   * 幂等两档，都在这里，不在调用方：
+   *   1. 已经不算「待裁决」（裁决过 / 状态变了）→ 一个字都不发，顺手把定时器清掉；
+   *   2. 同一个窗口内第二次触发 → 不发（定时器重放/重复 dispose 都撞这道闸）。
+   * 写路径**不新开**：走 hub 本地门面 groupPostFacade —— 与面板发言、/task 回执同一条
+   * commitLocalMessage（日志 + commitSeq + 复制队列），绝不另起一个写者。
+   */
+  function postShelvedReminder(proposalId) {
+    const id = String(proposalId ?? '');
+    const pending = shelvedPending(id);
+    if (!pending) {
+      clearShelvedReminder(id);
+      return { emitted: false, reason: 'not-pending' };
+    }
+    const last = Number(shelvedReminderAt.get(id) ?? 0);
+    const nowMs = config.now();
+    if (last > 0 && nowMs - last < shelvedReminderMs) return { emitted: false, reason: 'same-window' };
+    const proposal = votesStore.proposal(id) ?? {};
+    const rounds = Number(pending.entry.rounds ?? pending.vote?.round ?? MAX_ROUNDS);
+    const text = shelvedReminderText({ id, kind: proposal.kind, rounds });
+    groupPostFacade({ peerId: store.instanceId, name: config.name, kind: 'system', text, meta: {} });
+    shelvedReminderAt.set(id, nowMs);
+    if (config.logger) {
+      // 一条提醒一行日志；id ≤8、轮数、没有正文（与群消息同一口径）
+      config.logger('[group] vote shelved reminder id=' + shortVoteId(id) + ' round=' + Math.max(0, Math.floor(rounds)));
+    }
+    return { emitted: true, reason: '' };
+  }
+
+  /**
+   * 给一条 shelved 提案挂**一个**重提醒：到点发一次，还等着就再挂一个间隔。
+   * 关停闸（closing）与 voteTimers 同一条命门：close() 之后绝不再点亮定时器。
+   */
+  function scheduleShelvedReminder(proposalId) {
+    const id = String(proposalId ?? '');
+    if (id === '' || closing || !votesStore) return;
+    if (!shelvedPending(id)) {
+      clearShelvedReminder(id);
+      return;
+    }
+    clearShelvedReminder(id);
+    const timer = setTimeout(() => {
+      shelvedReminders.delete(id);
+      const out = postShelvedReminder(id);
+      // 还等裁决 → 排下一间隔（一次只排一个；裁决/关停会把它清掉）
+      if (out.emitted) scheduleShelvedReminder(id);
+    }, shelvedReminderMs);
+    timer.unref?.();
+    shelvedReminders.set(id, timer);
+  }
+
+
   /**
    * 结算一轮并推进状态机。**幂等**：只有「open → 结算」的那一次会 advance ——
    * 定时器重复触发、网络重放、hub 重启补结算都不会把同一个信号推进两轮（V6 的 hub 一半）。
@@ -3149,8 +3290,13 @@ export function createPeerServer(overrides = {}) {
     } else if (next.outcome === 'shelved') {
       // 第 MAX_ROUNDS 轮还没过：摘出 open，记进 shelved 集交人裁决（4b-2 的面板负责端给用户）
       votesStore.putVote(next.vote);
-      votesStore.markShelved({ proposalId: id, rounds: next.vote.round });
+      const marked = votesStore.markShelved({ proposalId: id, rounds: next.vote.round });
       if (config.logger) config.logger(`[group] vote shelved id=${shortVoteId(id)} rounds=${next.vote.round}`);
+      // 4b-3：搁置**当场**就在群里说一声 —— 没人会碰巧打开面板的群页签。
+      // duplicate（同一条被重复登记）不再发第二条：一条提案的「搁置公告」只发一次。
+      if (!marked.duplicate) postShelvedReminder(id);
+      // 然后挂上重提醒：进程活得比这次搁置久，人可能几天后才回来。
+      scheduleShelvedReminder(id);
     }
     return { ok: true, outcome: settled.outcome, closed: true, vote: settled.vote };
   }
@@ -3213,6 +3359,10 @@ export function createPeerServer(overrides = {}) {
       }
       return out;
     }
+    // 4b-3：裁决落地 = 这条提案不再等任何人 —— 重提醒立刻撤掉（连「上次提醒时间」一起清），
+    // 否则它会对着一条已决定的提案继续喊。
+    clearShelvedReminder(proposalId);
+    shelvedReminderAt.delete(String(proposalId ?? ''));
     if (config.logger) {
       // 只记短 id / 裁决 / rev：理由正文绝不上日志
       config.logger(`[group] adjudicate id=${shortVoteId(proposalId)} decision=${String(decision ?? '').slice(0, 8)} rev=${out.rev}`);
@@ -3252,10 +3402,15 @@ export function createPeerServer(overrides = {}) {
    */
   function resumeVoteTicks() {
     if (!votesStore || closing) return;
-    for (const vote of Object.values(votesStore.plane().votes)) {
+    const plane = votesStore.plane();
+    for (const vote of Object.values(plane.votes)) {
       if (vote.status !== 'open') continue;
       scheduleVoteTick(vote);
     }
+    // 4b-3：shelved 的**不许**因为重启而沉默 —— 重新挂上一整个间隔（不是立刻补发：
+    // 搁置当场那一条已经发过了，重启就补发会让「反复重启」变成刷屏）。
+    // 已经裁决过的由 shelvedPending 挡掉，这里不为它起定时器。
+    for (const entry of plane.shelved ?? []) scheduleShelvedReminder(entry.proposalId);
   }
 
   /** 真实监听端口（listen 时才知道）；S1 的地址探测要用 */
@@ -9956,6 +10111,12 @@ export function createPeerServer(overrides = {}) {
           ),
           // 测试/排障可见：还挂着几个表决定时器（关轮与 close() 之后必须是 0）
           voteTimers: () => voteTimers.size,
+          // 4b-3：还挂着几个 shelved 重提醒（裁决、close() 之后必须是 0）
+          shelvedReminders: () => shelvedReminders.size,
+          // 测试/排障用：立刻走一次提醒的落点（同一窗口内的第二次是空操作，不刷屏）
+          remindShelved: (input) => postShelvedReminder(
+            input && typeof input === 'object' ? input.proposalId : input,
+          ),
           // 与 /v1/group/history 同一个渲染口径：同名成员在这里就已经带上短 id 后缀
           history: (options = {}) => decoratedMessages(options),
           // §18：归档索引 / 人工删除 / 游标落在归档区间的判定（管理接口与面板走这里）
@@ -10013,6 +10174,9 @@ export function createPeerServer(overrides = {}) {
           adjudicate: () => ({ ok: false, error: 'votes-hub-only' }),
           closeVote: () => ({ ok: false, error: 'votes-hub-only' }),
           voteTimers: () => 0,
+          // 成员侧没有提醒器：提醒是 hub 的事（只读副本不挂任何定时器）
+          shelvedReminders: () => 0,
+          remindShelved: () => ({ emitted: false, reason: 'votes-hub-only' }),
           // 契约 §4 的门面在成员节点也要在：不带新字段时走既有回执通道（hub / 群级签名）
           post: (input) => groupPostFacade(input),
           advertiseBaseUrl: () => localAdvertiseBaseUrl(),
@@ -10105,6 +10269,9 @@ export function createPeerServer(overrides = {}) {
       }
       // 0.10.0-α slice 4b-1：表决定时器整表清掉（关停后 scheduleVoteTick 的 closing 闸也不再起新的）
       clearVoteTicks();
+      // 0.10.0-α slice 4b-3：shelved 重提醒同时清 —— 两种定时器两条命门，漏一条就是
+      // 「断言全过、进程不退出」的那个形状
+      clearShelvedReminders();
       if (!httpServer.listening) return;
       const closed = new Promise((resolve) => httpServer.close(resolve));
       httpServer.closeAllConnections?.();
