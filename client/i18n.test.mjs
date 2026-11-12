@@ -77,8 +77,8 @@ test('t：按语言取文案，params 做 {name} 插值', () => {
   assert.match(t('en', 'cli.code.ok', { code: '123456' }), /123456/);
   // 没给的占位符原样保留：宁可露出一处 {peerId}，也不抛错、不拼出半句话
   assert.equal(t('zh', 'cli.pair.ok', { label: 'x' }), '已配对: x ({peerId}) · {transport}');
-  // 没有 params 时不做任何替换
-  assert.equal(t('zh', 'cli.group.acceptOn'), '接单中');
+  // 没有 params 时不做任何替换：占位符原样留着，{label} 不会被换成字面量
+  assert.equal(t('zh', 'cli.pair.ok'), '已配对: {label} ({peerId}) · {transport}');
 });
 
 test('t：缺 key 回落英文，两格都缺则原样返回 key 且不抛错', () => {
