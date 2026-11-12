@@ -6,6 +6,7 @@
  *   T1 搁置当场发且只发一条 kind:'system'，正文/备注不进群历史；
  *   T2 同一窗口内重复触发不刷屏（幂等）；
  *   T2b 提醒确实由定时器发出来（不是只在搁置那一下发过一次）；
+ *   T2c 隔着两个整间隔各发一条（节奏会重复，不是发一次就停，第二次之后仍挂着）；
  *   T3 已裁决的提案不再提醒，定时器被清掉；
  *   T4 close() 之后两种定时器都是 0（进程因此能退出：跑完这个文件就是证据）；
  *   T5 重启后 resume 重新挂上提醒（只断言挂着，不等它到点）；
@@ -121,6 +122,46 @@ test('4b-3 T2b：提醒真的由定时器发出来（间隔可覆盖，断言两
   }
   assert.equal(texts.length >= 2, true, '到点必须自己再发一条（这正是「不会沉默」）：' + texts.length);
   assert.equal(texts[1], texts[0], '提醒与搁置公告同形（同一条文本，不夹带新信息）');
+});
+
+test('4b-3 T2c：隔着两个整间隔各发一条（节奏会重复，不是发一次就停）', async (t) => {
+  const INTERVAL_MS = 120;
+  const lines = [];
+  const hub = await startHub(t, { logger: (line) => lines.push(String(line)), reminderMs: INTERVAL_MS });
+  shelveOnce(hub.group);
+  assert.equal(systemMessages(hub.stateDir).length, 1, '起点只有搁置当场那一条（T1）');
+  assert.equal(hub.group.shelvedReminders(), 1, '起点挂着恰好一个提醒');
+
+  // 按「落盘条数变没变」取样，不看定时器内部怎么实现；记下每次变化的相对时刻
+  const startedAt = performance.now();
+  const changes = [];
+  let count = 1;
+  while (count < 3 && performance.now() - startedAt < 2000) {
+    await sleep(10);
+    const now = systemMessages(hub.stateDir).length;
+    if (now !== count) {
+      changes.push({ at: performance.now() - startedAt, count: now });
+      count = now;
+    }
+  }
+  // 第二条之后**立刻**读：第三条还要再过一整个间隔，此刻必须还挂着
+  const armedAfterSecond = hub.group.shelvedReminders();
+
+  assert.deepEqual(changes.map((change) => change.count), [2, 3],
+    '两个间隔各来一条（1→2→3：一次不落，也不在一个间隔里连发）：' + JSON.stringify(changes));
+  assert.ok(changes[0].at >= INTERVAL_MS - 20,
+    '第一条要等满第一个间隔才到：' + changes[0].at.toFixed(0) + 'ms');
+  assert.ok(changes[1].at - changes[0].at >= INTERVAL_MS - 20,
+    '第二条要再等一个整间隔（不是紧挨着第一条，中间不许有）：'
+      + (changes[1].at - changes[0].at).toFixed(0) + 'ms');
+  assert.equal(armedAfterSecond, 1,
+    '第二条之后定时器仍挂着 ——「发一次就停」的实现在这里是 0，第三个间隔永远不会来');
+  const systems = systemMessages(hub.stateDir);
+  assert.equal(systems.length, 3, '落盘 3 条 = 1 条搁置公告 + 2 条重提醒（不是 2 条，也不是 4 条）');
+  assert.equal(systems[1].text, systems[0].text, '第一条重提醒与搁置公告逐字节相同');
+  assert.equal(systems[2].text, systems[0].text, '第二条重提醒与前一条逐字节相同（文本不随次数漂移）');
+  const reminderLogs = lines.filter((line) => line.includes('vote shelved reminder'));
+  assert.equal(reminderLogs.length, 3, '日志口径同为 1+2 行：' + JSON.stringify(reminderLogs));
 });
 
 test('4b-3 T3：已裁决的提案不再提醒，且定时器被清掉', async (t) => {
