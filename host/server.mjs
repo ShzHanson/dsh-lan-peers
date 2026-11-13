@@ -192,6 +192,22 @@ import {
   normalizeNotesValue,
   notesSummary,
 } from '../lib/group-notes.mjs';
+// 0.12.0-α（S2）群文件：hub 侧一份拷贝 + 公告平面。纯模块（零 I/O 语义以外的网络），
+// 落盘/走线/门禁都在本文件；单测直接驱动那个模块。
+import {
+  GROUP_FILE_CHUNK_MAX,
+  GROUP_FILES_QUOTA_BYTES,
+  createGroupFiles,
+  filesPlaneSummary,
+  mergeFilesPlane,
+  normalizeFilesPlane,
+  GroupFileDownloads,
+  normalizeTargets,
+  parseGroupFileId,
+  sanitizeGroupFileName,
+  targetAllows,
+  visibleFiles,
+} from '../lib/group-files.mjs';
 // 0.10.0-α slice 4b-1：群表决状态机（纯模块）。hub 只负责落盘、走线、定时器与 hub-only 门。
 import {
   MAX_ROUNDS,
@@ -2382,6 +2398,31 @@ export class GroupReplicaStore {
     return { rev: merged.rev, proposals: merged.proposals.length, adopted };
   }
 
+  /**
+   * 0.12.0-α S2：同步来的群文件公告平面（只读镜像）。
+   * 成员侧**永不**写 hub 那份：这里只是 pull 同步来的缓存，形状 {rev, files}。
+   */
+  files() {
+    return normalizeFilesPlane(this.#load().files);
+  }
+
+  /**
+   * 收下一份群文件平面快照（pull 响应里的 groupFiles 字段）。
+   * 只认 rev 更大的那份（mergeFilesPlane）：本地见过更新的视图时绝不因对端更旧而丢掉它。
+   * 返回 {rev, count, adopted}；adopted=false 表示这次什么都没落盘。
+   */
+  setFiles(value) {
+    const data = this.#load();
+    const current = normalizeFilesPlane(data.files);
+    const merged = mergeFilesPlane(current, value);
+    const adopted = merged.rev !== current.rev;
+    if (adopted) {
+      data.files = merged;
+      this.#save(data);
+    }
+    return { rev: merged.rev, count: merged.files.length, adopted };
+  }
+
   /** bootstrap 时写入/校正头部字段（groupId/epoch/leader），不动消息与 lastSeq */
   ensureHeader({ groupId = '', epoch = 0, leaderPeerId = '', lastSeq = 0 } = {}) {
     const data = this.#load();
@@ -3014,6 +3055,63 @@ export function createPeerServer(overrides = {}) {
   }
 
   // -------------------------------------------------------------------------
+  // 0.12.0-α（S2）· 群文件：hub 存**一份**，成员按需来拉
+  //
+  // 三块落盘全在 lib/group-files.mjs：
+  //   group-files/<fileId>/{meta.json,data}   字节（只有 hub 有）
+  //   group-files.json                        公告平面 {rev, files}（hub 权威、成员只读镜像）
+  //   group-downloads.json                    本机已下载台账（面板的 downloaded 只认它）
+  //
+  // 铁律：
+  //   · 公告**复用的是平面**（notes / votePlane 那一套），不新增群消息 kind ——
+  //     老 peer 收到不认识的 kind 会 400 整条消息，那等于「要么全网升级、要么谁都收不到」；
+  //   · 平面 hub 单写：成员收到 pull 里的 groupFiles 只落副本，写路径在 handler 里 403；
+  //   · targets:[peerId] 只发给那一个人（hub 自己全见）—— 可见性只有 visibleFiles 一个实现。
+  // -------------------------------------------------------------------------
+
+  /** hub 才有字节存储；成员那侧只有一个只读镜像（与 notesStore 同生共死） */
+  const groupFiles = groupStore
+    ? createGroupFiles({
+        stateDir: config.stateDir,
+        now: config.now,
+        // 配额不在这里写死：lib/group-files.mjs 先看 GROUP_FILES_QUOTA_BYTES，缺省才是 20 GiB
+        // （运维压盘、用例做小配额，都走同一个口子）
+        logger: config.logger,
+        // 定时器由 listen() 统一 arm（与 fileStore/fileOutbox 同一个位置、同一个理由）
+        start: false,
+      })
+    : null;
+
+  /** 已下载台账：两个角色都有（它只记「本机拉过什么」） */
+  const groupDownloads = new GroupFileDownloads({ stateDir: config.stateDir, now: config.now });
+
+  /** 平面只读视图：hub 读权威文件，成员读 pull 同步来的镜像 */
+  function filesPlaneValue() {
+    if (groupFiles) return groupFiles.plane.value();
+    return replicaStore ? replicaStore.files() : { rev: 0, files: [] };
+  }
+
+  /**
+   * 按**看的人**过滤的平面视图。hub 全见，成员只见 'all' 与点名给自己的。
+   * pull 响应与管理接口都走这里 —— 可见性绝不在两处各写一遍。
+   */
+  function filesView(peerId, { isHub = false } = {}) {
+    const value = filesPlaneValue();
+    return { rev: value.rev, files: visibleFiles(value, { peerId, isHub }) };
+  }
+
+  /** 面板/日志用的便宜摘要（条数 / rev / 失效条数），不含文件名 */
+  function filesSummary() {
+    return filesPlaneSummary(filesPlaneValue());
+  }
+
+  /** 公告一次（hub 侧 finish/withdraw 的唯一入口；幂等：内容一样不推 rev） */
+  function announceGroupFile(entry) {
+    if (!groupFiles) return { ok: false, error: 'files-hub-only' };
+    return groupFiles.plane.announce(entry);
+  }
+
+  // -------------------------------------------------------------------------
   // 0.10.0-α slice 4b-1 · 表决平面（hub 单写、成员只读同步）
   //
   // 用户定的规则落地在这几行里：
@@ -3591,6 +3689,20 @@ export function createPeerServer(overrides = {}) {
     '/v1/group/vote/advance',
   ]);
 
+  /**
+   * 0.12.0-α（S2）群文件的七条路径，与纪要/表决同一个机制（契约 §7 的 11 条是**冻结**的，
+   * host/test/group-auth.test.mjs 逐条钉死，一个都不改 —— 新端点只能加在本侧集合里）。
+   * 「谁能写」由 handler 判（hub-only 的门在 handler 里），与这份白名单无关。
+   */
+  const GROUP_FILES_PATHS = Object.freeze([
+    '/v1/group/file/init',
+    '/v1/group/file/upload',
+    '/v1/group/file/finish',
+    '/v1/group/file/pull',
+    '/v1/group/file/withdraw',
+    '/v1/group/files',
+  ]);
+
   /** 头分流：'group' | 'group-v2' | ''（缺失或其它值 = 现有 per-peer 签名路径） */
   function groupAuthModeOf(req) {
     const value = headerValue(req, GROUP_AUTH_HEADER.toLowerCase());
@@ -3611,7 +3723,8 @@ export function createPeerServer(overrides = {}) {
     return GROUP_AUTH_PATHS.includes(pathname)
       || GROUP_IDENTITY_PATHS.includes(pathname)
       || GROUP_NOTES_PATHS.includes(pathname)
-      || GROUP_VOTE_PATHS.includes(pathname);
+      || GROUP_VOTE_PATHS.includes(pathname)
+      || GROUP_FILES_PATHS.includes(pathname);
   }
 
   /** legacy 告警：只记 peer 前 8 位，同一 peer 60 秒最多一条 */
@@ -6254,6 +6367,10 @@ export function createPeerServer(overrides = {}) {
         // 0.10.0-α slice 4b-1：表决平面也搭**同一次 pull** 回来（与纪要同一个理由：不新增轮询）。
         // 成员拿到只落副本（replicaStore.setVotes），永不回写 hub —— hub 是唯一写者。
         votePlane: votePlaneView(),
+        // 0.12.0-α（S2）：群文件公告搭**同一次 pull** 回来（与纪要/表决同一个理由：不新增轮询）。
+        // 按**收件人**过滤：targets:[peerId] 的条目只发给那一个人（hub 自己全见）。
+        // 成员拿到只落镜像（replicaStore.setFiles），永不回写 hub —— 平面 hub 单写。
+        groupFiles: filesView(auth.peerId, { isHub: false }),
         // 成员靠它把成员表刷新到最新（新成员加进来后不会一直判 not-a-member）
         memberIds: Object.keys(ctx.members),
       },
@@ -7910,6 +8027,544 @@ export function createPeerServer(overrides = {}) {
     }
     return { status: 503, body: { error: 'quorum-unavailable', epoch: st.epoch }, peerId: input.peerId };
   }
+  // -------------------------------------------------------------------------
+  // 0.12.0-α（S2）· 群文件端点（群级鉴权）
+  //
+  // 模型：发送方往 hub **传一份**，成员按需来 hub 拉。targets:'all' 与 targets:[peerId]
+  // 走**同一条**路径（点名给一个人的也落在 hub：发送方下线之后它照样在）。
+  //
+  // 门禁两条，各管一件事，绝不互相顶替：
+  //   · 成员节点上没有字节存储 → init/upload/finish/pull/withdraw 一律 403 files-hub-only
+  //     （不是「还没实现」：字节只该存在 hub 上）；
+  //   · 上传者/hub 才能动这一条（upload/finish/withdraw），别的成员猜到 id 也改不了它。
+  //
+  // 错误码是稳定契约（面板/CLI 不翻译）：
+  //   400 bad-request | bad-offset      404 unknown-file
+  //   403 files-hub-only | forbidden    409 offset-mismatch | file-gone | integrity-failed
+  //                                       | too-many-uploads | already-exists | size-exceeded
+  //   413 too-large
+  // -------------------------------------------------------------------------
+
+  /** 成员节点没有字节存储：这一条与 notes/vote 的 hub-only 门同一条口径 */
+  function requireFilesHub() {
+    if (groupFiles) return null;
+    return { status: 403, body: { ok: false, error: 'files-hub-only' } };
+  }
+
+  /** 上传者本人或 hub 自己 —— 只有他们能动这一条 */
+  function mayManageGroupFile(auth, entry) {
+    const peerId = String(auth.peerId ?? '');
+    if (peerId !== '' && peerId === store.instanceId) return true;
+    return String(entry?.from?.peerId ?? '') === peerId;
+  }
+
+  /** 路由公共前段：hub 门 + JSON 体 + 把 peerId 带回去（handler 的返回就是响应体） */
+  async function withGroupFileRoute(auth, rawBody, handler) {
+    const peerId = String(auth.peerId ?? '');
+    const gate = requireFilesHub();
+    if (gate) return { ...gate, peerId };
+    let body;
+    try {
+      body = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { ok: false, error: 'bad-request' }, peerId };
+    }
+    return { ...(await handler(auth, body)), peerId };
+  }
+
+  function applyFileInit(auth, body) {
+    const fileId = parseGroupFileId(body.fileId);
+    const name = sanitizeGroupFileName(body.name);
+    const size = Number(body.size);
+    const sha256 = String(body.sha256 ?? '').toLowerCase();
+    if (fileId === '' || name === '' || !Number.isInteger(size) || size < 0
+      || !/^[0-9a-f]{64}$/.test(sha256)) {
+      return { status: 400, body: { ok: false, error: 'bad-request' } };
+    }
+    const out = groupFiles.store.begin({
+      fileId,
+      name,
+      size,
+      sha256,
+      from: { peerId: String(auth.peerId ?? ''), name: groupMemberName(String(auth.peerId ?? '')) },
+      targets: body.targets,
+    });
+    if (!out.ok) {
+      const status = out.error === 'too-large' ? 413
+        : (out.error === 'too-many-uploads' || out.error === 'already-exists' ? 409 : 400);
+      if (config.logger) {
+        config.logger('[group-files] init refused from=' + shortPeerId(auth.peerId)
+          + ' id=' + String(fileId).slice(0, 8) + ' reason=' + String(out.error));
+      }
+      return { status, body: { ok: false, error: String(out.error) } };
+    }
+    if (config.logger) {
+      // 日志口径（契约 §0）：id / 字节 / sha 前 8 位 / 目标个数 —— 文件名与路径绝不进日志
+      config.logger('[group-files] init from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8)
+        + ' bytes=' + size + ' sha=' + sha256.slice(0, 8)
+        + ' targets=' + (out.targets === 'all' ? 'all' : String(out.targets.length))
+        + ' replay=' + (out.replay === true));
+    }
+    return {
+      status: out.replay === true ? 200 : 201,
+      body: { ok: true, fileId, received: out.received, replay: out.replay === true },
+    };
+  }
+
+  function applyFileUpload(auth, body) {
+    const fileId = parseGroupFileId(body.fileId);
+    if (fileId === '') return { status: 400, body: { ok: false, error: 'bad-request' } };
+    const found = groupFiles.store.get(fileId);
+    if (!found.ok) {
+      return { status: found.reason === 'file-gone' ? 409 : 404, body: { ok: false, error: String(found.reason) } };
+    }
+    if (!mayManageGroupFile(auth, found.entry)) {
+      if (config.logger) {
+        config.logger('[group-files] upload denied from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8));
+      }
+      return { status: 403, body: { ok: false, error: 'forbidden' } };
+    }
+    const offset = Number(body.offset);
+    if (!Number.isInteger(offset) || offset < 0) {
+      return { status: 400, body: { ok: false, error: 'bad-offset' } };
+    }
+    const encoded = typeof body.dataBase64 === 'string' ? body.dataBase64 : '';
+    // base64 只认标准字母表：Buffer.from 对坏输入是「尽力而为」，那会把坏块写成静默的错字节
+    if (encoded === '' || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+      return { status: 400, body: { ok: false, error: 'bad-request' } };
+    }
+    const data = Buffer.from(encoded, 'base64');
+    if (data.length === 0) return { status: 400, body: { ok: false, error: 'bad-request' } };
+    // 单块原始字节上限：超过就是客户端用错了块大小（不上溢到磁盘，也不静默截断）
+    if (data.length > GROUP_FILE_CHUNK_MAX) {
+      return { status: 413, body: { ok: false, error: 'too-large', chunkMax: GROUP_FILE_CHUNK_MAX } };
+    }
+    const out = groupFiles.store.append(fileId, offset, data);
+    if (!out.ok) {
+      const status = (out.error === 'offset-mismatch' || out.error === 'size-exceeded'
+        || out.error === 'file-gone' || out.error === 'already-complete') ? 409
+        : (out.error === 'unknown-file' ? 404 : 400);
+      return {
+        status,
+        body: {
+          ok: false,
+          error: String(out.error),
+          received: Number.isFinite(Number(out.received)) ? Number(out.received) : null,
+        },
+      };
+    }
+    return {
+      status: 200,
+      body: { ok: true, replay: out.replay === true, offset: out.offset, received: out.received },
+    };
+  }
+
+  async function applyFileFinish(auth, body) {
+    const fileId = parseGroupFileId(body.fileId);
+    if (fileId === '') return { status: 400, body: { ok: false, error: 'bad-request' } };
+    const found = groupFiles.store.get(fileId);
+    if (!found.ok) {
+      return { status: found.reason === 'file-gone' ? 409 : 404, body: { ok: false, error: String(found.reason) } };
+    }
+    if (!mayManageGroupFile(auth, found.entry)) {
+      return { status: 403, body: { ok: false, error: 'forbidden' } };
+    }
+    const out = await groupFiles.store.finish(fileId);
+    if (!out.ok) {
+      // integrity-failed：半截已经被 store 删掉，公告一条都不动
+      if (config.logger) {
+        config.logger('[group-files] finish refused from=' + shortPeerId(auth.peerId)
+          + ' id=' + fileId.slice(0, 8) + ' reason=' + String(out.error));
+      }
+      return {
+        status: out.error === 'integrity-failed' ? 409 : (out.error === 'file-gone' ? 409 : 404),
+        body: { ok: false, error: String(out.error), size: out.size ?? null, expected: out.expected ?? null },
+      };
+    }
+    // 校验通过才公告：members 从下一次 pull 起就能看到这一条（rev 前进）
+    const announced = groupFiles.plane.announce(out.entry);
+    if (config.logger) {
+      config.logger('[group-files] finish from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8)
+        + ' bytes=' + out.entry.size + ' sha=' + String(out.entry.sha256).slice(0, 8)
+        + ' rev=' + announced.rev + ' evicted=' + (Array.isArray(out.evicted) ? out.evicted.length : 0));
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        fileId,
+        size: out.entry.size,
+        sha256: out.entry.sha256,
+        rev: announced.rev,
+        evicted: Array.isArray(out.evicted) ? out.evicted : [],
+      },
+    };
+  }
+
+  function applyFilePull(auth, body) {
+    const fileId = parseGroupFileId(body.fileId);
+    if (fileId === '') return { status: 404, body: { ok: false, error: 'unknown-file' } };
+    const found = groupFiles.store.get(fileId);
+    if (!found.ok) {
+      return { status: found.reason === 'file-gone' ? 409 : 404, body: { ok: false, error: String(found.reason) } };
+    }
+    // 可见性：不是这一条的目标、又不是上传者/hub，一个字节都拿不走
+    if (!targetAllows(found.entry.targets, auth.peerId) && !mayManageGroupFile(auth, found.entry)) {
+      if (config.logger) {
+        config.logger('[group-files] pull denied from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8));
+      }
+      return { status: 403, body: { ok: false, error: 'forbidden' } };
+    }
+    const offset = Number(body.offset);
+    if (!Number.isInteger(offset) || offset < 0) {
+      return { status: 400, body: { ok: false, error: 'bad-offset', size: found.entry.size } };
+    }
+    const chunk = groupFiles.store.open(fileId, offset, GROUP_FILE_CHUNK_MAX);
+    if (chunk.error) {
+      const status = chunk.error === 'file-gone' ? 409
+        : (chunk.error === 'unknown-file' ? 404 : (chunk.error === 'bad-offset' ? 400 : 500));
+      return { status, body: { ok: false, error: String(chunk.error), size: chunk.size ?? null } };
+    }
+    if (config.logger) {
+      config.logger('[group-files] pull from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8)
+        + ' offset=' + chunk.offset + ' bytes=' + chunk.data.length + ' eof=' + chunk.eof);
+    }
+    return {
+      status: 200,
+      body: {
+        dataBase64: chunk.data.toString('base64'),
+        offset: chunk.offset,
+        size: chunk.size,
+        eof: chunk.eof === true,
+      },
+    };
+  }
+
+  function applyFileWithdraw(auth, body) {
+    const fileId = parseGroupFileId(body.fileId);
+    if (fileId === '') return { status: 400, body: { ok: false, error: 'bad-request' } };
+    const listed = groupFiles.plane.value().files.find((row) => row.fileId === fileId) ?? null;
+    const found = groupFiles.store.get(fileId);
+    const fromPeerId = listed ? String(listed.from.peerId) : (found.ok ? String(found.entry.from.peerId) : '');
+    if (fromPeerId === '' && !found.ok) {
+      return { status: 404, body: { ok: false, error: 'unknown-file' } };
+    }
+    if (String(auth.peerId ?? '') !== store.instanceId && fromPeerId !== String(auth.peerId ?? '')) {
+      if (config.logger) {
+        config.logger('[group-files] withdraw denied from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8));
+      }
+      return { status: 403, body: { ok: false, error: 'forbidden' } };
+    }
+    // 字节删掉、公告翻 gone（store.remove 的墓碑会回调平面）：members 下一次 pull 就看到「已失效」
+    const removed = groupFiles.store.remove(fileId);
+    const plane = groupFiles.plane.value();
+    if (config.logger) {
+      config.logger('[group-files] withdraw from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8)
+        + ' removed=' + (removed.ok === true) + ' rev=' + plane.rev);
+    }
+    return {
+      status: 200,
+      body: { ok: true, fileId, removed: removed.ok === true, gone: true, rev: plane.rev },
+    };
+  }
+
+  /** POST /v1/group/file/init —— 开一条上传（hub only；重复 init 幂等） */
+  const groupFileInit = (req, rawBody, url, auth) => withGroupFileRoute(auth, rawBody, applyFileInit);
+  /** POST /v1/group/file/upload —— 追加一块（offset 必须接上；重放尾部 200 replay） */
+  const groupFileUpload = (req, rawBody, url, auth) => withGroupFileRoute(auth, rawBody, applyFileUpload);
+  /** POST /v1/group/file/finish —— 验 size+sha256，通过才公告 */
+  const groupFileFinish = (req, rawBody, url, auth) => withGroupFileRoute(auth, rawBody, applyFileFinish);
+  /** POST /v1/group/file/pull —— 任何（被点名的）成员都能来拉 */
+  const groupFilePull = (req, rawBody, url, auth) => withGroupFileRoute(auth, rawBody, applyFilePull);
+  /** POST /v1/group/file/withdraw —— 上传者或 hub 才能收回 */
+  const groupFileWithdraw = (req, rawBody, url, auth) => withGroupFileRoute(auth, rawBody, applyFileWithdraw);
+
+  /**
+   * GET /v1/group/files —— 公告平面（成员允许：这是同步的那一半）。
+   * 形状与 GET /v1/group/notes 一个模子：{ok, groupId, rev, files}，按看的人过滤。
+   */
+  function groupFilesRead(req, rawBody, url, auth) {
+    const isHub = String(auth.peerId ?? '') === store.instanceId;
+    const value = filesView(auth.peerId, { isHub });
+    if (config.logger) {
+      config.logger('[group-files] plane read from=' + shortPeerId(auth.peerId)
+        + ' rev=' + value.rev + ' n=' + value.files.length);
+    }
+    return {
+      status: 200,
+      body: { ok: true, groupId: String(auth.ctx?.groupId ?? ''), rev: value.rev, files: value.files },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * POST /v1/group/files —— **hub 自己**才能写，成员一律 403 files-hub-only。
+   *
+   * 与 POST /v1/group/notes 同一条口径：白名单只回答「这条路径认不认群签名」，
+   * 「谁能写平面」在这一层判。成员收到 pull 里的 groupFiles 只落镜像、永不回写 ——
+   * 不然任何一个握群钥的成员都能凭空给全群公告一份不存在的文件。
+   *
+   * 这条端点的实际用途不是「随便写」：它让 hub 用**存储里的真相**重建公告
+   * （平面文件被删/写坏之后不必手工编辑 json）。
+   */
+  function groupFilesWrite(req, rawBody, url, auth) {
+    if (!groupFiles || String(auth.peerId ?? '') !== store.instanceId) {
+      if (config.logger) {
+        config.logger('[group-files] plane write refused from=' + shortPeerId(auth.peerId)
+          + ' reason=files-hub-only');
+      }
+      return { status: 403, body: { ok: false, error: 'files-hub-only' }, peerId: auth.peerId };
+    }
+    let announced = 0;
+    for (const entry of groupFiles.store.list()) {
+      const out = groupFiles.plane.announce(entry);
+      if (out.changed === true) announced += 1;
+    }
+    const value = groupFiles.plane.value();
+    if (config.logger) {
+      config.logger('[group-files] plane rebuilt rev=' + value.rev + ' n=' + value.files.length
+        + ' changed=' + announced);
+    }
+    return {
+      status: 200,
+      body: { ok: true, rev: value.rev, files: value.files, changed: announced },
+      peerId: auth.peerId,
+    };
+  }
+
+  // ---- 本机侧（管理接口用）：上行/下载/收回，hub 与成员走同一套语义 -------------
+
+  /**
+   * 一条群文件调用：hub 自己走**本地**那一套 apply*（不经回环 HTTP，同一份语义），
+   * 成员走群级签名（withGroupKey + groupCall，与提案/表决同一条通道）。
+   */
+  async function groupFilesCall(apiPath, body, { timeoutMs = 60_000 } = {}) {
+    if (groupFiles) {
+      const table = {
+        '/v1/group/file/init': applyFileInit,
+        '/v1/group/file/upload': applyFileUpload,
+        '/v1/group/file/finish': applyFileFinish,
+        '/v1/group/file/pull': applyFilePull,
+        '/v1/group/file/withdraw': applyFileWithdraw,
+      };
+      const handler = table[apiPath];
+      if (!handler) return { status: 404, body: { ok: false, error: 'not-found' } };
+      const localAuth = { peerId: store.instanceId, ctx: localGroupContext() };
+      return withGroupFileRoute(localAuth, Buffer.from(JSON.stringify(body ?? {}), 'utf8'), handler);
+    }
+    const hub = groupHubPeer();
+    if (!hub) return { status: 503, body: { ok: false, error: 'hub-not-paired' } };
+    try {
+      const json = await withGroupKey((keyCtx) => groupCall(withIdentity({
+        baseUrl: hub.baseUrl,
+        groupKey: keyCtx.groupKey,
+        groupId: String(keyCtx.groupId),
+        senderId: store.instanceId,
+        selfBaseUrl: localAdvertiseBaseUrl(),
+        method: 'POST',
+        apiPath,
+        body,
+        timeoutMs,
+      })));
+      return { status: 200, body: json };
+    } catch (error) {
+      return {
+        status: Number(error?.status) || 502,
+        body: error?.body && typeof error.body === 'object'
+          ? error.body
+          : { ok: false, error: String(error?.message ?? error).slice(0, 120) },
+      };
+    }
+  }
+
+  /**
+   * 契约（0.12.0-α S2）send：把本机选定的文件**传到 hub**，一块一块来。
+   * path 是本机操作者给的文件（用户自己选的），对端永远不能指定本机路径。
+   * 失败一律 { ok:false, reason }（不抛）：面板与 CLI 只需要一个可判定的结果。
+   */
+  async function sendGroupFile(input = {}) {
+    const startedAt = config.now();
+    const sourcePath = String(input.path ?? '').trim();
+    if (sourcePath === '') return { ok: false, reason: 'path-required' };
+    const targets = normalizeTargets(input.to ?? input.peerId ?? 'all');
+    let stat;
+    try {
+      stat = fs.statSync(sourcePath);
+    } catch {
+      return { ok: false, reason: 'not-found' };
+    }
+    if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
+    const name = sanitizeGroupFileName(sourcePath.split(/[\\/]/).pop() ?? '');
+    if (name === '') return { ok: false, reason: 'bad-name' };
+    const size = stat.size;
+    // 装不进整份配额的东西，连一块都不用发（hub 也会 413，这里先省一趟）
+    if (size > GROUP_FILES_QUOTA_BYTES) return { ok: false, reason: 'too-large', bytes: size };
+    const sha256 = await hashFile(sourcePath);
+    const fileId = randomUUID();
+    const init = await groupFilesCall('/v1/group/file/init', { fileId, name, size, sha256, targets });
+    if (init.status !== 200 && init.status !== 201) {
+      return { ok: false, status: init.status, reason: String(init.body?.error ?? 'init-failed'), bytes: size };
+    }
+    let offset = Number(init.body?.received) || 0;
+    const buffer = Buffer.allocUnsafe(GROUP_FILE_CHUNK_MAX);
+    let round = 0;
+    while (offset < size) {
+      round += 1;
+      let read = 0;
+      try {
+        const handle = fs.openSync(sourcePath, 'r');
+        try {
+          read = fs.readSync(handle, buffer, 0, Math.min(GROUP_FILE_CHUNK_MAX, size - offset), offset);
+        } finally {
+          fs.closeSync(handle);
+        }
+      } catch {
+        return { ok: false, reason: 'read-failed', fileId, bytes: offset };
+      }
+      if (read <= 0) return { ok: false, reason: 'read-failed', fileId, bytes: offset };
+      const up = await groupFilesCall('/v1/group/file/upload', {
+        fileId,
+        offset,
+        dataBase64: Buffer.from(buffer.subarray(0, read)).toString('base64'),
+      });
+      if (up.status !== 200) {
+        const received = Number(up.body?.received);
+        // offset-mismatch 且对端报了「已收到哪」→ 按它重对齐再续（断点续传的唯一路径）
+        if (up.status === 409 && String(up.body?.error) === 'offset-mismatch'
+          && Number.isFinite(received) && received !== offset) {
+          offset = received;
+          continue;
+        }
+        return {
+          ok: false,
+          status: up.status,
+          reason: String(up.body?.error ?? 'upload-failed'),
+          fileId,
+          bytes: offset,
+        };
+      }
+      offset = Number(up.body?.received) || (offset + read);
+    }
+    const finish = await groupFilesCall('/v1/group/file/finish', { fileId });
+    if (finish.status !== 200) {
+      return {
+        ok: false,
+        status: finish.status,
+        reason: String(finish.body?.error ?? 'finish-failed'),
+        fileId,
+        bytes: offset,
+      };
+    }
+    const ms = Math.max(0, config.now() - startedAt);
+    if (config.logger) {
+      // 只记 id 前 8 位 / 字节 / sha 前 8 位 / 目标个数 —— 文件名与路径不进日志
+      config.logger('[group-files] send id=' + fileId.slice(0, 8) + ' bytes=' + size
+        + ' sha=' + sha256.slice(0, 8) + ' targets=' + (targets === 'all' ? 'all' : targets.length)
+        + ' rounds=' + round + ' ms=' + ms);
+    }
+    return {
+      ok: true,
+      fileId,
+      bytes: size,
+      sha256,
+      targets,
+      rev: Number(finish.body?.rev) || null,
+      rounds: round,
+      ms,
+    };
+  }
+
+  /** GET group/files 的数据：可见条目 + gone/downloaded/mine（面板 S3 只读这三个字段） */
+  function listGroupFiles() {
+    const visible = filesView(store.instanceId, { isHub: Boolean(groupFiles) });
+    const rows = visible.files.map((entry) => ({
+      ...entry,
+      gone: entry.gone === true,
+      downloaded: groupDownloads.has(entry.fileId),
+      mine: String(entry.from?.peerId ?? '') === store.instanceId,
+    }));
+    return { rev: visible.rev, files: rows };
+  }
+
+  /**
+   * 契约（0.12.0-α S2）download：把 hub 上的一份群文件拉到本机 inbox。
+   * 校验点只有一处：fileStore.complete()（整文件 hash 对齐声明的 sha256）。
+   */
+  async function downloadGroupFile(rawFileId) {
+    const fileId = parseGroupFileId(rawFileId);
+    if (fileId === '') return { ok: false, reason: 'unknown-file' };
+    const visible = filesView(store.instanceId, { isHub: Boolean(groupFiles) });
+    const entry = visible.files.find((row) => row.fileId === fileId) ?? null;
+    if (!entry) return { ok: false, reason: 'unknown-file' };
+    if (entry.gone === true) return { ok: false, reason: 'file-gone' };
+    const opened = fileStore.offer({
+      transferId: fileId,
+      name: entry.name,
+      size: entry.size,
+      sha256: entry.sha256,
+      from: entry.from,
+    });
+    if (opened.accept !== true) {
+      return { ok: false, reason: String(opened.reason ?? 'offer-rejected'), bytes: entry.size };
+    }
+    let offset = Math.max(0, Math.min(entry.size, Math.floor(Number(opened.resumeFrom) || 0)));
+    while (offset < entry.size) {
+      let chunk;
+      if (groupFiles) {
+        // hub 自己就是持有者：直接读盘，不经回环 HTTP
+        const local = groupFiles.store.open(fileId, offset, GROUP_FILE_CHUNK_MAX);
+        if (local.error) {
+          return { ok: false, reason: String(local.error), received: offset, bytes: entry.size };
+        }
+        chunk = { dataBase64: local.data.toString('base64'), eof: local.eof };
+      } else {
+        const reply = await groupFilesCall('/v1/group/file/pull', { fileId, offset });
+        if (reply.status !== 200) {
+          return {
+            ok: false,
+            status: reply.status,
+            reason: String(reply.body?.error ?? 'pull-failed'),
+            received: offset,
+            bytes: entry.size,
+          };
+        }
+        chunk = reply.body;
+      }
+      const data = Buffer.from(String(chunk?.dataBase64 ?? ''), 'base64');
+      if (data.length === 0) return { ok: false, reason: 'bad-pull', received: offset, bytes: entry.size };
+      const written = fileStore.writeChunk({ transferId: fileId, offset, data });
+      if (written.error) {
+        return { ok: false, reason: String(written.error), received: offset, bytes: entry.size };
+      }
+      offset += data.length;
+      if (chunk?.eof === true && offset >= entry.size) break;
+    }
+    const done = await fileStore.complete({ transferId: fileId });
+    if (!done || done.error) {
+      return { ok: false, reason: String(done?.error ?? 'integrity-failed'), bytes: entry.size };
+    }
+    const accepted = fileStore.accept(done.id);
+    // 已下载台账：面板的 downloaded 只认这一笔（不是「点过下载」，是「盘上真的有」）
+    groupDownloads.add(fileId, { size: entry.size, sha256: entry.sha256 });
+    if (config.logger) {
+      config.logger('[group-files] download id=' + fileId.slice(0, 8) + ' bytes=' + entry.size
+        + ' sha=' + String(entry.sha256).slice(0, 8) + ' accepted=' + (accepted === true));
+    }
+    return { ok: true, fileId, id: done.id, bytes: entry.size, sha256: entry.sha256, accepted: accepted === true };
+  }
+
+  /** 收回自己传的群文件（hub 也能收回任何一条）：字节删掉、公告翻 gone */
+  async function withdrawGroupFile(rawFileId) {
+    const fileId = parseGroupFileId(rawFileId);
+    if (fileId === '') return { ok: false, reason: 'unknown-file' };
+    const out = await groupFilesCall('/v1/group/file/withdraw', { fileId });
+    if (out.status !== 200) {
+      return { ok: false, status: out.status, reason: String(out.body?.error ?? 'withdraw-failed') };
+    }
+    groupDownloads.remove(fileId);
+    return { ok: true, fileId, removed: out.body?.removed === true, rev: Number(out.body?.rev) || null };
+  }
+
   async function groupAuthDispatch(req, rawBody, url) {
     if (groupRole === 'off') return { status: 404, body: { error: 'not-found' } };
     const method = String(req.method ?? 'GET').toUpperCase();
@@ -7926,6 +8581,14 @@ export function createPeerServer(overrides = {}) {
       'POST /v1/group/vote': groupVoteCast,
       'POST /v1/group/vote/open': groupVoteOpen,
       'POST /v1/group/vote/advance': groupVoteAdvance,
+      // 0.12.0-α（S2）群文件：字节的往来 + 公告平面（读成员允许、写 hub only，门在 handler）。
+      'POST /v1/group/file/init': groupFileInit,
+      'POST /v1/group/file/upload': groupFileUpload,
+      'POST /v1/group/file/finish': groupFileFinish,
+      'POST /v1/group/file/pull': groupFilePull,
+      'POST /v1/group/file/withdraw': groupFileWithdraw,
+      'GET /v1/group/files': groupFilesRead,
+      'POST /v1/group/files': groupFilesWrite,
       // S1 查询 leader（GET）/ S3 心跳（POST）共用这一条路径，方法区分
       'GET /v1/group/leader': groupLeader,
       'POST /v1/group/leader': groupHeartbeat,
@@ -8712,6 +9375,10 @@ export function createPeerServer(overrides = {}) {
       const syncedVotes = page.votePlane && typeof page.votePlane === 'object'
         ? replicaStore.setVotes(page.votePlane)
         : null;
+      // 0.12.0-α（S2）：群文件公告同样只落镜像（rev 更大的才采纳），永不回写 hub
+      const syncedFiles = page.groupFiles && typeof page.groupFiles === 'object'
+        ? replicaStore.setFiles(page.groupFiles)
+        : null;
       memberLastError = '';
       // hub 在 pull 响应里自报地址（X-Peer-Base 同一口径）：按名入群的节点本地没有 hub 的
       // 配对记录，靠这一条把地址写进 group-key.json 的成员表（选举/提案要用）。
@@ -8737,6 +9404,9 @@ export function createPeerServer(overrides = {}) {
       }
       if (syncedVotes && syncedVotes.adopted && config.logger) {
         config.logger(`[group] votes sync rev=${syncedVotes.rev} n=${syncedVotes.proposals}`);
+      }
+      if (syncedFiles && syncedFiles.adopted && config.logger) {
+        config.logger(`[group-files] plane sync rev=${syncedFiles.rev} n=${syncedFiles.count}`);
       }
       return { ok: true, added: applied.added, lastSeq: applied.lastSeq };
     } catch (error) {
@@ -10255,6 +10925,18 @@ export function createPeerServer(overrides = {}) {
           closeVote: (input) => closeVoteRound(
             input && typeof input === 'object' ? input.proposalId : input,
           ),
+          // 0.12.0-α（S2）群文件：hub 存一份、成员按需拉。send 的 to 是 'all' 或一个 peerId。
+          files: {
+            send: (input) => sendGroupFile(input ?? {}),
+            list: () => listGroupFiles(),
+            download: (fileId) => downloadGroupFile(fileId),
+            withdraw: (fileId) => withdrawGroupFile(fileId),
+            plane: () => filesPlaneValue(),
+            summary: () => filesSummary(),
+            storeDir: () => groupFiles.store.root,
+            quotaBytes: () => groupFiles.store.total,
+            usedBytes: () => groupFiles.store.used,
+          },
           // 测试/排障可见：还挂着几个表决定时器（关轮与 close() 之后必须是 0）
           voteTimers: () => voteTimers.size,
           // 4b-3：还挂着几个 shelved 重提醒（裁决、close() 之后必须是 0）
@@ -10320,6 +11002,20 @@ export function createPeerServer(overrides = {}) {
           adjudicate: () => ({ ok: false, error: 'votes-hub-only' }),
           closeVote: () => ({ ok: false, error: 'votes-hub-only' }),
           voteTimers: () => 0,
+          // 0.12.0-α（S2）群文件：成员侧同样能 send/download/withdraw（都打到 hub），
+          // 但**没有**字节存储 —— 平面只是 pull 同步来的镜像，写路径压根不存在。
+          files: {
+            send: (input) => sendGroupFile(input ?? {}),
+            list: () => listGroupFiles(),
+            download: (fileId) => downloadGroupFile(fileId),
+            withdraw: (fileId) => withdrawGroupFile(fileId),
+            plane: () => filesPlaneValue(),
+            summary: () => filesSummary(),
+            storeDir: () => null,
+            // 成员没有字节存储：配额只是个报告值（告诉面板「hub 那边是多少」）
+            quotaBytes: () => GROUP_FILES_QUOTA_BYTES,
+            usedBytes: () => 0,
+          },
           // 成员侧没有提醒器：提醒是 hub 的事（只读副本不挂任何定时器）
           shelvedReminders: () => 0,
           remindShelved: () => ({ emitted: false, reason: 'votes-hub-only' }),
@@ -10369,6 +11065,8 @@ export function createPeerServer(overrides = {}) {
       // 0.8.5-α 契约 §2：未确认 10 分钟自动拒收删除（unref，不吊住进程）
       fileStore.start();
       fileOutbox.start();
+      // 0.12.0-α（S2）：群文件的半截上传/配额清扫（同样 unref，close() 里清掉）
+      groupFiles?.store.start();
       // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
       dispatchPending.start();
       // 0.10.0-α slice 4b-1：上一段进程遗留的 open 轮重新挂上定时器（过点的立刻结算）
@@ -10408,6 +11106,8 @@ export function createPeerServer(overrides = {}) {
       // 0.8.5-α：待确认 TTL 定时器（unref 起来的，热重载时必须显式清掉）
       fileStore.close();
       fileOutbox.close();
+      // 0.12.0-α（S2）：群文件清扫器一并收尾（热重载不留定时器）
+      groupFiles?.close();
       // 0.8.5-α 契约 §3：待批准队列同样要收尾（并丢掉只存在内存里的正文）
       dispatchPending.close();
       dispatchPrompts.clear();
