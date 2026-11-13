@@ -192,7 +192,7 @@ import {
   normalizeNotesValue,
   notesSummary,
 } from '../lib/group-notes.mjs';
-// 0.12.0-α（S2）群文件：hub 侧一份拷贝 + 公告平面。纯模块（零 I/O 语义以外的网络），
+// 0.12.0-alpha（S2）群文件：hub 侧一份拷贝 + 公告平面。纯模块（零 I/O 语义以外的网络），
 // 落盘/走线/门禁都在本文件；单测直接驱动那个模块。
 import {
   GROUP_FILE_CHUNK_MAX,
@@ -233,7 +233,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.12.0-α';
+export const PLUGIN_VERSION = '0.12.0-alpha';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -2399,7 +2399,7 @@ export class GroupReplicaStore {
   }
 
   /**
-   * 0.12.0-α S2：同步来的群文件公告平面（只读镜像）。
+   * 0.12.0-alpha S2：同步来的群文件公告平面（只读镜像）。
    * 成员侧**永不**写 hub 那份：这里只是 pull 同步来的缓存，形状 {rev, files}。
    */
   files() {
@@ -2839,7 +2839,7 @@ export function createPeerServer(overrides = {}) {
   });
 
   /**
-   * 0.12.0-α S1（单发 offer/pull）：发送方的 keeper 拷贝（outbox）、接收方的待下载条目
+   * 0.12.0-alpha S1（单发 offer/pull）：发送方的 keeper 拷贝（outbox）、接收方的待下载条目
    * （offers，只有 metadata）与 per-peer 信任标记（file-trust.json）。
    * 三块都在 <stateDir> 下，各自独占自己的目录；定时清扫与 fileStore 一样 unref。
    */
@@ -3055,7 +3055,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   // -------------------------------------------------------------------------
-  // 0.12.0-α（S2）· 群文件：hub 存**一份**，成员按需来拉
+  // 0.12.0-alpha（S2）· 群文件：hub 存**一份**，成员按需来拉
   //
   // 三块落盘全在 lib/group-files.mjs：
   //   group-files/<fileId>/{meta.json,data}   字节（只有 hub 有）
@@ -3690,7 +3690,7 @@ export function createPeerServer(overrides = {}) {
   ]);
 
   /**
-   * 0.12.0-α（S2）群文件的七条路径，与纪要/表决同一个机制（契约 §7 的 11 条是**冻结**的，
+   * 0.12.0-alpha（S2）群文件的七条路径，与纪要/表决同一个机制（契约 §7 的 11 条是**冻结**的，
    * host/test/group-auth.test.mjs 逐条钉死，一个都不改 —— 新端点只能加在本侧集合里）。
    * 「谁能写」由 handler 判（hub-only 的门在 handler 里），与这份白名单无关。
    */
@@ -6367,7 +6367,7 @@ export function createPeerServer(overrides = {}) {
         // 0.10.0-α slice 4b-1：表决平面也搭**同一次 pull** 回来（与纪要同一个理由：不新增轮询）。
         // 成员拿到只落副本（replicaStore.setVotes），永不回写 hub —— hub 是唯一写者。
         votePlane: votePlaneView(),
-        // 0.12.0-α（S2）：群文件公告搭**同一次 pull** 回来（与纪要/表决同一个理由：不新增轮询）。
+        // 0.12.0-alpha（S2）：群文件公告搭**同一次 pull** 回来（与纪要/表决同一个理由：不新增轮询）。
         // 按**收件人**过滤：targets:[peerId] 的条目只发给那一个人（hub 自己全见）。
         // 成员拿到只落镜像（replicaStore.setFiles），永不回写 hub —— 平面 hub 单写。
         groupFiles: filesView(auth.peerId, { isHub: false }),
@@ -8028,7 +8028,7 @@ export function createPeerServer(overrides = {}) {
     return { status: 503, body: { error: 'quorum-unavailable', epoch: st.epoch }, peerId: input.peerId };
   }
   // -------------------------------------------------------------------------
-  // 0.12.0-α（S2）· 群文件端点（群级鉴权）
+  // 0.12.0-alpha（S2）· 群文件端点（群级鉴权）
   //
   // 模型：发送方往 hub **传一份**，成员按需来 hub 拉。targets:'all' 与 targets:[peerId]
   // 走**同一条**路径（点名给一个人的也落在 hub：发送方下线之后它照样在）。
@@ -8049,6 +8049,19 @@ export function createPeerServer(overrides = {}) {
   function requireFilesHub() {
     if (groupFiles) return null;
     return { status: 403, body: { ok: false, error: 'files-hub-only' } };
+  }
+
+  /**
+   * targets 点名了**发送者自己** → 稳定码 self-target。
+   *
+   * 'all' 不算：全体成员是群的口径，不是「只给我自己」。而 [自己] 会把一份只有上传者能看见、
+   * 谁也用不上的字节写进 hub 的配额 —— 两道闸都拒：hub 的 init（durable）与发送侧（本机连字节
+   * 都不读）。判据只有这一份，两处调用同一行。
+   */
+  function targetsSelf(targets, peerId) {
+    const id = String(peerId ?? '');
+    if (id === '' || targets === 'all' || !Array.isArray(targets)) return false;
+    return targets.includes(id);
   }
 
   /** 上传者本人或 hub 自己 —— 只有他们能动这一条 */
@@ -8082,8 +8095,15 @@ export function createPeerServer(overrides = {}) {
       return { status: 400, body: { ok: false, error: 'bad-request' } };
     }
     // targets 归一化在这里算一次：store.begin 只在内部持有它，返回值里没有 targets
-    // （0.12.0-α 曾在这里读 out.targets.length —— 开了 logger 就是 500）
+    // （0.12.0-alpha 曾在这里读 out.targets.length —— 开了 logger 就是 500）
     const targets = normalizeTargets(body.targets);
+    // 发给自己：在任何字节/临时目录存在之前就拒（store.begin 会建 group-files/<id>）
+    if (targetsSelf(targets, auth.peerId)) {
+      if (config.logger) {
+        config.logger('[group-files] init refused from=' + shortPeerId(auth.peerId) + ' reason=self-target');
+      }
+      return { status: 400, body: { ok: false, error: 'self-target' } };
+    }
     const out = groupFiles.store.begin({
       fileId,
       name,
@@ -8381,7 +8401,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 契约（0.12.0-α S2）send：把本机选定的文件**传到 hub**，一块一块来。
+   * 契约（0.12.0-alpha S2）send：把本机选定的文件**传到 hub**，一块一块来。
    * path 是本机操作者给的文件（用户自己选的），对端永远不能指定本机路径。
    * 失败一律 { ok:false, reason }（不抛）：面板与 CLI 只需要一个可判定的结果。
    */
@@ -8390,6 +8410,8 @@ export function createPeerServer(overrides = {}) {
     const sourcePath = String(input.path ?? '').trim();
     if (sourcePath === '') return { ok: false, reason: 'path-required' };
     const targets = normalizeTargets(input.to ?? input.peerId ?? 'all');
+    // 发给自己是死字节：本机连 stat/hash 都不做，直接给稳定码（hub 的 init 闸是 durable 的那一道）
+    if (targetsSelf(targets, store.instanceId)) return { ok: false, reason: 'self-target' };
     let stat;
     try {
       stat = fs.statSync(sourcePath);
@@ -8490,7 +8512,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 契约（0.12.0-α S2）download：把 hub 上的一份群文件拉到本机 inbox。
+   * 契约（0.12.0-alpha S2）download：把 hub 上的一份群文件拉到本机 inbox。
    * 校验点只有一处：fileStore.complete()（整文件 hash 对齐声明的 sha256）。
    */
   async function downloadGroupFile(rawFileId) {
@@ -8584,7 +8606,7 @@ export function createPeerServer(overrides = {}) {
       'POST /v1/group/vote': groupVoteCast,
       'POST /v1/group/vote/open': groupVoteOpen,
       'POST /v1/group/vote/advance': groupVoteAdvance,
-      // 0.12.0-α（S2）群文件：字节的往来 + 公告平面（读成员允许、写 hub only，门在 handler）。
+      // 0.12.0-alpha（S2）群文件：字节的往来 + 公告平面（读成员允许、写 hub only，门在 handler）。
       'POST /v1/group/file/init': groupFileInit,
       'POST /v1/group/file/upload': groupFileUpload,
       'POST /v1/group/file/finish': groupFileFinish,
@@ -9378,7 +9400,7 @@ export function createPeerServer(overrides = {}) {
       const syncedVotes = page.votePlane && typeof page.votePlane === 'object'
         ? replicaStore.setVotes(page.votePlane)
         : null;
-      // 0.12.0-α（S2）：群文件公告同样只落镜像（rev 更大的才采纳），永不回写 hub
+      // 0.12.0-alpha（S2）：群文件公告同样只落镜像（rev 更大的才采纳），永不回写 hub
       const syncedFiles = page.groupFiles && typeof page.groupFiles === 'object'
         ? replicaStore.setFiles(page.groupFiles)
         : null;
@@ -9467,7 +9489,7 @@ export function createPeerServer(overrides = {}) {
 
   /**
    * POST /v1/file/offer —— 对端（发送方）只报 metadata：本机记一条「待下载」，**一个字节都不收**。
-   * 0.12.0-α S1（单发 offer/pull 模型）：字节留在发送方 outbox 里，等本机点了下载再来拉。
+   * 0.12.0-alpha S1（单发 offer/pull 模型）：字节留在发送方 outbox 里，等本机点了下载再来拉。
    */
   function fileOfferInbound(req, rawBody) {
     const auth = authenticate(req, rawBody);
@@ -9597,7 +9619,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 契约（0.12.0-α S1）send：把**本机**选定的文件收进 outbox，只把 metadata 报给对端。
+   * 契约（0.12.0-alpha S1）send：把**本机**选定的文件收进 outbox，只把 metadata 报给对端。
    * 失败一律 { ok:false, reason }（不抛）：面板与 CLI 只需要一个可判定的结果。
    * 注：这里读的 path 是本机操作者给的文件（发送端自己的选择），
    * 对端永远不能指定本机路径 —— 落盘路径只由 fileOutbox / fileStore 拼。
@@ -9681,7 +9703,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 契约（0.12.0-α S1）download：把一条待下载条目真正拉下来（逐块 pull），验 sha256 后落 inbox。
+   * 契约（0.12.0-alpha S1）download：把一条待下载条目真正拉下来（逐块 pull），验 sha256 后落 inbox。
    *
    * 校验点只有一处：fileStore.complete() —— 它把 .incoming 拼好的整文件 hash 一遍，
    * 与 offer 声明的 sha256 不一致就 checksum-mismatch 并 dropPart()（半截文件一并删掉）。
@@ -9816,7 +9838,7 @@ export function createPeerServer(overrides = {}) {
     };
   }
 
-  /** 契约（0.12.0-α S1）decline：丢掉一条待下载条目（不发网络请求：对端不必知道） */
+  /** 契约（0.12.0-alpha S1）decline：丢掉一条待下载条目（不发网络请求：对端不必知道） */
   function declineOffer(rawFileId) {
     const fileId = parseFileId(rawFileId);
     if (fileId === '') return { ok: false, reason: 'unknown-file' };
@@ -9830,7 +9852,7 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 文件门面（0.12.0-α S1：list/send/download/decline/setTrust/progress）。
+   * 文件门面（0.12.0-alpha S1：list/send/download/decline/setTrust/progress）。
    * 管理接口（lib/admin.mjs）只调这里；面板与 CLI 都经管理接口，不直接碰盘。
    */
   const filesFacade = {
@@ -9850,7 +9872,7 @@ export function createPeerServer(overrides = {}) {
       ...fileStore.list(),
     ],
     /**
-     * 0.12.0-α S3b：发送方的「我发出的」桶。每条 keeper 拷贝一行，只有 metadata：
+     * 0.12.0-alpha S3b：发送方的「我发出的」桶。每条 keeper 拷贝一行，只有 metadata：
      * 高水位（pulledBytes）+ 三态（waiting/pulling/pulled）都由 FileOutbox 算，
      * 这里只把 to 从 peerId 补成 { peerId, name }（名字来自 peers.json，对端自报）。
      */
@@ -10937,7 +10959,7 @@ export function createPeerServer(overrides = {}) {
           closeVote: (input) => closeVoteRound(
             input && typeof input === 'object' ? input.proposalId : input,
           ),
-          // 0.12.0-α（S2）群文件：hub 存一份、成员按需拉。send 的 to 是 'all' 或一个 peerId。
+          // 0.12.0-alpha（S2）群文件：hub 存一份、成员按需拉。send 的 to 是 'all' 或一个 peerId。
           files: {
             send: (input) => sendGroupFile(input ?? {}),
             list: () => listGroupFiles(),
@@ -11014,7 +11036,7 @@ export function createPeerServer(overrides = {}) {
           adjudicate: () => ({ ok: false, error: 'votes-hub-only' }),
           closeVote: () => ({ ok: false, error: 'votes-hub-only' }),
           voteTimers: () => 0,
-          // 0.12.0-α（S2）群文件：成员侧同样能 send/download/withdraw（都打到 hub），
+          // 0.12.0-alpha（S2）群文件：成员侧同样能 send/download/withdraw（都打到 hub），
           // 但**没有**字节存储 —— 平面只是 pull 同步来的镜像，写路径压根不存在。
           files: {
             send: (input) => sendGroupFile(input ?? {}),
@@ -11077,7 +11099,7 @@ export function createPeerServer(overrides = {}) {
       // 0.8.5-α 契约 §2：未确认 10 分钟自动拒收删除（unref，不吊住进程）
       fileStore.start();
       fileOutbox.start();
-      // 0.12.0-α（S2）：群文件的半截上传/配额清扫（同样 unref，close() 里清掉）
+      // 0.12.0-alpha（S2）：群文件的半截上传/配额清扫（同样 unref，close() 里清掉）
       groupFiles?.store.start();
       // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
       dispatchPending.start();
@@ -11118,7 +11140,7 @@ export function createPeerServer(overrides = {}) {
       // 0.8.5-α：待确认 TTL 定时器（unref 起来的，热重载时必须显式清掉）
       fileStore.close();
       fileOutbox.close();
-      // 0.12.0-α（S2）：群文件清扫器一并收尾（热重载不留定时器）
+      // 0.12.0-alpha（S2）：群文件清扫器一并收尾（热重载不留定时器）
       groupFiles?.close();
       // 0.8.5-α 契约 §3：待批准队列同样要收尾（并丢掉只存在内存里的正文）
       dispatchPending.close();

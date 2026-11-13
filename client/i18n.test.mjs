@@ -144,7 +144,7 @@ test('同一个错误在两种语言下：文案翻译，稳定标识与退出�
     assert.ok(out.stderr.includes('/v1/unpair'), '协议路径不翻译');
   }
 
-  // 0.12.0-α：inbox accept 已随推送模型一起删除，改指 download（缺 id 仍是用法错误）
+  // 0.12.0-alpha：inbox accept 已随推送模型一起删除，改指 download（缺 id 仍是用法错误）
   const usageZh = await run(['inbox', 'download', '--state-dir', dir, '--lang', 'zh']);
   const usageEn = await run(['inbox', 'download', '--state-dir', dir, '--lang', 'en']);
   assert.equal(usageZh.status, 1, '缺 id 是用法错误 exit 1，与语言无关');

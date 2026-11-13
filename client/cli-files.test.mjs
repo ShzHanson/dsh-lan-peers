@@ -1,4 +1,4 @@
-// dsh-lan-peers · 0.12.0-α（S1）CLI：send-file（挂出待下载）/ inbox（list / download / decline）。
+// dsh-lan-peers · 0.12.0-alpha（S1）CLI：send-file（挂出待下载）/ inbox（list / download / decline）。
 //
 // 三条命令都只打本机回环管理接口（/api/lan-peers/files*），所以这里起一个只实现
 // 那几条路由的 node:http 桩，真跑 cli.mjs 子进程，断言请求形状（含 token 头）、

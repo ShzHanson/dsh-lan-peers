@@ -1386,7 +1386,7 @@ async function cmdGroup(args) {
 // v0.8.5-α 文件互传（契约 §3/§4，Lane F2）
 //
 // 三条命令都只打本机回环管理接口（/api/lan-peers/files*）：CLI 是独立进程，
-// 伙伴密钥与实际读写都在 host 里。0.12.0-α S1 起是**单发 offer/pull**：
+// 伙伴密钥与实际读写都在 host 里。0.12.0-alpha S1 起是**单发 offer/pull**：
 // send-file 只在对方那里挂一条「待下载」，字节留在本机 outbox，等对方点下载时来拉。
 // 日志/输出口径（契约 §0）：只报 size、sha256、状态与来源，不打印文件内容。
 // ---------------------------------------------------------------------------
@@ -1395,7 +1395,7 @@ async function cmdGroup(args) {
 function reportFilesError(error) {
   const text = String(error && error.message ? error.message : error);
   process.stderr.write(L('cli.file.failed', { text }) + '\n');
-  // 0.12.0-α S1：503 holder-offline（对端关着/逐出了）与 409 file-gone 同属「现在做不了」
+  // 0.12.0-alpha S1：503 holder-offline（对端关着/逐出了）与 409 file-gone 同属「现在做不了」
   process.exitCode = /^(40[39]|50[13])\b/.test(text) ? 2 : 1;
 }
 

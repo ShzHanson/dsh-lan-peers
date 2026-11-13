@@ -1,4 +1,4 @@
-// dsh-lan-peers · 0.12.0-α（S1）单发 offer/pull 模型：真节点端到端。
+// dsh-lan-peers · 0.12.0-alpha（S1）单发 offer/pull 模型：真节点端到端。
 //
 // 两条真 createPeerServer（真实 HTTP、真实签名/信封）覆盖：
 //   T4 offer（只有 metadata）→ 逐块 pull → sha256 对齐 → 落 inbox

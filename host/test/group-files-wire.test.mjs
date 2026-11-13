@@ -1,4 +1,4 @@
-// dsh-lan-peers · 0.12.0-α（S2）群文件：**线上**那一段（真节点、真群签名、真信封）。
+// dsh-lan-peers · 0.12.0-alpha（S2）群文件：**线上**那一段（真节点、真群签名、真信封）。
 //
 //   U1 三块上传 → finish：hub 盘上 sha 一致、公告 rev 前进（管理接口 send 走的是同一条路径）
 //   U2 前跳 409 / 重放 200 replay:true 且 hub 盘上不出现重复字节
@@ -319,9 +319,11 @@ test('S2-U5 成员拉全文件 sha 一致；非目标成员 403；非成员连�
   assert.equal(sha256(pulled), sha256(data));
   assert.deepEqual(pulled, data);
 
-  // 非目标成员：targets 只点自己之外的人 → 403 forbidden（「不是你的，一个字节也拿不走」）
+  // 非目标成员：targets 只点别人 → 403 forbidden（「不是你的，一个字节也拿不走」）
+  // 0.12.0-alpha 修缺陷：这一格原本点的是 m1 自己（= 只有上传者看得见的死字节，现在 init 就 400），
+  // 换成点 hub 自己 —— 用例要的仍然只是「m2 不是目标」，断言一个字没动。
   const targeted = await uploadFile(cluster, hub.baseUrl, m1.peerId, {
-    name: 'only-m1.bin', data: payload(300, 8), targets: [m1.peerId],
+    name: 'only-hub.bin', data: payload(300, 8), targets: [hub.peerId],
   });
   await expectCode(
     postAs(cluster, hub.baseUrl, m2.peerId, '/v1/group/file/pull', { fileId: targeted.fileId, offset: 0 }),
@@ -523,7 +525,7 @@ test('Q3/Q4 files/upload/finish scope:group —— hub 收下字节、公告按 
   }
 });
 test('S2-U9 打开 logger 也照样 2xx：init 日志形状对、且不含文件名/路径（日志读错字段的回归）', async (t) => {
-  // 这一条就是 0.12.0-α 线上那个 500 的回归：applyFileInit 曾读 out.targets.length，
+  // 这一条就是 0.12.0-alpha 线上那个 500 的回归：applyFileInit 曾读 out.targets.length，
   // 而 store.begin 从不返回 targets —— 只有**配了 logger**的进程才会炸，CI 一直是绿的。
   const lines = [];
   const cluster = await startCluster(t, { count: 2, logger: (line) => { lines.push(String(line)); } });
@@ -557,3 +559,79 @@ test('S2-U9 打开 logger 也照样 2xx：init 日志形状对、且不含文件
     assert.equal(line.includes('group-files/' + fileId), false, '路径进了日志：' + line);
   }
 });
+
+
+// ---------------------------------------------------------------------------
+// U10-U12：**发给自己**是一份死字节（只有上传者看得见、谁也用不上，还占 hub 配额）
+//   U10 管理接口 send → 400 self-target，hub 一个 group-files/<id> 都不建、公告 rev 不动
+//   U11 线上 init（targets 只有自己）→ 400 self-target，一个字节都没落盘
+//   U12 合法那两格（all / 另一个成员）照旧成功 —— 闸不许误伤
+// ---------------------------------------------------------------------------
+test('S2-U10 管理接口发给自己：400 self-target、不建目录、公告 rev 不动', async (t) => {
+  const cluster = await startCluster(t, { count: 2 });
+  const [hub] = cluster.nodes;
+  const { createAdmin } = await import('../../lib/admin.mjs');
+  const hubAdmin = createAdmin({ server: hub.server });
+  const localPath = path.join(hub.dir, 'self.bin');
+  fs.writeFileSync(localPath, payload(300, 11));
+  const filesDir = path.join(hub.dir, 'group-files');
+  const dirsBefore = fs.existsSync(filesDir) ? fs.readdirSync(filesDir).length : 0;
+  const revBefore = hub.server.group.files.plane().rev;
+
+  const sent = await hitAdmin(hubAdmin, 'POST', '/api/lan-peers/group/files/send',
+    { peerId: hub.peerId, path: localPath });
+  assert.equal(sent.status, 400, '发给自己是 400：' + JSON.stringify(sent.json));
+  assert.equal(sent.json.error, 'self-target', '稳定码');
+  assert.equal(fs.existsSync(filesDir) ? fs.readdirSync(filesDir).length : 0, dirsBefore,
+    '不许建 group-files/<id>（一个目录都不多）');
+  assert.equal(hub.server.group.files.plane().rev, revBefore, '公告 rev 不动');
+});
+
+test('S2-U11 线上 init 只点名自己：400 self-target，一个字节都没落盘', async (t) => {
+  const cluster = await startCluster(t, { count: 2 });
+  const [hub, member] = cluster.nodes;
+  const data = payload(500, 12);
+  const fileId = randomUUID();
+  const revBefore = hub.server.group.files.plane().rev;
+
+  await expectCode(postAs(cluster, hub.baseUrl, member.peerId, '/v1/group/file/init', {
+    fileId, name: 'self.bin', size: data.length, sha256: sha256(data), targets: [member.peerId],
+  }), 400, 'self-target');
+  assert.equal(fs.existsSync(path.join(hub.dir, 'group-files', fileId)), false, '临时目录都不许建');
+  assert.equal(hub.server.group.files.plane().rev, revBefore, '公告 rev 不动');
+  // store 里没有这一条：upload 连门都找不到（证明 init 之前就已经拒了）
+  await expectCode(postAs(cluster, hub.baseUrl, member.peerId, '/v1/group/file/upload', {
+    fileId, offset: 0, dataBase64: data.subarray(0, 400).toString('base64'),
+  }), 404, 'unknown-file');
+
+  // 判据是「targets 里出现上传者」而不是「只有上传者」：混在别人中间也拒（一条规则，不做两套）
+  await expectCode(postAs(cluster, hub.baseUrl, member.peerId, '/v1/group/file/init', {
+    fileId: randomUUID(), name: 'mixed.bin', size: data.length, sha256: sha256(data),
+    targets: [hub.peerId, member.peerId],
+  }), 400, 'self-target');
+});
+
+test('S2-U12 合法目标照旧：all 与另一个成员都成功，成员也能往 hub 发', async (t) => {
+  const cluster = await startCluster(t, { count: 2 });
+  const [hub, member] = cluster.nodes;
+  const { createAdmin } = await import('../../lib/admin.mjs');
+  const hubAdmin = createAdmin({ server: hub.server });
+  const localPath = path.join(hub.dir, 'legit.bin');
+  fs.writeFileSync(localPath, payload(200, 13));
+
+  const all = await hitAdmin(hubAdmin, 'POST', '/api/lan-peers/group/files/send',
+    { peerId: 'all', path: localPath });
+  assert.equal(all.status, 200, JSON.stringify(all.json));
+  const one = await hitAdmin(hubAdmin, 'POST', '/api/lan-peers/group/files/send',
+    { peerId: member.peerId, path: localPath });
+  assert.equal(one.status, 200, JSON.stringify(one.json));
+  const row = hub.server.group.files.plane().files.find((entry) => entry.fileId === one.json.fileId);
+  assert.ok(row, '点名给另一个成员的那份必须在公告里');
+  assert.equal(row.from.peerId, hub.peerId);
+  assert.deepEqual(row.targets, [member.peerId], 'targets 原样落到公告');
+
+  const wire = await uploadFile(cluster, hub.baseUrl, member.peerId,
+    { name: 'ok.bin', data: payload(300, 14), targets: [hub.peerId] });
+  assert.equal(wire.done.ok, true, '成员发给 hub（另一个 peerId）照旧成功');
+});
+
