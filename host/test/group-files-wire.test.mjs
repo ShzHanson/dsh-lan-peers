@@ -8,6 +8,7 @@
 //   U6 可见性：targets:[peerId] 只给那个人，targets:'all' 两边都见
 //   U7 成员写平面 → 403 files-hub-only；成员镜像 rev 跟得上 hub
 //   U8 withdraw：hub 删字节、公告翻 gone，成员镜像跟着变，pull 409
+//   U9 **打开 logger** 也照样 2xx：init 日志形状对、且日志里没有文件名/路径（线上 500 的回归）
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -519,5 +520,40 @@ test('Q3/Q4 files/upload/finish scope:group —— hub 收下字节、公告按 
     assert.deepEqual(hub.server.files.outbox(), [], '不许留下一条私聊 keeper 拷贝');
     assert.deepEqual(hub.server.files.list().filter((entry) => entry.state === 'offer'), [],
       '不许挂出私聊 offer（群这一趟终点在 hub）');
+  }
+});
+test('S2-U9 打开 logger 也照样 2xx：init 日志形状对、且不含文件名/路径（日志读错字段的回归）', async (t) => {
+  // 这一条就是 0.12.0-α 线上那个 500 的回归：applyFileInit 曾读 out.targets.length，
+  // 而 store.begin 从不返回 targets —— 只有**配了 logger**的进程才会炸，CI 一直是绿的。
+  const lines = [];
+  const cluster = await startCluster(t, { count: 2, logger: (line) => { lines.push(String(line)); } });
+  const [hub, member] = cluster.nodes;
+  lines.length = 0; // 起群那一阵的日志不算这一趟
+
+  const name = '季度报告-秘密名.bin';
+  const data = payload(600, 13);
+  const { fileId, init, done } = await uploadFile(cluster, hub.baseUrl, member.peerId, { name, data, chunkSize: 300 });
+
+  // (a) 不抛错、两段都是 2xx（logger 打开时曾经是 500 internal）
+  assert.equal(init.ok, true, 'init 必须是 2xx：' + JSON.stringify(init));
+  assert.equal(init.received, 0);
+  assert.equal(done.ok, true, 'finish 必须是 2xx：' + JSON.stringify(done));
+  assert.equal(done.sha256, sha256(data));
+
+  // (b) 至少一条 init 形状的日志：id 前 8 / 字节 / sha 前 8 / 目标个数（这里是 all）
+  const initLine = lines.find((line) => line.startsWith('[group-files] init from='));
+  assert.ok(initLine, '必须记下一条 init 日志，实际：' + JSON.stringify(lines.slice(0, 8)));
+  assert.match(initLine, / id=[0-9a-f]{8} /);
+  assert.ok(initLine.includes(' id=' + fileId.slice(0, 8) + ' '), '日志里的 id 是这一条的：' + initLine);
+  assert.ok(initLine.includes(' bytes=' + data.length + ' '), '字节数要在：' + initLine);
+  assert.ok(initLine.includes(' sha=' + sha256(data).slice(0, 8) + ' '), 'sha 前 8 位要在：' + initLine);
+  assert.match(initLine, / targets=all replay=false$/, '日志口径是「目标个数或 all」：' + initLine);
+
+  // (c) 所有日志都不带文件名、不带路径（契约 §0：日志只认 id/字节/sha/目标个数）
+  for (const line of lines) {
+    assert.equal(line.includes(name), false, '文件名进了日志：' + line);
+    assert.equal(line.includes('秘密名'), false, '文件名进了日志：' + line);
+    assert.equal(line.includes(hub.dir), false, '路径进了日志：' + line);
+    assert.equal(line.includes('group-files/' + fileId), false, '路径进了日志：' + line);
   }
 });

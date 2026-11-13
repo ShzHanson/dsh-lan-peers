@@ -8081,13 +8081,16 @@ export function createPeerServer(overrides = {}) {
       || !/^[0-9a-f]{64}$/.test(sha256)) {
       return { status: 400, body: { ok: false, error: 'bad-request' } };
     }
+    // targets 归一化在这里算一次：store.begin 只在内部持有它，返回值里没有 targets
+    // （0.12.0-α 曾在这里读 out.targets.length —— 开了 logger 就是 500）
+    const targets = normalizeTargets(body.targets);
     const out = groupFiles.store.begin({
       fileId,
       name,
       size,
       sha256,
       from: { peerId: String(auth.peerId ?? ''), name: groupMemberName(String(auth.peerId ?? '')) },
-      targets: body.targets,
+      targets,
     });
     if (!out.ok) {
       const status = out.error === 'too-large' ? 413
@@ -8102,7 +8105,7 @@ export function createPeerServer(overrides = {}) {
       // 日志口径（契约 §0）：id / 字节 / sha 前 8 位 / 目标个数 —— 文件名与路径绝不进日志
       config.logger('[group-files] init from=' + shortPeerId(auth.peerId) + ' id=' + fileId.slice(0, 8)
         + ' bytes=' + size + ' sha=' + sha256.slice(0, 8)
-        + ' targets=' + (out.targets === 'all' ? 'all' : String(out.targets.length))
+        + ' targets=' + (targets === 'all' ? 'all' : String(targets.length))
         + ' replay=' + (out.replay === true));
     }
     return {
