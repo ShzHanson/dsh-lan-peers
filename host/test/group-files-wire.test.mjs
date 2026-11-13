@@ -17,6 +17,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { groupCall } from '../../lib/group-client.mjs';
+import { visibleFiles } from '../../lib/group-files.mjs';
 import { startCluster, waitFor } from './group-cluster.mjs';
 
 const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
@@ -426,5 +427,97 @@ test('S2-U8 withdraw：hub 删字节、公告翻 gone、成员镜像跟着变、
     const plane = node.server.group.files.plane();
     assert.equal(plane.rev, out.rev);
     assert.equal(plane.files.find((row) => row.fileId === fileId).gone, true);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// S3b：群发不再只认本机绝对路径 —— 浏览器选的文件走同一条 group 路由链
+//
+// 非空化：把 admin 的 files/upload/finish 里的 groupScope 分支拆掉（一律走
+// facade.send）→ 下面「hub 盘上有字节 / 公告有这一条 / 没有 DM offer」三组断言全红，
+// 因为那一刻走的是私聊 offer，hub 的群字节存储一个字节都收不到。
+// ---------------------------------------------------------------------------
+
+/** 浏览器上传链（管理接口那一侧）：init → chunk × N，返回 uploadId。 */
+async function adminUpload(admin, { name, bytes, chunk = 400 }) {
+  const init = await hitAdmin(admin, 'POST', '/api/lan-peers/files/upload/init', { name, bytes: bytes.length });
+  assert.equal(init.status, 200, JSON.stringify(init.json));
+  const uploadId = String(init.json.uploadId ?? '');
+  assert.ok(uploadId !== '');
+  let offset = 0;
+  while (offset < bytes.length) {
+    const slice = bytes.subarray(offset, Math.min(bytes.length, offset + chunk));
+    const out = await hitAdmin(admin, 'POST', '/api/lan-peers/files/upload/chunk', {
+      uploadId,
+      offset,
+      dataBase64: Buffer.from(slice).toString('base64'),
+    });
+    assert.equal(out.status, 200, JSON.stringify(out.json));
+    offset += slice.length;
+  }
+  return uploadId;
+}
+
+test('Q3/Q4 files/upload/finish scope:group —— hub 收下字节、公告按 targets 可见、临时目录消失、无 DM offer', async (t) => {
+  const cluster = await startCluster(t, { count: 3 });
+  const [hub, m1, m2] = cluster.nodes;
+  const { createAdmin } = await import('../../lib/admin.mjs');
+  const hubAdmin = createAdmin({ server: hub.server });
+
+  for (const [targets, visibleTo, hiddenFrom] of [
+    ['all', [m1.peerId, m2.peerId], null],
+    [m2.peerId, [m2.peerId], m1.peerId],
+  ]) {
+    const data = payload(900, 11);
+    const name = 'browser-' + (targets === 'all' ? 'all' : 'direct') + '.bin';
+    const uploadId = await adminUpload(hubAdmin, { name, bytes: data });
+    const uploadDir = path.join(hub.dir, '.upload-tmp', uploadId);
+    assert.equal(fs.existsSync(uploadDir), true, '上传过程中临时目录必须在');
+
+    const finish = await hitAdmin(hubAdmin, 'POST', '/api/lan-peers/files/upload/finish', {
+      uploadId, scope: 'group', targets,
+    });
+    assert.equal(finish.status, 200, JSON.stringify(finish.json));
+    assert.equal(finish.json.ok, true);
+    assert.equal(finish.json.uploadId, uploadId);
+    assert.equal(finish.json.offer, undefined, '群这一趟没有 offer 这一格');
+    const fileId = String(finish.json.fileId ?? '');
+    assert.ok(fileId !== '');
+
+    // 1) hub 盘上真的有这份字节，且逐字相同
+    const onDisk = path.join(hub.dir, 'group-files', fileId, 'data');
+    assert.equal(fs.existsSync(onDisk), true, 'hub 必须收下这份字节');
+    assert.equal(sha256(fs.readFileSync(onDisk)), sha256(data));
+    assert.equal(finish.json.sha256, sha256(data));
+
+    // 2) 公告带着这一趟的 targets
+    const plane = hub.server.group.files.plane();
+    const row = plane.files.find((entry) => entry.fileId === fileId);
+    assert.ok(row, 'finish 之后必须有这一条公告');
+    assert.deepEqual(row.targets, targets === 'all' ? 'all' : [m2.peerId]);
+    assert.equal(row.name, name);
+    assert.equal(row.sha256, sha256(data));
+
+    // 3) 可见性只走既有那一个实现
+    for (const peerId of visibleTo) {
+      assert.equal(
+        visibleFiles(plane, { peerId }).some((entry) => entry.fileId === fileId),
+        true,
+        'targets 里的人必须看得见：' + peerId.slice(0, 8),
+      );
+    }
+    if (hiddenFrom) {
+      assert.equal(
+        visibleFiles(plane, { peerId: hiddenFrom }).some((entry) => entry.fileId === fileId),
+        false,
+        '没被点名的人看不见：' + hiddenFrom.slice(0, 8),
+      );
+    }
+
+    // 4) 临时目录不见了（同一个 finally），5) 没有挂出任何私聊 offer
+    assert.equal(fs.existsSync(uploadDir), false, 'finish 之后临时目录必须消失');
+    assert.deepEqual(hub.server.files.outbox(), [], '不许留下一条私聊 keeper 拷贝');
+    assert.deepEqual(hub.server.files.list().filter((entry) => entry.state === 'offer'), [],
+      '不许挂出私聊 offer（群这一趟终点在 hub）');
   }
 });

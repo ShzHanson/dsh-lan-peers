@@ -19,6 +19,8 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { decryptBytes } from '../../lib/wire-crypto.mjs';
+import { createAdmin } from '../../lib/admin.mjs';
+import { FileOutbox, pullStateOf } from '../../lib/file-offer.mjs';
 import { FILE_V1_PATHS, resolveConfig } from '../server.mjs';
 import { FileStore, isReservedFileName, sanitizeFileName } from '../../lib/file-store.mjs';
 import {
@@ -27,6 +29,35 @@ import {
 
 /** 单响应硬上限：也是 pull 的块大小 */
 const CHUNK = 512 * 1024;
+
+/** 管理接口的最小请求/应答桩（与 group-files-wire / admin-files 同一口径） */
+async function adminHit(admin, method, apiPath, body) {
+  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+  const req = {
+    method,
+    url: apiPath,
+    socket: { remoteAddress: '127.0.0.1', setNoDelay() {} },
+    headers: {
+      host: '127.0.0.1:7788',
+      'content-type': 'application/json',
+      'content-length': String(chunks[0]?.length ?? 0),
+      'x-lan-peers-token': String(admin.token ?? ''),
+    },
+    on() { return req; },
+    once() { return req; },
+    async *[Symbol.asyncIterator]() { for (const chunk of chunks) yield chunk; },
+  };
+  const res = {
+    status: 0, headers: {}, body: '',
+    setHeader(k, v) { this.headers[k] = v; },
+    writeHead(status, headers) { this.status = status; Object.assign(this.headers, headers || {}); },
+    write(chunk) { this.body += chunk; return true; },
+    end(chunk) { if (chunk) this.body += chunk; if (!this.status) this.status = 200; },
+    once() {}, on() {},
+  };
+  await admin.handle(req, res, new URL('http://127.0.0.1' + apiPath));
+  return { status: res.status, json: (() => { try { return JSON.parse(res.body); } catch { return null; } })() };
+}
 const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
 
 /** 确定性内容（不用随机：失败时 sha256 稳定可查；seed 用来造「同长度不同内容」） */
@@ -999,4 +1030,124 @@ test('§2 store：重启重建、坏 meta 自愈、越界 id 拒绝', async (t) 
   const healed = new FileStore({ stateDir });
   assert.equal(healed.list().length, 1);
   assert.equal(fs.existsSync(path.join(stateDir, 'inbox', '.pending', brokenId)), false);
+});
+
+// ---------------------------------------------------------------------------
+// S3b：发送方那一半也要看得见（GET files 的 outbox 桶）
+//
+// 非空化：把 FileOutbox.open() 里的高水位记账拆掉 → 本用例的 pulling / pulled
+// 与 pulledBytes 三条断言红；把 admin 的 outbox 白名单换成原样透传 → Q2 的路径断言红。
+// ---------------------------------------------------------------------------
+
+test('Q1 发送方看得见自己发出去的那一份：outbox 从 waiting → pulling → pulled（真两块 + 断线）', async (t) => {
+  const sender = await startServer(t);
+  const receiver = await startServer(t);
+  const link = linkAll([sender, receiver]);
+  const admin = createAdmin({ server: sender.server });
+
+  const payload = payloadBytes(CHUNK * 2 + 7);   // 3 块
+  const localFile = path.join(sender.stateDir, 'outbox-demo.bin');
+  fs.writeFileSync(localFile, payload);
+
+  const before = await adminHit(admin, 'GET', '/api/lan-peers/files');
+  assert.equal(before.status, 200);
+  assert.deepEqual(before.json.outbox, [], '还没发过东西：这一桶是空数组（字段本身必须在）');
+
+  const sent = await adminHit(admin, 'POST', '/api/lan-peers/files/send', {
+    peerId: receiver.server.store.instanceId,
+    path: localFile,
+  });
+  assert.equal(sent.status, 200, JSON.stringify(sent.json));
+
+  const waiting = await adminHit(admin, 'GET', '/api/lan-peers/files');
+  const row = waiting.json.outbox.find((item) => item.fileId === sent.json.fileId);
+  assert.ok(row, '发完之后发送方的 outbox 里必须有这一行');
+  assert.equal(row.state, 'waiting', '对方还没拉：waiting');
+  assert.equal(row.pulledBytes, 0);
+  assert.equal(row.size, payload.length);
+  assert.equal(row.sha256, sha256(payload));
+  assert.equal(row.name, 'outbox-demo.bin', '名字是清洗过的那一份');
+  assert.equal(row.to.peerId, receiver.server.store.instanceId, '这一格就是「送给谁」');
+  assert.match(String(row.to.name), /^node-/, 'to.name 取自本机 peers.json（不是对端给的）');
+  assert.ok(row.at > 0);
+
+  // Q2：metadata only —— 发送方的落盘布局一个字都不许上线
+  assert.deepEqual(Object.keys(row).sort(),
+    ['at', 'fileId', 'name', 'pulledBytes', 'sha256', 'size', 'state', 'to']);
+  const wire = JSON.stringify(waiting.json);
+  assert.equal(wire.includes(sender.stateDir), false, '不许带发送方的 stateDir');
+  assert.equal(wire.includes('outbox/'), false, '不许带 keeper 拷贝的落盘路径');
+  assert.equal(wire.includes('"path"'), false, '没有 path 这一格');
+
+  // 只服务一块就断：pulling + pulledBytes 在 0 与 size 之间
+  const seen = watchPulls(link.key(receiver, sender), { failFrom: 1 });
+  let first;
+  try {
+    first = await receiver.server.files.download(sent.json.fileId);
+    assert.deepEqual(seen.offsets, [0, CHUNK], '第 2 块发出去了但没等到回包');
+  } finally {
+    seen.restore();
+  }
+  assert.equal(first.ok, false, '这一趟必须失败（否则没有「拉到一半」这件事）');
+  const pulling = await adminHit(admin, 'GET', '/api/lan-peers/files');
+  const mid = pulling.json.outbox.find((item) => item.fileId === sent.json.fileId);
+  assert.equal(mid.state, 'pulling', '拉了一部分就是 pulling');
+  assert.equal(mid.pulledBytes, CHUNK, '高水位 = 真被服务出去的那一块');
+  assert.ok(mid.pulledBytes > 0 && mid.pulledBytes < payload.length);
+
+  // 续传拉完：pulled，高水位 = size，仍是同一行（不新开一条）
+  const second = await receiver.server.files.download(sent.json.fileId);
+  assert.equal(second.ok, true, JSON.stringify(second));
+  const pulled = await adminHit(admin, 'GET', '/api/lan-peers/files');
+  const done = pulled.json.outbox.find((item) => item.fileId === sent.json.fileId);
+  assert.equal(done.state, 'pulled', '整份被服务过一次就是 pulled');
+  assert.equal(done.pulledBytes, payload.length);
+  assert.equal(pulled.json.outbox.length, 1, '一条 keeper 拷贝只占一行');
+  assert.equal(sha256(fs.readFileSync(second.path)), sha256(payload), '字节真的被对端拉全了');
+});
+
+test('T4 高水位：list() 三态 waiting → pulling → pulled，只增不减，且落在 meta.json 里（重启后还在）', async (t) => {
+  const stateDir = makeTempStateDir('dsh-lan-peers-outbox-');
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const bytes = payloadBytes(1000);
+  const source = path.join(stateDir, 'src.bin');
+  fs.writeFileSync(source, bytes);
+
+  const outbox = new FileOutbox({ stateDir, now: () => 1_000_000 });
+  const put = await outbox.put({ name: '报告.pdf', sourcePath: source, to: 'peer-b' });
+  assert.equal(put.ok, true, JSON.stringify(put));
+
+  const fresh = outbox.list();
+  assert.equal(fresh.length, 1);
+  assert.deepEqual(Object.keys(fresh[0]).sort(),
+    ['at', 'fileId', 'name', 'pulledBytes', 'sha256', 'size', 'state', 'to'],
+    '八格 metadata：没有 path、没有 bytes');
+  assert.equal(fresh[0].state, 'waiting', '一个字节都没被拉过');
+  assert.equal(fresh[0].pulledBytes, 0);
+  assert.equal(fresh[0].to, 'peer-b', 'FileOutbox 里 to 还是裸 peerId（补名字的是 server 门面）');
+
+  outbox.open(put.fileId, 0, 400);
+  assert.equal(outbox.list()[0].state, 'pulling');
+  assert.equal(outbox.list()[0].pulledBytes, 400, '高水位 = 服务出去的最远偏移');
+
+  // 重发同一片（回到 0）不许把高水位往回拨
+  outbox.open(put.fileId, 0, 400);
+  assert.equal(outbox.list()[0].pulledBytes, 400, '只增不减');
+
+  outbox.open(put.fileId, 400, 600);
+  assert.equal(outbox.list()[0].state, 'pulled', '整份被服务过一次就是 pulled');
+
+  // 拉完那一趟必须落一次盘：重启之后不能退回 pulling
+  const reopened = new FileOutbox({ stateDir, now: () => 1_000_000 });
+  assert.equal(reopened.list()[0].pulledBytes, 1000, '高水位落在 outbox/<fileId>/meta.json 里');
+  assert.equal(reopened.list()[0].state, 'pulled');
+
+  // 三态只有一处实现
+  assert.equal(pullStateOf({ size: 10, servedBytes: 0 }), 'waiting');
+  assert.equal(pullStateOf({ size: 10, servedBytes: 3 }), 'pulling');
+  assert.equal(pullStateOf({ size: 10, servedBytes: 10 }), 'pulled');
+
+  // 逐出之后这一行就没了（墓碑不外露）
+  outbox.drop(put.fileId, 'test');
+  assert.deepEqual(outbox.list(), []);
 });

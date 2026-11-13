@@ -9846,6 +9846,15 @@ export function createPeerServer(overrides = {}) {
       })),
       ...fileStore.list(),
     ],
+    /**
+     * 0.12.0-α S3b：发送方的「我发出的」桶。每条 keeper 拷贝一行，只有 metadata：
+     * 高水位（pulledBytes）+ 三态（waiting/pulling/pulled）都由 FileOutbox 算，
+     * 这里只把 to 从 peerId 补成 { peerId, name }（名字来自 peers.json，对端自报）。
+     */
+    outbox: () => fileOutbox.list().map((row) => ({
+      ...row,
+      to: { peerId: row.to, name: String(store.getPeer(row.to)?.name ?? '') },
+    })),
     send: (input = {}) => offerFileToPeer(input),
     download: (fileId) => downloadOffer(fileId),
     decline: (fileId) => declineOffer(fileId),
