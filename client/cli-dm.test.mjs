@@ -108,6 +108,27 @@ test('dm <peer> <正文>：本机就能拦下的错误不发请求（未知对�
   assert.equal(admin.seen.length, 0, '本地就能拦下的错误不发请求');
 });
 
+test('dm <peer> <正文> --perm <档>：校验档位并原样转发 permission（ask 改动的护栏）', async (t) => {
+  const admin = await startAdmin(t, () => ({
+    body: { ok: true, id: 'm-4', sessionId: 's-1', reply: '收到', permission: 'danger-full-access' },
+  }));
+  const out = await runAsync(['dm', '书房', '在吗', '--perm', 'danger-full-access', '--url', admin.url, '--state-dir', admin.dir]);
+
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(admin.seen.length, 1);
+  assert.deepEqual(admin.seen[0].body, { peerId: PEER_ID, text: '在吗', permission: 'danger-full-access' }, '档位必须原样进 dm/send');
+  assert.match(out.stdout, /perm=danger-full-access/);
+
+  const bad = await runAsync(['dm', '书房', '在吗', '--perm', 'root', '--url', admin.url, '--state-dir', admin.dir]);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /read-only \| workspace-write \| danger-full-access/, '非法档位仍在本机拦下');
+  // 文案必须点对旗标：dm 用的是 --perm（dispatch settings 才用 --max-perm），
+  // 共用一个键会让用户按提示去改一个这里不存在的旗标。
+  assert.match(bad.stderr, /--perm 只能是/, 'dm 的报错必须点 --perm');
+  assert.doesNotMatch(bad.stderr, /--max-perm/, 'dm 的报错不许提 --max-perm');
+  assert.equal(admin.seen.length, 1, '档位非法时不发请求');
+});
+
 // ---------------------------------------------------------------------------
 // dm log <peer>
 // ---------------------------------------------------------------------------

@@ -248,6 +248,9 @@ async function cmdPeers(args) {
 }
 
 async function cmdAsk(args) {
+  // /v1/ask 的报文里没有权限档：静默收下 --perm 等于让用户以为档位生效了（v0.10.3 实测无效）。
+  // 带权限档的路径是 dm <peer> <正文> --perm <档>，这里直接拒绝并指过去。
+  if (args.perm !== undefined) throw new Error(L('cli.ask.noPerm'));
   const dir = stateDir(args);
   const me = identity(dir);
   const prompt = args._.join(' ').trim();
@@ -1870,7 +1873,7 @@ async function cmdDmSend(dir, args) {
   // 契约 §2/§5：两个都可选；都不给就对端用它的默认工作区与默认档。
   const workspaceId = args.workspace === undefined || args.workspace === true ? '' : String(args.workspace).trim();
   const permission = args.perm === undefined || args.perm === true ? '' : String(args.perm).trim();
-  if (permission !== '' && !DISPATCH_PERMISSIONS.includes(permission)) throw new Error(L('cli.dispatch.badPerm'));
+  if (permission !== '' && !DISPATCH_PERMISSIONS.includes(permission)) throw new Error(L('cli.dispatch.badPermDm'));
   let url;
   try {
     url = resolveAdminUrl(dir, args);
