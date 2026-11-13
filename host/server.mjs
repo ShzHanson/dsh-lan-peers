@@ -74,7 +74,15 @@ import {
   FILE_DEFAULT_PENDING_TTL_MS,
   FileStore,
   hashFile,
+  isFileId,
 } from '../lib/file-store.mjs';
+import {
+  FileOffers,
+  FileOutbox,
+  FileTrust,
+  parseFileId,
+  sanitizeOfferName,
+} from '../lib/file-offer.mjs';
 import {
   PAIR_CURVE,
   PAIR_PROTOCOL_VERSION,
@@ -283,9 +291,8 @@ export const GROUP_PEER_V1_PATHS = Object.freeze([
  */
 export const FILE_V1_PATHS = Object.freeze([
   '/v1/file/offer',
-  '/v1/file/chunk',
-  '/v1/file/complete',
-  '/v1/file/status',
+  '/v1/file/pull',
+  '/v1/file/withdraw',
 ]);
 
 /** 0.8.5-α 契约 §3：私聊两端对齐（per-peer 签名 + 信封，与文件互传同一套） */
@@ -2787,6 +2794,27 @@ export function createPeerServer(overrides = {}) {
     chunkBytes: config.fileChunkBytes,
     pendingTtlMs: config.filePendingTtlMs,
     autoAccept: config.fileAutoAccept,
+    logger: config.logger,
+  });
+
+  /**
+   * 0.12.0-α S1（单发 offer/pull）：发送方的 keeper 拷贝（outbox）、接收方的待下载条目
+   * （offers，只有 metadata）与 per-peer 信任标记（file-trust.json）。
+   * 三块都在 <stateDir> 下，各自独占自己的目录；定时清扫与 fileStore 一样 unref。
+   */
+  const fileOutbox = new FileOutbox({
+    stateDir: config.stateDir,
+    now: config.now,
+    logger: config.logger,
+  });
+  const fileOffers = new FileOffers({
+    stateDir: config.stateDir,
+    now: config.now,
+    logger: config.logger,
+  });
+  const fileTrust = new FileTrust({
+    stateDir: config.stateDir,
+    now: config.now,
     logger: config.logger,
   });
 
@@ -8764,112 +8792,131 @@ export function createPeerServer(overrides = {}) {
     return { status: response.status, json };
   }
 
-  /** POST /v1/file/offer —— 决定收不收；resumeFrom 让被 kill 过的发送端接着推 */
-  function fileOffer(req, rawBody) {
+  /**
+   * POST /v1/file/offer —— 对端（发送方）只报 metadata：本机记一条「待下载」，**一个字节都不收**。
+   * 0.12.0-α S1（单发 offer/pull 模型）：字节留在发送方 outbox 里，等本机点了下载再来拉。
+   */
+  function fileOfferInbound(req, rawBody) {
     const auth = authenticate(req, rawBody);
     if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
     const body = readPeerJsonBody(rawBody);
     if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
-    const transferId = String(body.transferId ?? '');
+    // 与其他 peer 写入同一条闸：offer 由对方发起，可以成串到达
+    if (config.askRateLimit) {
+      const token = takeAskToken(auth.peerId, config.now());
+      if (!token.ok) {
+        return {
+          status: 429,
+          body: { error: 'rate-limited', retryAfterMs: token.retryAfterMs },
+          peerId: auth.peerId,
+        };
+      }
+    }
+    const fileId = String(body.fileId ?? '');
     const size = Number(body.size);
     const sha256 = String(body.sha256 ?? '').toLowerCase();
-    if (transferId === '' || transferId.length > 200
-      || typeof body.name !== 'string' || body.name.length > 512
-      || !Number.isFinite(size) || size < 0 || Math.floor(size) !== size
-      || !/^[0-9a-f]{64}$/.test(sha256)) {
+    if (!isFileId(fileId) || typeof body.name !== 'string' || body.name.length > 512
+      || !Number.isInteger(size) || size < 0 || !/^[0-9a-f]{64}$/.test(sha256)) {
       return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
     }
-    const out = fileStore.offer({
-      transferId,
+    if (size > config.fileMaxBytes) {
+      return { status: 413, body: { error: 'too-large' }, peerId: auth.peerId };
+    }
+    const added = fileOffers.add({
+      fileId,
       name: body.name,
       size,
       sha256,
-      chunkBytes: body.chunkBytes,
       from: { peerId: auth.peerId, name: String(auth.peer?.name ?? '') },
     });
-    if (out.accept !== true) {
-      // 契约只要求 4xx + { accept:false, reason }；具体码按语义给（F2 只应读 reason）
-      const status = out.reason === 'bad-name' || out.reason === 'bad-request'
-        ? 400
-        : (out.reason === 'too-large' ? 413 : (out.reason === 'busy' ? 429 : 409));
-      return { status, body: { accept: false, reason: out.reason }, peerId: auth.peerId };
+    if (!added.ok) {
+      const reason = added.reason === 'bad-name' ? 'bad-name' : 'bad-request';
+      return { status: 400, body: { error: reason }, peerId: auth.peerId };
     }
-    return { status: 200, body: { accept: true, resumeFrom: out.resumeFrom, dedupe: out.dedupe }, peerId: auth.peerId };
+    // 日志口径（契约 §0）：来源前 8 位 / id 前 8 位 / 字节数 —— 文件名与内容绝不进日志
+    if (config.logger) {
+      config.logger('[file] offer from=' + shortPeer(auth.peerId)
+        + ' id=' + fileId.slice(0, 8) + ' bytes=' + size);
+    }
+    return { status: 200, body: { ok: true }, peerId: auth.peerId };
   }
 
-  /** POST /v1/file/chunk —— data 是明文块 base64，信封由传输层解密后才是它 */
-  function fileChunk(req, rawBody) {
+  /**
+   * POST /v1/file/pull —— 只有「这份 keeper 拷贝当初 offer 给谁」的那个 peer 能拉。
+   * 单响应最多 FILE_CHUNK_HARD_MAX 原始字节（base64 后仍在 1 MiB 的 MAX_BODY_BYTES 内）。
+   */
+  function filePull(req, rawBody) {
     const auth = authenticate(req, rawBody);
     if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
     const body = readPeerJsonBody(rawBody);
     if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
-    const transferId = String(body.transferId ?? '');
+    const fileId = String(body.fileId ?? '');
+    if (!isFileId(fileId)) return { status: 404, body: { error: 'unknown-file' }, peerId: auth.peerId };
+    const found = fileOutbox.get(fileId);
+    if (!found.ok) {
+      // unknown-file 与 file-gone 是两个事实：后者是「有过，但被逐出/收回了」
+      const gone = found.reason === 'file-gone';
+      return { status: gone ? 409 : 404, body: { error: String(found.reason) }, peerId: auth.peerId };
+    }
+    // 授权：keeper 拷贝只服务当初那份 offer 的收件人。别的 peer 猜中 id 也拉不走一个字节。
+    if (String(found.entry.to) !== String(auth.peerId)) {
+      if (config.logger) {
+        config.logger('[file] pull denied from=' + shortPeer(auth.peerId) + ' id=' + fileId.slice(0, 8));
+      }
+      return { status: 403, body: { error: 'forbidden' }, peerId: auth.peerId };
+    }
     const offset = Number(body.offset);
-    if (transferId === '' || typeof body.data !== 'string'
-      || !Number.isFinite(offset) || offset < 0 || Math.floor(offset) !== offset) {
-      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    if (!Number.isInteger(offset) || offset < 0) {
+      return {
+        status: 400,
+        body: { error: 'bad-offset', size: Number(found.entry.size) || 0 },
+        peerId: auth.peerId,
+      };
     }
-    const out = fileStore.writeChunk({
-      transferId,
-      offset,
-      data: Buffer.from(body.data, 'base64'),
-    });
-    if (out.error === 'bad-offset') {
-      return { status: 409, body: { error: 'bad-offset', expected: out.expected }, peerId: auth.peerId };
+    const chunk = fileOutbox.open(fileId, offset, FILE_CHUNK_HARD_MAX);
+    if (chunk.error === 'bad-offset') {
+      return { status: 400, body: { error: 'bad-offset', size: chunk.size }, peerId: auth.peerId };
     }
-    if (out.error === 'too-large') {
-      return { status: 413, body: { error: 'too-large' }, peerId: auth.peerId };
+    if (chunk.error === 'file-gone') {
+      return { status: 409, body: { error: 'file-gone' }, peerId: auth.peerId };
     }
-    if (out.error === 'unknown-transfer') {
-      return { status: 404, body: { error: 'unknown-transfer' }, peerId: auth.peerId };
+    if (chunk.error) {
+      const status = chunk.error === 'unknown-file' ? 404 : 500;
+      return { status, body: { error: String(chunk.error) }, peerId: auth.peerId };
     }
-    if (out.error) {
-      return { status: 500, body: { error: 'internal' }, peerId: auth.peerId };
-    }
-    return { status: 200, body: { received: out.received }, peerId: auth.peerId };
+    return {
+      status: 200,
+      body: { dataBase64: chunk.data.toString('base64'), offset: chunk.offset, eof: chunk.eof === true },
+      peerId: auth.peerId,
+    };
   }
 
-  /** POST /v1/file/complete —— 整体 sha256 对齐后才进待确认区 */
-  async function fileComplete(req, rawBody) {
+  /** POST /v1/file/withdraw —— 发送方收回；本机把待下载条目删掉（幂等，删过就是 removed:false） */
+  function fileWithdraw(req, rawBody) {
     const auth = authenticate(req, rawBody);
     if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
     const body = readPeerJsonBody(rawBody);
     if (!body) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
-    const transferId = String(body.transferId ?? '');
-    if (transferId === '') return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
-    const out = await fileStore.complete({ transferId });
-    if (out.ok === true) {
-      return { status: 200, body: { ok: true, id: out.id, needConfirm: out.needConfirm }, peerId: auth.peerId };
+    const fileId = String(body.fileId ?? '');
+    if (!isFileId(fileId)) return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    const offer = fileOffers.get(fileId);
+    if (!offer) return { status: 200, body: { ok: true, removed: false }, peerId: auth.peerId };
+    // 与 pull 同一条口径：只有「这份 offer 来自谁」，谁能把它收回
+    if (String(offer.from.peerId) !== String(auth.peerId)) {
+      return { status: 403, body: { error: 'forbidden' }, peerId: auth.peerId };
     }
-    if (out.error === 'checksum-mismatch') {
-      return { status: 422, body: { error: 'checksum-mismatch' }, peerId: auth.peerId };
+    fileOffers.remove(fileId);
+    if (config.logger) {
+      config.logger('[file] withdraw from=' + shortPeer(auth.peerId) + ' id=' + fileId.slice(0, 8));
     }
-    if (out.error === 'incomplete') {
-      return { status: 409, body: { error: 'incomplete', received: out.received }, peerId: auth.peerId };
-    }
-    if (out.error === 'unknown-transfer') {
-      return { status: 404, body: { error: 'unknown-transfer' }, peerId: auth.peerId };
-    }
-    if (config.logger) config.logger('[file] complete state=rejected err=' + String(out.error ?? 'unknown'));
-    return { status: 500, body: { error: 'internal' }, peerId: auth.peerId };
-  }
-
-  /** GET /v1/file/status?transferId=… */
-  function fileStatus(req, rawBody, url) {
-    const auth = authenticate(req, rawBody);
-    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
-    const transferId = String(url.searchParams.get('transferId') ?? '');
-    const out = fileStore.status(transferId);
-    if (!out) return { status: 404, body: { error: 'unknown-transfer' }, peerId: auth.peerId };
-    return { status: 200, body: out, peerId: auth.peerId };
+    return { status: 200, body: { ok: true, removed: true }, peerId: auth.peerId };
   }
 
   async function fileDispatch(req, rawBody, url) {
     const method = String(req.method ?? 'GET').toUpperCase();
-    if (method === 'POST' && url.pathname === '/v1/file/offer') return fileOffer(req, rawBody);
-    if (method === 'POST' && url.pathname === '/v1/file/chunk') return fileChunk(req, rawBody);
-    if (method === 'POST' && url.pathname === '/v1/file/complete') return fileComplete(req, rawBody);
-    if (method === 'GET' && url.pathname === '/v1/file/status') return fileStatus(req, rawBody, url);
+    if (method === 'POST' && url.pathname === '/v1/file/offer') return fileOfferInbound(req, rawBody);
+    if (method === 'POST' && url.pathname === '/v1/file/pull') return filePull(req, rawBody);
+    if (method === 'POST' && url.pathname === '/v1/file/withdraw') return fileWithdraw(req, rawBody);
     if (FILE_V1_PATHS.includes(url.pathname)) {
       return { status: 405, body: { error: 'method-not-allowed' } };
     }
@@ -8877,25 +8924,12 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
-   * 契约 §3 send：发送方按块推送，返回 { ok, id, bytes, sha256, ms }。
+   * 契约（0.12.0-α S1）send：把**本机**选定的文件收进 outbox，只把 metadata 报给对端。
    * 失败一律 { ok:false, reason }（不抛）：面板与 CLI 只需要一个可判定的结果。
-   * 注：这里读的 path 是**本机**操作者给的文件（发送端自己的选择），
-   * 对端永远不能指定接收端路径 —— 落盘路径只由 fileStore 拼。
+   * 注：这里读的 path 是本机操作者给的文件（发送端自己的选择），
+   * 对端永远不能指定本机路径 —— 落盘路径只由 fileOutbox / fileStore 拼。
    */
-  // 出站进度（v0.8.5-α）：send 期间按 transferId 记「这一趟已经发出多少字节」，
-  // 完成/失败后立刻清掉。上限按「同时进行的发送数」兜一层，绝不会无界增长。
-  // 对外只经 filesFacade.outbound() 读，**不含 path**（文件路径绝不离开本机选择那一刻）。
-  const outboundTransfers = new Map();
-  const OUTBOUND_LIMIT = 32;
-  const trackOutbound = (row) => {
-    if (outboundTransfers.size >= OUTBOUND_LIMIT && !outboundTransfers.has(row.transferId)) {
-      const oldest = outboundTransfers.keys().next().value;
-      if (oldest !== undefined) outboundTransfers.delete(oldest);
-    }
-    outboundTransfers.set(row.transferId, row);
-  };
-
-  async function sendFileToPeer(input = {}) {
+  async function offerFileToPeer(input = {}) {
     const startedAt = config.now();
     const elapsed = () => Math.max(0, config.now() - startedAt);
     const peerId = String(input?.peerId ?? '');
@@ -8916,139 +8950,251 @@ export function createPeerServer(overrides = {}) {
       return { ok: false, reason: 'not-found', ms: elapsed() };
     }
     if (!stat.isFile()) return { ok: false, reason: 'not-a-file', ms: elapsed() };
-    const size = stat.size;
-    if (size > config.fileMaxBytes) return { ok: false, reason: 'too-large', bytes: size, ms: elapsed() };
+    if (stat.size > config.fileMaxBytes) {
+      return { ok: false, reason: 'too-large', bytes: stat.size, ms: elapsed() };
+    }
+    // 名字只走 file-store 那一份清洗（唯一实现），且只当文件名用，绝不拼路径
+    const name = sanitizeOfferName(path.basename(filePath));
+    if (name === '') return { ok: false, reason: 'bad-name', ms: elapsed() };
 
-    const name = path.basename(filePath);
-    const sha256 = await hashFile(filePath);
-    const chunkBytes = config.fileChunkBytes;
-    const transferId = randomUUID();
-    const peerCtx = { baseUrl, secret, senderId: store.instanceId };
+    const kept = await fileOutbox.put({ name, sourcePath: filePath, to: peerId });
+    if (!kept.ok) return { ok: false, reason: kept.reason, bytes: stat.size, ms: elapsed() };
 
     let replied;
     try {
       replied = await fileCall({
-        ...peerCtx,
+        baseUrl,
+        secret,
+        senderId: store.instanceId,
         method: 'POST',
         apiPath: '/v1/file/offer',
-        body: { transferId, name, size, sha256, chunkBytes },
+        body: { fileId: kept.fileId, name: kept.name, size: kept.size, sha256: kept.sha256 },
       });
     } catch (error) {
-      return { ok: false, reason: 'unreachable', detail: String(error?.message ?? error), ms: elapsed() };
+      // 对端没收到 = 这份 keeper 拷贝永远不会有人来拉：当场收掉，不占配额
+      fileOutbox.drop(kept.fileId, 'unreachable');
+      return {
+        ok: false,
+        reason: 'unreachable',
+        detail: String(error?.message ?? error).slice(0, 200),
+        bytes: kept.size,
+        sha256: kept.sha256,
+        ms: elapsed(),
+      };
     }
     if (replied.status !== 200) {
+      fileOutbox.drop(kept.fileId, 'offer-rejected');
       return {
         ok: false,
-        reason: String(replied.json?.reason ?? replied.json?.error ?? 'offer-rejected'),
+        reason: String(replied.json?.error ?? 'offer-rejected'),
         status: replied.status,
-        bytes: size,
-        sha256,
+        bytes: kept.size,
+        sha256: kept.sha256,
         ms: elapsed(),
       };
     }
-    if (replied.json?.dedupe === true) {
-      // 对端已有同一 sha256：一个字节都不重传（契约 §2 去重）
-      return { ok: true, id: '', bytes: size, sha256, ms: elapsed(), dedupe: true, sent: 0 };
+    if (config.logger) {
+      config.logger('[file] offer to=' + shortPeer(peerId) + ' id=' + kept.fileId.slice(0, 8)
+        + ' bytes=' + kept.size + ' state=ok');
     }
-    const resumeFrom = Math.max(0, Math.min(size, Math.floor(Number(replied.json?.resumeFrom) || 0)));
-
-    trackOutbound({ transferId, peerId, name, size, sent: resumeFrom });
-    try {
-      const handle = await fs.promises.open(filePath, 'r');
-      let offset = resumeFrom;
-      try {
-        while (offset < size) {
-          const want = Math.min(chunkBytes, size - offset);
-          const buffer = Buffer.allocUnsafe(want);
-          const read = await handle.read(buffer, 0, want, offset);
-          if (read.bytesRead <= 0) throw new Error('short-read');
-          const data = buffer.subarray(0, read.bytesRead).toString('base64');
-          const reply = await fileCall({
-            ...peerCtx,
-            method: 'POST',
-            apiPath: '/v1/file/chunk',
-            body: { transferId, offset, data },
-          });
-          if (reply.status !== 200) {
-            return {
-              ok: false,
-              reason: String(reply.json?.error ?? 'chunk-failed'),
-              expected: reply.json?.expected,
-              sent: offset - resumeFrom,
-              bytes: size,
-              sha256,
-              ms: elapsed(),
-            };
-          }
-          offset += read.bytesRead;
-          // 进度点：每成功投递一块就更新一次「已发字节」。
-          trackOutbound({ transferId, peerId, name, size, sent: offset });
-        }
-      } finally {
-        await handle.close().catch(() => {});
-      }
-      const done = await fileCall({
-        ...peerCtx,
-        method: 'POST',
-        apiPath: '/v1/file/complete',
-        body: { transferId },
-      });
-      if (done.status !== 200) {
-        return {
-          ok: false,
-          reason: String(done.json?.error ?? 'complete-failed'),
-          bytes: size,
-          sha256,
-          ms: elapsed(),
-        };
-      }
-      return {
-        ok: true,
-        id: String(done.json?.id ?? ''),
-        bytes: size,
-        sha256,
-        ms: elapsed(),
-        resumeFrom,
-        needConfirm: done.json?.needConfirm === true,
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        reason: 'transport',
-        detail: String(error?.message ?? error),
-        bytes: size,
-        sha256,
-        ms: elapsed(),
-      };
-    } finally {
-      // 这一趟结束了（成功/失败/抛出都算）：进度条目立刻消失，绝不留残影。
-      outboundTransfers.delete(transferId);
-    }
+    return {
+      ok: true,
+      fileId: kept.fileId,
+      bytes: kept.size,
+      sha256: kept.sha256,
+      offer: 'sent',
+      ms: elapsed(),
+    };
   }
 
   /**
-   * 契约 §3 冻结门面（Lane F2 依赖）：list/accept/reject/send/progress 签名一字不改。
-   * sweep()/dirs() 是给测试与 CLI 的辅助，不属于冻结面。
+   * 契约（0.12.0-α S1）download：把一条待下载条目真正拉下来（逐块 pull），验 sha256 后落 inbox。
+   *
+   * 校验点只有一处：fileStore.complete() —— 它把 .incoming 拼好的整文件 hash 一遍，
+   * 与 offer 声明的 sha256 不一致就 checksum-mismatch 并 dropPart()（半截文件一并删掉）。
+   * 这里把那个错误翻成 integrity-failed：盘上什么都不会多出来。
+   */
+  async function downloadOffer(rawFileId) {
+    const startedAt = config.now();
+    const elapsed = () => Math.max(0, config.now() - startedAt);
+    const fileId = parseFileId(rawFileId);
+    if (fileId === '') return { ok: false, reason: 'unknown-file' };
+    const offer = fileOffers.get(fileId);
+    if (!offer) return { ok: false, reason: 'unknown-file' };
+    const peer = store.getPeer(offer.from.peerId);
+    const baseUrl = peer ? baseUrlOf(offer.from.peerId) : '';
+    const secret = String(peer?.secret ?? '');
+    if (!peer || baseUrl === '' || secret === '') {
+      return { ok: false, reason: 'holder-offline', bytes: offer.size };
+    }
+
+    // 先用 FileStore 建（或复用）一条 .incoming 分片：断线重试时 resumeFrom 就是已收字节
+    const opened = fileStore.offer({
+      transferId: fileId,
+      name: offer.name,
+      size: offer.size,
+      sha256: offer.sha256,
+      from: offer.from,
+    });
+    if (opened.accept !== true) {
+      return { ok: false, reason: String(opened.reason ?? 'offer-rejected'), bytes: offer.size };
+    }
+
+    const peerCtx = { baseUrl, secret, senderId: store.instanceId };
+    let offset = Math.max(0, Math.min(offer.size, Math.floor(Number(opened.resumeFrom) || 0)));
+    let pulled = 0;
+    while (offset < offer.size) {
+      let reply;
+      try {
+        reply = await fileCall({
+          ...peerCtx,
+          method: 'POST',
+          apiPath: '/v1/file/pull',
+          body: { fileId, offset },
+        });
+      } catch (error) {
+        return {
+          ok: false,
+          reason: 'holder-offline',
+          detail: String(error?.message ?? error).slice(0, 200),
+          received: offset,
+          bytes: offer.size,
+          ms: elapsed(),
+        };
+      }
+      if (reply.status !== 200) {
+        const code = String(reply.json?.error ?? 'pull-failed');
+        // 409 file-gone：对端已逐出/收回，这条待下载永远拉不完 → 当场删掉，别再让用户点
+        if (reply.status === 409) fileOffers.remove(fileId);
+        return {
+          ok: false,
+          reason: reply.status === 409 ? 'file-gone' : (reply.status === 403 ? 'forbidden' : code),
+          status: reply.status,
+          received: offset,
+          bytes: offer.size,
+          ms: elapsed(),
+        };
+      }
+      const encoded = typeof reply.json?.dataBase64 === 'string' ? reply.json.dataBase64 : '';
+      const data = Buffer.from(encoded, 'base64');
+      if (data.length === 0) {
+        return { ok: false, reason: 'bad-pull', received: offset, bytes: offer.size, ms: elapsed() };
+      }
+      const written = fileStore.writeChunk({ transferId: fileId, offset, data });
+      if (written.error) {
+        return {
+          ok: false,
+          reason: String(written.error),
+          expected: written.expected,
+          received: offset,
+          bytes: offer.size,
+          ms: elapsed(),
+        };
+      }
+      offset += data.length;
+      pulled += data.length;
+      if (reply.json?.eof === true && offset < offer.size) {
+        // 对端说「完了」但还差字节：不猜，按失败处理（半截留在 .incoming 里等重试）
+        return { ok: false, reason: 'short-pull', received: offset, bytes: offer.size, ms: elapsed() };
+      }
+    }
+
+    const done = await fileStore.complete({ transferId: fileId });
+    if (done.error === 'checksum-mismatch') {
+      // 整文件 sha256 与 offer 不一致：complete() 已删掉半截分片，盘上什么都没多出来
+      fileOffers.remove(fileId);
+      if (config.logger) {
+        config.logger('[file] download id=' + fileId.slice(0, 8) + ' state=rejected reason=integrity-failed');
+      }
+      return { ok: false, reason: 'integrity-failed', bytes: offer.size, ms: elapsed() };
+    }
+    if (done.ok !== true) {
+      return {
+        ok: false,
+        reason: String(done.error ?? 'complete-failed'),
+        received: offset,
+        bytes: offer.size,
+        ms: elapsed(),
+      };
+    }
+    // fileAutoAccept=true 时 complete() 自己就搬进 inbox，落盘路径在 done.path 上；
+    // 这里若用空串盖掉，门面回的 locator 永远是 ''（调用方拿它写盘/写界面就是空路径）。
+    let accepted = { ok: true, id: done.id, path: String(done.path ?? '') };
+    if (done.needConfirm === true) {
+      const decided = fileStore.accept(done.id);
+      if (decided.ok !== true) {
+        return { ok: false, reason: String(decided.reason ?? 'move-failed'), bytes: offer.size, ms: elapsed() };
+      }
+      accepted = decided;
+    }
+    fileOffers.remove(fileId);
+    if (config.logger) {
+      config.logger('[file] download id=' + fileId.slice(0, 8) + ' bytes=' + offer.size
+        + ' sha=' + String(offer.sha256).slice(0, 8) + ' state=ok ms=' + elapsed());
+    }
+    return {
+      ok: true,
+      id: String(accepted.id ?? done.id ?? fileId),
+      bytes: offer.size,
+      sha256: offer.sha256,
+      pulled,
+      ms: elapsed(),
+      path: String(accepted.path ?? ''),
+    };
+  }
+
+  /** 契约（0.12.0-α S1）decline：丢掉一条待下载条目（不发网络请求：对端不必知道） */
+  function declineOffer(rawFileId) {
+    const fileId = parseFileId(rawFileId);
+    if (fileId === '') return { ok: false, reason: 'unknown-file' };
+    const offer = fileOffers.get(fileId);
+    if (!offer) return { ok: false, reason: 'unknown-file' };
+    fileOffers.remove(fileId);
+    if (config.logger) {
+      config.logger('[file] decline id=' + fileId.slice(0, 8) + ' bytes=' + offer.size);
+    }
+    return { ok: true, fileId, name: offer.name };
+  }
+
+  /**
+   * 文件门面（0.12.0-α S1：list/send/download/decline/setTrust/progress）。
+   * 管理接口（lib/admin.mjs）只调这里；面板与 CLI 都经管理接口，不直接碰盘。
    */
   const filesFacade = {
-    list: () => fileStore.list(),
-    accept: (id) => fileStore.accept(id),
-    reject: (id) => fileStore.reject(id),
-    send: (input = {}) => sendFileToPeer(input),
+    /** 待下载（state:'offer'，带 trusted）+ 收件箱 + 传输中：三桶由管理接口切 */
+    list: () => [
+      ...fileOffers.list().map((offer) => ({
+        id: offer.id,
+        name: offer.name,
+        size: offer.size,
+        sha256: offer.sha256,
+        from: offer.from,
+        at: offer.at,
+        state: 'offer',
+        // 面板据此决定「下载前要不要问一句」：信任的 peer 不再弹确认
+        trusted: fileTrust.isTrusted(offer.from.peerId),
+      })),
+      ...fileStore.list(),
+    ],
+    send: (input = {}) => offerFileToPeer(input),
+    download: (fileId) => downloadOffer(fileId),
+    decline: (fileId) => declineOffer(fileId),
+    setTrust: (peerId, trusted) => fileTrust.set(peerId, trusted),
+    isTrusted: (peerId) => fileTrust.isTrusted(peerId),
     progress: (id) => fileStore.progress(id),
-    // 出站进度：只回 transferId/peerId/name/size/sent —— **不含 path**。
-    outbound: () => [...outboundTransfers.values()].map((row) => ({
-      transferId: row.transferId,
-      peerId: row.peerId,
-      name: row.name,
-      size: row.size,
-      sent: row.sent,
-    })),
-    sweep: (nowMs) => fileStore.sweep(nowMs),
+    // 出站进度表随「推送」一起没了：现在字节是对方来拉的，本机没有「已发多少」可报。
+    outbound: () => [],
+    sweep: (nowMs) => {
+      const offers = fileOffers.sweep(nowMs);
+      const outbox = fileOutbox.sweep(nowMs).removed;
+      return offers + outbox + fileStore.sweep(nowMs);
+    },
     dirs: () => ({
       inbox: fileStore.inboxDir,
       pending: fileStore.pendingDir,
       incoming: fileStore.incomingDir,
+      outbox: fileOutbox.root,
+      offers: fileOffers.root,
     }),
   };
 
@@ -10222,6 +10368,7 @@ export function createPeerServer(overrides = {}) {
       startRoleTimers();
       // 0.8.5-α 契约 §2：未确认 10 分钟自动拒收删除（unref，不吊住进程）
       fileStore.start();
+      fileOutbox.start();
       // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
       dispatchPending.start();
       // 0.10.0-α slice 4b-1：上一段进程遗留的 open 轮重新挂上定时器（过点的立刻结算）
@@ -10260,6 +10407,7 @@ export function createPeerServer(overrides = {}) {
       }
       // 0.8.5-α：待确认 TTL 定时器（unref 起来的，热重载时必须显式清掉）
       fileStore.close();
+      fileOutbox.close();
       // 0.8.5-α 契约 §3：待批准队列同样要收尾（并丢掉只存在内存里的正文）
       dispatchPending.close();
       dispatchPrompts.clear();

@@ -1386,15 +1386,17 @@ async function cmdGroup(args) {
 // v0.8.5-α 文件互传（契约 §3/§4，Lane F2）
 //
 // 三条命令都只打本机回环管理接口（/api/lan-peers/files*）：CLI 是独立进程，
-// 伙伴密钥与分块加密都在 host 里，本进程不可能也不该自己推数据。
+// 伙伴密钥与实际读写都在 host 里。0.12.0-α S1 起是**单发 offer/pull**：
+// send-file 只在对方那里挂一条「待下载」，字节留在本机 outbox，等对方点下载时来拉。
 // 日志/输出口径（契约 §0）：只报 size、sha256、状态与来源，不打印文件内容。
 // ---------------------------------------------------------------------------
 
-/** 403/409/501 = 本机现在做不了这件事（exit 2）；其余算失败（exit 1）。 */
+/** 403/409/501/503 = 本机现在做不了这件事（exit 2）；其余算失败（exit 1）。 */
 function reportFilesError(error) {
   const text = String(error && error.message ? error.message : error);
   process.stderr.write(L('cli.file.failed', { text }) + '\n');
-  process.exitCode = /^(40[39]|501)\b/.test(text) ? 2 : 1;
+  // 0.12.0-α S1：503 holder-offline（对端关着/逐出了）与 409 file-gone 同属「现在做不了」
+  process.exitCode = /^(40[39]|50[13])\b/.test(text) ? 2 : 1;
 }
 
 /**
@@ -1514,16 +1516,14 @@ async function cmdSendFile(args) {
     return;
   }
   process.stderr.write(L('cli.common.sending', { label: peerLabel, bytes: stat.size }) + '\n');
-  // id 目前是 send 返回时才有的，所以这一趟先滚「已用 Ns」；一拿到 id 就填进 holder，
-  // 下一拍（如果还没结束）自动切成「已发 X/Y 字节」——同一条代码路径，不重发。
-  let transferId = '';
-  // pendingSend：send 还没返回时用来自证「出站表里哪一条是我的」——
-  // 认 (peerId, size) 两项，够了；表在 send 结束那一拍就被清掉。
+  // offer 只有 metadata，本机没有「已发多少字节」可报（字节等对方来拉才离开本机），
+  // 所以这一趟进度条只会滚「已用 Ns」——与以前的降级路径完全一致。
+  let fileId = '';
   const progress = startFileProgress({
     dir,
     url: adminUrl,
     size: stat.size,
-    idSource: () => transferId,
+    idSource: () => fileId,
     pendingSend: () => ({ peerId, size: stat.size }),
   });
   let out;
@@ -1538,12 +1538,12 @@ async function cmdSendFile(args) {
     reportFilesError(error);
     return;
   }
-  transferId = String(out?.id ?? '');
+  fileId = String(out?.fileId ?? '');
   progress.stop();
   const bytes = Number.isFinite(Number(out?.bytes)) ? Number(out.bytes) : stat.size;
   const sha256 = String(out?.sha256 ?? '');
   const ms = Number.isFinite(Number(out?.ms)) ? Number(out.ms) : 0;
-  console.log(L('cli.file.sent', { id: String(out?.id ?? ''), bytes, sha256, ms }));
+  console.log(L('cli.file.offered', { id: fileId, bytes, sha256, ms }));
 }
 
 const inboxSha = (row) => {
@@ -1559,6 +1559,7 @@ const inboxAt = (row) => {
   return Number.isFinite(at) && at > 0 ? new Date(at).toISOString() : '-';
 };
 
+/** files 的三桶：待下载（offer）/ 已收（done）/ 传输中（incoming） */
 async function cmdInboxList(dir, args) {
   let out;
   try {
@@ -1567,7 +1568,7 @@ async function cmdInboxList(dir, args) {
     reportFilesError(error);
     return;
   }
-  const pending = Array.isArray(out?.pending) ? out.pending : [];
+  const offers = Array.isArray(out?.offers) ? out.offers : [];
   const inbox = Array.isArray(out?.inbox) ? out.inbox : [];
   const incoming = Array.isArray(out?.incoming) ? out.incoming : [];
   const line = (row, tag) => [
@@ -1579,9 +1580,12 @@ async function cmdInboxList(dir, args) {
     'from ' + inboxFrom(row),
     inboxAt(row),
   ].join('\t');
-  for (const row of pending) console.log(line(row, L('cli.inbox.tagPending')));
+  for (const row of offers) {
+    // 信任标记并在 tag 里（不另开一列：面板/CLI 的列宽是给眼睛看的，不是给机器解析的）
+    console.log(line(row, row?.trusted === true ? L('cli.inbox.tagOfferTrusted') : L('cli.inbox.tagOffer')));
+  }
   for (const row of inbox) console.log(line(row, L('cli.inbox.tagReceived')));
-  // 传输中的单独一行：id 前 8 位 + 名字 + 已收/总量（对端已经在推，只是还没收完）。
+  // 传输中的单独一行：id 前 8 位 + 名字 + 已收/总量（正在从 holder 拉）。
   for (const row of incoming) {
     console.log(L('cli.inbox.incomingLine', {
       id: String(row?.id ?? '').slice(0, 8),
@@ -1590,30 +1594,50 @@ async function cmdInboxList(dir, args) {
       size: Number.isFinite(Number(row?.size)) ? Number(row.size) : 0,
     }));
   }
-  process.stderr.write(L('cli.inbox.summary', { pending: pending.length, inbox: inbox.length }) + '\n');
+  process.stderr.write(L('cli.inbox.summary', { offers: offers.length, inbox: inbox.length }) + '\n');
 }
 
-async function cmdInboxDecide(dir, args, action) {
-  const id = String(args._[1] ?? args.id ?? '').trim();
+/** download / decline：都只带 fileId 打一条写路由 */
+async function cmdInboxDownload(dir, args) {
+  const id = String(args._[0] ?? args.id ?? '').trim();
   if (id === '') {
-    throw new Error(L('cli.inbox.usageDecide', { action }) + '\n' + L('cli.help.inbox'));
+    throw new Error(L('cli.inbox.usageDecide', { action: 'download' }) + '\n' + L('cli.help.inbox'));
   }
   let out;
   try {
-    out = await adminCall(args.url, 'files/' + action, {
+    out = await adminCall(args.url, 'files/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id }),
+      body: JSON.stringify({ fileId: id }),
     }, dir);
   } catch (error) {
     reportFilesError(error);
     return;
   }
-  if (action === 'accept') {
-    console.log(L('cli.inbox.accepted', { id, path: String(out?.path ?? '') }));
+  console.log(L('cli.inbox.downloaded', {
+    id: String(out?.id ?? id),
+    bytes: Number.isFinite(Number(out?.bytes)) ? Number(out.bytes) : 0,
+    sha256: String(out?.sha256 ?? ''),
+    ms: Number.isFinite(Number(out?.ms)) ? Number(out.ms) : 0,
+  }));
+}
+
+async function cmdInboxDecline(dir, args) {
+  const id = String(args._[0] ?? args.id ?? '').trim();
+  if (id === '') {
+    throw new Error(L('cli.inbox.usageDecide', { action: 'decline' }) + '\n' + L('cli.help.inbox'));
+  }
+  try {
+    await adminCall(args.url, 'files/decline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileId: id }),
+    }, dir);
+  } catch (error) {
+    reportFilesError(error);
     return;
   }
-  console.log(L('cli.inbox.rejected', { id }));
+  console.log(L('cli.inbox.declined', { id }));
 }
 
 async function cmdInbox(args) {
@@ -1624,8 +1648,24 @@ async function cmdInbox(args) {
   }
   const dir = stateDir(args);
   if (sub === 'list') return cmdInboxList(dir, args);
-  if (sub === 'accept' || sub === 'reject') return cmdInboxDecide(dir, args, sub);
+  if (sub === 'download') {
+    args._ = args._.slice(1);
+    return cmdInboxDownload(dir, args);
+  }
+  if (sub === 'decline') {
+    args._ = args._.slice(1);
+    return cmdInboxDecline(dir, args);
+  }
   throw new Error(L('cli.inbox.unknownSub', { sub }) + '\n' + L('cli.help.inbox'));
+}
+
+/** 顶层 download / decline：等价于 inbox download / inbox decline（id 是第一个参数） */
+async function cmdDownloadFile(args) {
+  return cmdInboxDownload(stateDir(args), args);
+}
+
+async function cmdDeclineFile(args) {
+  return cmdInboxDecline(stateDir(args), args);
 }
 
 // ---------------------------------------------------------------------------
@@ -2014,6 +2054,8 @@ const commands = {
   dispatch: cmdDispatch,
   'send-file': cmdSendFile,
   inbox: cmdInbox,
+  download: cmdDownloadFile,
+  decline: cmdDeclineFile,
 };
 const helpFor = {
   code: 'cli.help.code',
@@ -2027,6 +2069,8 @@ const helpFor = {
   dispatch: 'cli.dispatch.usage',
   'send-file': 'cli.help.sendFile',
   inbox: 'cli.help.inbox',
+  download: 'cli.help.download',
+  decline: 'cli.help.decline',
 };
 
 const args = parseArgs(process.argv.slice(2));

@@ -1,4 +1,4 @@
-// dsh-lan-peers · v0.8.5-α（契约 §3/§4，Lane F2）CLI：send-file / inbox。
+// dsh-lan-peers · 0.12.0-α（S1）CLI：send-file（挂出待下载）/ inbox（list / download / decline）。
 //
 // 三条命令都只打本机回环管理接口（/api/lan-peers/files*），所以这里起一个只实现
 // 那几条路由的 node:http 桩，真跑 cli.mjs 子进程，断言请求形状（含 token 头）、
@@ -73,14 +73,16 @@ const AT = 1_760_000_000_000;
 // send-file
 // ---------------------------------------------------------------------------
 
-test('send-file：POST { peerId, path } 带 token，打印 id/bytes/sha256/ms', async (t) => {
+test('send-file：POST { peerId, path } 带 token，打印「已挂出待下载」+ fileId', async (t) => {
   const admin = await startAdmin(t, () => ({
-    body: { ok: true, id: 'tx-7f3a91', bytes: 4096, sha256: SHA, ms: 37 },
+    body: { ok: true, fileId: 'file-7f3a91', bytes: 4096, sha256: SHA, offer: 'sent', ms: 37 },
   }));
   const out = await runAsync(['send-file', '书房', admin.file, '--url', admin.url, '--state-dir', admin.dir]);
 
   assert.equal(out.status, 0, out.stderr);
-  assert.equal(out.stdout.trim(), '已发送 id=tx-7f3a91 bytes=4096 sha256=' + SHA + ' ms=37');
+  assert.equal(out.stdout.trim(),
+    '已挂出待下载 id=file-7f3a91 bytes=4096 sha256=' + SHA + ' ms=37（对端下载时才拉字节）');
+  assert.equal(/已发送/.test(out.stdout), false, '不能再说「已发送」：字节一步都还没走');
   assert.match(out.stderr, /发送中 → 书房 · 4096 字节/, '先把「往哪发、多大」说清楚');
 
   assert.equal(admin.seen.length, 1);
@@ -116,14 +118,15 @@ test('send-file：进度轮询不可用（404/501）时静默降级为已用时�
   for (const status of [404, 501]) {
     const admin = await startAdmin(t, (call) => (call.url.includes('/files/progress')
       ? { status, body: { error: status === 404 ? 'unknown-id' : 'files-unsupported' } }
-      : { body: { ok: true, id: 'tx-7f3a91', bytes: 4096, sha256: SHA, ms: 37 }, delayMs: 700 }));
+      : { body: { ok: true, fileId: 'file-7f3a91', bytes: 4096, sha256: SHA, offer: 'sent', ms: 37 }, delayMs: 700 }));
     const out = await runAsync(
       ['send-file', '书房', admin.file, '--url', admin.url, '--state-dir', admin.dir],
       { DSH_LAN_PEERS_PROGRESS: '1' },
     );
 
     assert.equal(out.status, 0, out.stderr);
-    assert.equal(out.stdout.trim(), '已发送 id=tx-7f3a91 bytes=4096 sha256=' + SHA + ' ms=37');
+    assert.equal(out.stdout.trim(),
+      '已挂出待下载 id=file-7f3a91 bytes=4096 sha256=' + SHA + ' ms=37（对端下载时才拉字节）');
     assert.match(out.stderr, /已用 \d+s/, '拿不到字节进度就退回已用时长（TTY/强制模式才刷）');
     assert.equal(/文件操作失败/.test(out.stderr), false, '进度失败不外溢成命令失败');
   }
@@ -146,7 +149,7 @@ test('send-file：对端拒绝（409）走「现在做不了」exit 2，超限�
 // ---------------------------------------------------------------------------
 
 test('不带 --url 且没有 admin-url：明确报地址未知并退出 1，绝不静默回落 7788', async (t) => {
-  const admin = await startAdmin(t, () => ({ body: { pending: [], inbox: [] } }));
+  const admin = await startAdmin(t, () => ({ body: { offers: [], inbox: [], incoming: [] } }));
   const out = await runAsync(['inbox', 'list', '--state-dir', admin.dir]);
 
   assert.equal(out.status, 1);
@@ -157,7 +160,7 @@ test('不带 --url 且没有 admin-url：明确报地址未知并退出 1，绝�
 });
 
 test('admin-url 过期（端口已变、连不上）时给出可操作提示，而不是只留一句 fetch failed', async (t) => {
-  const admin = await startAdmin(t, () => ({ body: { pending: [], inbox: [] } }));
+  const admin = await startAdmin(t, () => ({ body: { offers: [], inbox: [], incoming: [] } }));
   fs.writeFileSync(path.join(admin.dir, 'admin-url'), 'http://127.0.0.1:1\n', { mode: 0o600 });
 
   const out = await runAsync(['inbox', 'list', '--state-dir', admin.dir]);
@@ -170,7 +173,7 @@ test('admin-url 过期（端口已变、连不上）时给出可操作提示，�
 test('从 <stateDir>/admin-url 读到地址后直接成功（打开过一次面板就够）', async (t) => {
   const admin = await startAdmin(t, () => ({
     body: {
-      pending: [],
+      offers: [],
       inbox: [{ id: 'id-done-1', name: 'photo.jpg', size: 2048, sha256: 'b'.repeat(64), from: { peerId: 'peer-b', name: '书房' }, at: AT, state: 'done' }],
     },
   }));
@@ -186,12 +189,13 @@ test('从 <stateDir>/admin-url 读到地址后直接成功（打开过一次面�
 });
 
 test('send-file 回归：不带 --url 时用 admin-url 发出去（真机那条 404 的形状）', async (t) => {
-  const admin = await startAdmin(t, () => ({ body: { ok: true, id: 'tx-7f3a91', bytes: 4096, sha256: SHA, ms: 29 } }));
+  const admin = await startAdmin(t, () => ({ body: { ok: true, fileId: 'file-7f3a91', bytes: 4096, sha256: SHA, offer: 'sent', ms: 29 } }));
   fs.writeFileSync(path.join(admin.dir, 'admin-url'), admin.url + '\n', { mode: 0o600 });
 
   const out = await runAsync(['send-file', '书房', admin.file, '--state-dir', admin.dir]);
   assert.equal(out.status, 0, out.stderr);
-  assert.equal(out.stdout.trim(), '已发送 id=tx-7f3a91 bytes=4096 sha256=' + SHA + ' ms=29');
+  assert.equal(out.stdout.trim(),
+    '已挂出待下载 id=file-7f3a91 bytes=4096 sha256=' + SHA + ' ms=29（对端下载时才拉字节）');
   assert.deepEqual(admin.seen.map((call) => call.url), ['/api/lan-peers/files/send']);
 });
 
@@ -199,68 +203,97 @@ test('send-file 回归：不带 --url 时用 admin-url 发出去（真机那条 
 // inbox
 // ---------------------------------------------------------------------------
 
-test('inbox list：待确认与已收分行打印 id/文件名/体积/sha256/来源/时间，末行汇总', async (t) => {
+test('inbox list：待下载 / 已收 / 传输中三桶分行打印，末行汇总', async (t) => {
   const admin = await startAdmin(t, () => ({
     body: {
-      pending: [{ id: 'id-pending-1', name: '报告.pdf', size: 4096, sha256: SHA, from: { peerId: 'peer-b', name: '书房' }, at: AT, state: 'pending' }],
+      offers: [{ id: 'id-offer-1', name: '报告.pdf', size: 4096, sha256: SHA, from: { peerId: 'peer-b', name: '书房' }, at: AT, state: 'offer', trusted: false }],
       inbox: [{ id: 'id-done-1', name: 'photo.jpg', size: 2048, sha256: 'b'.repeat(64), from: { peerId: 'peer-b', name: '书房' }, at: AT - 1000, state: 'done' }],
+      incoming: [{ id: 'id-inc-1', name: 'big.bin', size: 100, received: 40, sha256: SHA, from: { peerId: 'peer-b', name: '书房' }, at: AT, state: 'incoming' }],
     },
   }));
   const out = await runAsync(['inbox', 'list', '--url', admin.url, '--state-dir', admin.dir]);
 
   assert.equal(out.status, 0, out.stderr);
   const lines = out.stdout.trim().split('\n');
-  assert.equal(lines.length, 2);
-  assert.equal(lines[0], ['待确认', 'id-pending-1', '报告.pdf', '4096B', 'sha256 ' + SHA, 'from 书房', new Date(AT).toISOString()].join('\t'));
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0], ['待下载', 'id-offer-1', '报告.pdf', '4096B', 'sha256 ' + SHA, 'from 书房', new Date(AT).toISOString()].join('\t'));
   assert.equal(lines[1].split('\t')[0], '已收');
-  assert.match(out.stderr, /待确认 1 个 · 已收 1 个/);
+  assert.match(lines[2], /接收中 id-inc-1 big\.bin 40\/100/);
+  assert.match(out.stderr, /待下载 1 个 · 已收 1 个/);
   assert.equal(admin.seen[0].method, 'GET');
   assert.equal(admin.seen[0].url, '/api/lan-peers/files');
   assert.equal(admin.seen[0].token, TOKEN);
 });
 
 test('inbox list：空收件箱只打一行汇总，不印空表头', async (t) => {
-  const admin = await startAdmin(t, () => ({ body: { pending: [], inbox: [] } }));
+  const admin = await startAdmin(t, () => ({ body: { offers: [], inbox: [] } }));
   const out = await runAsync(['inbox', 'list', '--url', admin.url, '--state-dir', admin.dir]);
   assert.equal(out.status, 0, out.stderr);
   assert.equal(out.stdout, '');
-  assert.match(out.stderr, /待确认 0 个 · 已收 0 个/);
+  assert.match(out.stderr, /待下载 0 个 · 已收 0 个/);
 });
 
-test('inbox accept / reject：POST { id }，accept 打印落盘路径、reject 只回状态', async (t) => {
-  const admin = await startAdmin(t, (call) => (call.url.endsWith('/accept')
-    ? { body: { ok: true, path: '/state/inbox/id-pending-1__report.pdf' } }
-    : { body: { ok: true } }));
+test('inbox download / decline：POST { fileId }；download 打印 bytes/sha/ms，decline 只回状态', async (t) => {
+  const admin = await startAdmin(t, (call) => (call.url.endsWith('/download')
+    ? { body: { ok: true, id: 'file-7f3a91', bytes: 4096, sha256: SHA, ms: 37 } }
+    : { body: { ok: true, fileId: 'id-offer-1' } }));
 
-  const accepted = await runAsync(['inbox', 'accept', 'id-pending-1', '--url', admin.url, '--state-dir', admin.dir]);
-  assert.equal(accepted.status, 0, accepted.stderr);
-  assert.equal(accepted.stdout.trim(), '已接受 id=id-pending-1 path=/state/inbox/id-pending-1__report.pdf');
+  const downloaded = await runAsync(['inbox', 'download', 'id-offer-1', '--url', admin.url, '--state-dir', admin.dir]);
+  assert.equal(downloaded.status, 0, downloaded.stderr);
+  assert.equal(downloaded.stdout.trim(), '已下载 id=file-7f3a91 bytes=4096 sha256=' + SHA + ' ms=37');
 
-  const rejected = await runAsync(['inbox', 'reject', 'id-pending-1', '--url', admin.url, '--state-dir', admin.dir]);
-  assert.equal(rejected.status, 0, rejected.stderr);
-  assert.equal(rejected.stdout.trim(), '已拒收 id=id-pending-1');
+  const declined = await runAsync(['inbox', 'decline', 'id-offer-1', '--url', admin.url, '--state-dir', admin.dir]);
+  assert.equal(declined.status, 0, declined.stderr);
+  assert.equal(declined.stdout.trim(), '已放弃下载 id=id-offer-1');
 
   assert.deepEqual(admin.seen.map((call) => [call.method, call.url, call.body]), [
-    ['POST', '/api/lan-peers/files/accept', { id: 'id-pending-1' }],
-    ['POST', '/api/lan-peers/files/reject', { id: 'id-pending-1' }],
+    ['POST', '/api/lan-peers/files/download', { fileId: 'id-offer-1' }],
+    ['POST', '/api/lan-peers/files/decline', { fileId: 'id-offer-1' }],
   ]);
   assert.equal(admin.seen[0].contentType, 'application/json', '写操作必须是 JSON');
 });
 
+test('顶层 download / decline 是同一件事（等价于 inbox download / inbox decline）', async (t) => {
+  const admin = await startAdmin(t, (call) => (call.url.endsWith('/download')
+    ? { body: { ok: true, id: 'file-7f3a91', bytes: 4096, sha256: SHA, ms: 5 } }
+    : { body: { ok: true, fileId: 'id-offer-1' } }));
+
+  const downloaded = await runAsync(['download', 'id-offer-1', '--url', admin.url, '--state-dir', admin.dir]);
+  assert.equal(downloaded.status, 0, downloaded.stderr);
+  assert.equal(downloaded.stdout.trim(), '已下载 id=file-7f3a91 bytes=4096 sha256=' + SHA + ' ms=5');
+
+  const declined = await runAsync(['decline', 'id-offer-1', '--url', admin.url, '--state-dir', admin.dir]);
+  assert.equal(declined.status, 0, declined.stderr);
+  assert.equal(declined.stdout.trim(), '已放弃下载 id=id-offer-1');
+  assert.deepEqual(admin.seen.map((call) => call.url), [
+    '/api/lan-peers/files/download',
+    '/api/lan-peers/files/decline',
+  ]);
+});
+
+test('inbox download：完整性/离线错误码原样透出（502 integrity-failed / 503 holder-offline）', async (t) => {
+  for (const [status, error, exit] of [[502, 'integrity-failed', 1], [503, 'holder-offline', 2]]) {
+    const admin = await startAdmin(t, () => ({ status, body: { error } }));
+    const out = await runAsync(['inbox', 'download', 'id-offer-1', '--url', admin.url, '--state-dir', admin.dir]);
+    assert.equal(out.status, exit, error + ' → exit ' + exit);
+    assert.match(out.stderr, new RegExp(status + ' ' + error));
+  }
+});
+
 test('inbox：未知 id（404）exit 1；门面未接线（501）exit 2；缺 id 报用法且不发请求', async (t) => {
-  const unknown = await startAdmin(t, () => ({ status: 404, body: { error: 'unknown-id' } }));
-  const out404 = await runAsync(['inbox', 'accept', 'nope', '--url', unknown.url, '--state-dir', unknown.dir]);
+  const unknown = await startAdmin(t, () => ({ status: 404, body: { error: 'unknown-file' } }));
+  const out404 = await runAsync(['inbox', 'download', 'nope', '--url', unknown.url, '--state-dir', unknown.dir]);
   assert.equal(out404.status, 1);
-  assert.match(out404.stderr, /文件操作失败: 404 unknown-id/);
+  assert.match(out404.stderr, /文件操作失败: 404 unknown-file/);
 
   const unwired = await startAdmin(t, () => ({ status: 501, body: { error: 'files-unsupported' } }));
   const out501 = await runAsync(['inbox', 'list', '--url', unwired.url, '--state-dir', unwired.dir]);
   assert.equal(out501.status, 2);
   assert.match(out501.stderr, /文件操作失败: 501 files-unsupported/);
 
-  const usage = await runAsync(['inbox', 'accept', '--url', unknown.url, '--state-dir', unknown.dir]);
+  const usage = await runAsync(['inbox', 'download', '--url', unknown.url, '--state-dir', unknown.dir]);
   assert.equal(usage.status, 1);
-  assert.match(usage.stderr, /用法: dsh-lan-peers inbox accept <id>/);
+  assert.match(usage.stderr, /用法: dsh-lan-peers inbox download <id>/);
   assert.equal(unknown.seen.length, 1, '只有前一条 404 那次请求');
 
   const unknownSub = await runAsync(['inbox', 'nope', '--url', unknown.url, '--state-dir', unknown.dir]);
