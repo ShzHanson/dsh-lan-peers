@@ -144,12 +144,16 @@ test('同一个错误在两种语言下：文案翻译，稳定标识与退出�
     assert.ok(out.stderr.includes('/v1/unpair'), '协议路径不翻译');
   }
 
-  const usageZh = await run(['inbox', 'accept', '--state-dir', dir, '--lang', 'zh']);
-  const usageEn = await run(['inbox', 'accept', '--state-dir', dir, '--lang', 'en']);
+  // 0.12.0-α：inbox accept 已随推送模型一起删除，改指 download（缺 id 仍是用法错误）
+  const usageZh = await run(['inbox', 'download', '--state-dir', dir, '--lang', 'zh']);
+  const usageEn = await run(['inbox', 'download', '--state-dir', dir, '--lang', 'en']);
   assert.equal(usageZh.status, 1, '缺 id 是用法错误 exit 1，与语言无关');
   assert.equal(usageEn.status, 1);
-  assert.match(usageZh.stderr, /用法: dsh-lan-peers inbox accept <id>/);
-  assert.match(usageEn.stderr, /Usage: dsh-lan-peers inbox accept <id>/);
+  assert.match(usageZh.stderr, /用法: dsh-lan-peers inbox download <id>/);
+  assert.match(usageEn.stderr, /Usage: dsh-lan-peers inbox download <id>/);
+  // 旧子命令必须已经不存在（否则说明删除没落干净）
+  const gone = await run(['inbox', 'accept', '--state-dir', dir, '--lang', 'zh']);
+  assert.notEqual(gone.status, 0, 'inbox accept 已被删除，不能再成功');
 });
 
 // ---------------------------------------------------------------------------
