@@ -222,6 +222,20 @@ import {
   summarize,
   votesSummary,
 } from '../lib/group-vote.mjs';
+// 0.12.1：日志轮转（纯逻辑模块自己不带定时器；节拍、一行日志、可见面都在这里）
+import {
+  DEFAULT_LOG_KEEP,
+  DEFAULT_LOG_MAX_BYTES,
+  LOG_KEEP_MAX,
+  LOG_KEEP_MIN,
+  LOG_MAX_BYTES_MAX,
+  LOG_MAX_BYTES_MIN,
+  LOG_ROTATE_INTERVAL_MAX_MS,
+  LOG_ROTATE_INTERVAL_MIN_MS,
+  LOG_ROTATE_INTERVAL_MS,
+  logRotateLine,
+  rotateOnce,
+} from '../lib/log-rotate.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -233,7 +247,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.12.0';
+export const PLUGIN_VERSION = '0.12.1';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -733,6 +747,9 @@ export function resolveConfig(overrides = {}) {
     trustedCidrs = list.map((item) => String(item));
   }
   const workspace = expandHome(overrides.workspace ?? path.join(stateDir, 'workspace'));
+  // 0.12.1 日志轮转：运维给的 logFile 先展开 ~，空串回落默认（<home>/.dsh/lan-peers.log）
+  const logFileRaw = String(overrides.logFile ?? '').trim();
+  const logFile = expandHome(logFileRaw === '' ? path.join(os.homedir(), '.dsh', 'lan-peers.log') : logFileRaw);
 
   return {
     name,
@@ -800,6 +817,22 @@ export function resolveConfig(overrides = {}) {
     // 没注入时才由 <stateDir>/config.json 的 dispatchApprovalTtlMs 决定（默认 10 分钟，
     // 允许 1 分钟 – 1 小时，手工改完不必重启 —— 见 lib/dispatch-prefs.mjs）。
     dispatchPendingTtlPinned: Number.isFinite(Number(overrides.dispatchPendingTtlMs)),
+    // 0.12.1 日志轮转（NAS 上 lan-peers.log 41 MB 且从未轮转）。四个旋钮全部走同一条
+    // 归一化路径：非法值回落默认、不抛错（老配置里没有这些键）。
+    //   logFile            绝对路径（~ 已展开）；默认 <home>/.dsh/lan-peers.log
+    //   logMaxBytes        严格大于才转；钳到 [64 KiB, 4 GiB]
+    //   logKeep            保留 .1..N 几份归档；钳到 [1, 20]
+    //   logRotateIntervalMs 节拍；钳到 [20 ms, 24 h]（下限这么小只为测试能压到毫秒级）
+    logFile,
+    logMaxBytes: normalizeCount(overrides.logMaxBytes, DEFAULT_LOG_MAX_BYTES, {
+      min: LOG_MAX_BYTES_MIN,
+      max: LOG_MAX_BYTES_MAX,
+    }),
+    logKeep: normalizeCount(overrides.logKeep, DEFAULT_LOG_KEEP, { min: LOG_KEEP_MIN, max: LOG_KEEP_MAX }),
+    logRotateIntervalMs: normalizeCount(overrides.logRotateIntervalMs, LOG_ROTATE_INTERVAL_MS, {
+      min: LOG_ROTATE_INTERVAL_MIN_MS,
+      max: LOG_ROTATE_INTERVAL_MAX_MS,
+    }),
   };
 }
 
@@ -2937,6 +2970,56 @@ export function createPeerServer(overrides = {}) {
   const pendingPairTimer = setInterval(() => prunePendingPairs(config.now()), 30_000);
   pendingPairTimer.unref?.();
 
+  /**
+   * 0.12.1 日志轮转节拍（整份文件只有这一枚定时器）。纪律与这里其它定时器一致：
+   * unref()、listen() 时挂上、close() 里清掉 —— 热重载不会留下一个还在转日志的幽灵。
+   *
+   * 闸门用注入的 config.now()（就是「overrides seam」里那个假时钟）：一个节拍到了但
+   * 时钟没走过一个间隔就不动，测试因此能在毫秒级复现「一个间隔后只转一次」。
+   * 转不动（Windows 上文件被占）时 rotateOnce 回 'locked'，这里只写一行日志就收手，
+   * **不重试**：下一次判断留给下一个节拍。
+   */
+  let logRotateTimer = null;
+  let logRotatedAt = 0;
+  let logRotateLast = null;
+
+  function rotateLogNow() {
+    const interval = config.logRotateIntervalMs;
+    const nowMs = config.now();
+    if (logRotatedAt !== 0 && nowMs - logRotatedAt < interval) return null;
+    logRotatedAt = nowMs;
+    const result = rotateOnce({
+      file: config.logFile,
+      maxBytes: config.logMaxBytes,
+      keep: config.logKeep,
+      stateDir: config.stateDir,
+      home: os.homedir(),
+    });
+    logRotateLast = { reason: result.reason, bytes: result.bytes };
+    // 一次轮转（成功或跳过）恰好一行：size=<字节数> keep=<保留份数> reason=<token>
+    // 路径与用户数据绝不进日志（scripts/leak-check.mjs 的规矩）。
+    if (config.logger) {
+      config.logger(logRotateLine({ size: result.bytes, keep: config.logKeep, reason: result.reason }));
+    }
+    return result;
+  }
+
+  function startLogRotation() {
+    if (logRotateTimer) return;
+    // 第一个节拍就是「挂上之后一整个间隔」，所以基准点取挂上那一刻（不在这里抢先转一次）
+    logRotatedAt = config.now();
+    logRotateTimer = setInterval(() => {
+      rotateLogNow();
+    }, config.logRotateIntervalMs);
+    logRotateTimer.unref?.();
+  }
+
+  function stopLogRotation() {
+    if (!logRotateTimer) return;
+    clearInterval(logRotateTimer);
+    logRotateTimer = null;
+  }
+
   function prunePendingPairs(nowMs) {
     for (const [code, pending] of pendingPairs) {
       if (pending.expiresAt <= nowMs) pendingPairs.delete(code);
@@ -4513,6 +4596,16 @@ export function createPeerServer(overrides = {}) {
         version: PLUGIN_VERSION,
         capability: capabilityList(),
         peers: store.getPeerCount(),
+        // 0.12.1：轮转策略的**生效值**（钳制之后），运维不必读代码就知道现在按什么转。
+        // 只给数字，不给路径：这条 GET 是免认证的，路径属于本机信息。
+        // 面板的 GET state 那一份由 lib/admin.mjs 拼装，本轮不动；策略落在宿主自己的
+        // GET 状态面上，同一个运维、同一条 curl 就能看到。
+        log: {
+          maxBytes: config.logMaxBytes,
+          keep: config.logKeep,
+          intervalMs: config.logRotateIntervalMs,
+          last: logRotateLast ? { reason: logRotateLast.reason, bytes: logRotateLast.bytes } : null,
+        },
       },
     };
   }
@@ -11172,6 +11265,8 @@ export function createPeerServer(overrides = {}) {
       groupFiles?.store.start();
       // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
       dispatchPending.start();
+      // 0.12.1：日志轮转节拍（unref；close() 里清掉）。挂上就等一整个间隔再第一次动。
+      startLogRotation();
       // 0.10.0-α slice 4b-1：上一段进程遗留的 open 轮重新挂上定时器（过点的立刻结算）
       resumeVoteTicks();
       // v0.8.0 契约 §2a：已入群节点启动后广播一次（延迟到地址已知；节流在广播里生效）
@@ -11213,6 +11308,8 @@ export function createPeerServer(overrides = {}) {
       groupFiles?.close();
       // 0.8.5-α 契约 §3：待批准队列同样要收尾（并丢掉只存在内存里的正文）
       dispatchPending.close();
+      // 0.12.1：日志轮转节拍（unref 起来的，热重载必须显式清掉，否则旧实例还在转日志）
+      stopLogRotation();
       dispatchPrompts.clear();
       if (replicaRetryTimer) {
         clearInterval(replicaRetryTimer);
@@ -11232,6 +11329,21 @@ export function createPeerServer(overrides = {}) {
     url() {
       if (!boundAddress) return null;
       return `http://127.0.0.1:${boundAddress.port}`;
+    },
+    /**
+     * 0.12.1：日志轮转的可见面（不给路径）。policy() 是钳制之后的生效值（与 GET /v1/health
+     * 的 log 块同一份数）；tick() 走同一个闸门（假时钟没过一个间隔就不动）；armed() 用来
+     * 证明 listen() 挂上、close() 清干净（与 uploadSweepArmed() 同一种口径）。
+     */
+    logRotation: {
+      policy: () => ({
+        maxBytes: config.logMaxBytes,
+        keep: config.logKeep,
+        intervalMs: config.logRotateIntervalMs,
+      }),
+      tick: () => rotateLogNow(),
+      armed: () => logRotateTimer !== null,
+      last: () => (logRotateLast ? { ...logRotateLast } : null),
     },
   };
 }
