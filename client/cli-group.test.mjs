@@ -23,9 +23,10 @@ function run(args) {
   return execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
 }
 
-function runAsync(args) {
+function runAsync(args, opts = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [CLI, ...args], { encoding: 'utf8' }, (error, stdout, stderr) => {
+    // 有 timeout：跟随循环要是退不出去，这里给 ETIMEDOUT 而不是把整个测试文件挂死。
+    execFile(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 8000, ...opts }, (error, stdout, stderr) => {
       resolve({ status: error ? error.code : 0, stdout, stderr });
     });
   });
@@ -512,5 +513,257 @@ test('C5 group-role.json 坏掉或不存在 → 回落今天的解析，不崩',
   assert.equal(peer.calls.length, 2, '没有可信角色文件时仍按旧规则解析（这里是唯一伙伴）');
   assert.equal(admin.calls.length, 0, '角色未知就绝不擅自打本机 admin');
 });
+
+// ---------------------------------------------------------------------------
+// v0.12.3 回归：hub 自己的**读**动词（真机 NAS 上 group state/history 答的是某个成员的副本）
+//
+// 形状与 C1–C5 是同一套桩：admin 桩 = 本机回环管理接口 GET group，peer 桩 = 那个「唯一的伙伴」。
+// 管理桩按 sinceSeq **真的切片** —— 这样「游标真的被用上了」才是可断言的，而不是只看 URL。
+//
+// R7 非空性（谁挂了就说明分支真的在起作用）：
+//   · 删掉 cmdGroupHistory 的 wantsLocalGroupRead 分支 → R2 的
+//     「?sinceSeq= 请求序列」与「--since 2 不许再给 #1」同时红（请求跑去 peer 桩，peer.calls 变 1）。
+//   · 把本地分支放宽到成员（去掉 isLocalGroupLeader）→ R6 的
+//     「成员节点的本机 admin 一个字都不该收」红。
+//   · 删掉 cmdGroupProbe 的本地分支 → R4 的「probe 一个字节都不许出站」红。
+//   · 把 groupTailLocal 退回「一次 GET 的快照」（删掉 for 循环）→ R3 的
+//     「cursors.length >= 2」+「≥2 个不同 sinceSeq」+「seqs 末尾 > 3」同时红（T4 的非空性断言），
+//     R3b 的「轮询次数 >= 2」也红。
+// ---------------------------------------------------------------------------
+
+const GROUP_ID = '11111111-2222-3333-4444-555555555555';
+const KEY_43 = 'k'.repeat(43);   // 43 个 base64url 字符 = 32 字节
+
+function groupMessage(seq, text) {
+  return { seq, ts: HUB_TS + seq * 1000, from: { peerId: HUB.peerId, name: HUB.name }, kind: 'chat', text };
+}
+
+/** 管理接口桩：GET /api/lan-peers/group[?sinceSeq=N]，按游标真的切片（与 hub 侧同口径） */
+async function startGroupAdmin(t, overrides = {}) {
+  const calls = [];
+  const messages = overrides.messages ?? [groupMessage(1, 'first'), groupMessage(2, 'second'), groupMessage(3, 'third')];
+  const members = overrides.members ?? [
+    { peerId: HUB.peerId, name: HUB.name, online: true, joinedAt: '2026-01-01T00:00:00.000Z' },
+    { peerId: MEMBER.peerId, name: MEMBER.name, online: false, joinedAt: '2026-01-02T00:00:00.000Z' },
+  ];
+  // grow:true = 每次轮询都在尾部追加一条新消息（真 hub 在 tail 期间就是这么长出来的）：
+  // 跟随式实现每轮都能拿到一条新的，快照式实现只能拿到第一轮那批。
+  const grow = overrides.grow === true;
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://stub.invalid');
+    calls.push({ method: req.method, path: req.url, token: req.headers['x-lan-peers-token'] ?? '' });
+    const since = Number(url.searchParams.get('sinceSeq') ?? 0) || 0;
+    if (grow) messages.push(groupMessage(messages.length + 1, 'live-' + (messages.length + 1)));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      enabled: true,
+      isHub: true,
+      group: { groupId: GROUP_ID, name: 'default', members },
+      messages: messages.filter((message) => message.seq > since),
+      lastSeq: messages.length === 0 ? 0 : messages[messages.length - 1].seq,
+      leader: { peerId: HUB.peerId, name: HUB.name, epoch: 1 },
+      advertiseBaseUrl: overrides.advertiseBaseUrl ?? 'http://10.0.0.1:7788',
+    }));
+  });
+  const info = await listenOnRandomPort(server);
+  t.after(() => new Promise((resolve) => { server.close(() => resolve()); }));
+  return { calls, baseUrl: info.url };
+}
+
+/**
+ * hub 节点：group-role 说本机是 leader + group.json（hub 的群密钥与 keyVersion 都在这里，
+ * hub 没有 group-key.json —— 那正是它落进「唯一伙伴」兜底、读请求打到成员身上的原因）。
+ * 给了 peer 就配一个成员当那个「唯一的伙伴」：本地分支缺席时请求就会跑到它那里。
+ */
+function hubNodeDir(t, { admin, peer, keyVersion = 1 } = {}) {
+  const dir = nodeDir(t, {
+    role: { role: 'leader', leaderPeerId: HUB.peerId },
+    peers: peer ? [{ ...MEMBER, baseUrl: peer.baseUrl }] : [],
+    admin,
+  });
+  writeJson0600(path.join(dir, 'group.json'), {
+    groupId: GROUP_ID,
+    name: 'default',
+    keyVersion,
+    key: KEY_43,
+    members: { [HUB.peerId]: { name: HUB.name }, [MEMBER.peerId]: { name: MEMBER.name } },
+    messages: [],
+    lastSeq: 0,
+  });
+  return dir;
+}
+
+test('R1 hub 本地 state：一次本机 admin GET group、零 peer 调用，输出与成员路径逐字一致', async (t) => {
+  const admin = await startGroupAdmin(t);
+  const peer = await startRecorder(t, {});
+  const dir = hubNodeDir(t, { admin, peer });
+
+  const out = await runAsync(['group', 'state', '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  // 与成员路径**同一个渲染口**（printGroupStatePeerLike）：四行逐字钉死
+  assert.deepEqual(out.stdout.trimEnd().split('\n'), [
+    '群组: default (' + GROUP_ID + ')  epoch=1 keyVersion=1 成员=2',
+    '  ' + HUB.name + '\t' + HUB.peerId + '\tonline\tjoinedAt=2026-01-01T00:00:00.000Z',
+    '  ' + MEMBER.name + '\t' + MEMBER.peerId + '\toffline\tjoinedAt=2026-01-02T00:00:00.000Z',
+    'groupKey: 已收到（32B，不显示）',
+  ]);
+  assert.equal(admin.calls.length, 1, '整条命令只该有一次本机 admin 调用');
+  assert.equal(admin.calls[0].method, 'GET');
+  assert.equal(admin.calls[0].path, '/api/lan-peers/group');
+  assert.equal(admin.calls[0].token, HUB_TOKEN, 'token 仍走 <stateDir>/admin-token');
+  assert.equal(peer.calls.length, 0, 'hub 本地读绝不给任何成员发请求（真机就是这条坏了）');
+  assert.ok(!out.stdout.includes(KEY_43), '群密钥一个字节都不许出现在输出里');
+});
+
+test('R2 hub 本地 history：sinceSeq 游标真的进到管理接口，且是同一套「保留最新」口径', async (t) => {
+  const admin = await startGroupAdmin(t);
+  const peer = await startRecorder(t, {});
+  const dir = hubNodeDir(t, { admin, peer });
+  const line = (seq, text) => '#' + seq + ' ' + new Date(HUB_TS + seq * 1000).toISOString() + ' ' + HUB.name + ' [chat] ' + text;
+
+  const all = await runAsync(['group', 'history', '--state-dir', dir]);
+  assert.equal(all.status, 0, all.stderr);
+  assert.deepEqual(all.stdout.trimEnd().split('\n'), [line(1, 'first'), line(2, 'second'), line(3, 'third')]);
+  assert.ok(all.stderr.includes('群 ' + GROUP_ID + ' · 3 条 · lastSeq=3'), all.stderr);
+
+  const paged = await runAsync(['group', 'history', '--since', '2', '--state-dir', dir]);
+  assert.equal(paged.status, 0, paged.stderr);
+  assert.deepEqual(paged.stdout.trimEnd().split('\n'), [line(3, 'third')], '--since 2 只该给 #3');
+  assert.ok(paged.stderr.includes('· 1 条 · lastSeq=3'), paged.stderr);
+
+  const capped = await runAsync(['group', 'history', '--limit', '2', '--state-dir', dir]);
+  assert.deepEqual(capped.stdout.trimEnd().split('\n'), [line(2, 'second'), line(3, 'third')], '--limit 保留最新的一批');
+
+  // 三次都是本机管理接口，且 sinceSeq 就是 CLI 那三个游标（顺序一起钉死）
+  assert.deepEqual(admin.calls.map((call) => call.path), [
+    '/api/lan-peers/group?sinceSeq=0',
+    '/api/lan-peers/group?sinceSeq=2',
+    '/api/lan-peers/group?sinceSeq=0',
+  ]);
+  assert.equal(peer.calls.length, 0, 'history 一次都不许打给成员');
+});
+
+test('R3 hub 本地 tail 跟随而不是快照：按 200ms 节拍推进 sinceSeq，逐批打印，零 peer 调用', async (t) => {
+  // 桩在每次轮询时追加一条新消息：跟随式实现每轮拿到一条新的，快照式实现只能拿第一轮那批。
+  const admin = await startGroupAdmin(t, { grow: true });
+  const peer = await startRecorder(t, {});
+  const dir = hubNodeDir(t, { admin, peer });
+
+  const out = await runAsync(['group', 'tail', '--duration', '1', '--since', '1', '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(out.stderr.includes('订阅群事件 sinceSeq=1 (1s)'), out.stderr);
+
+  // T1-a：多轮请求，且 sinceSeq 真的在前进（钉死在一个游标上就是快照）
+  const cursors = admin.calls.map((call) => Number(new URL(call.path, 'http://stub.invalid').searchParams.get('sinceSeq')));
+  assert.ok(cursors.length >= 2, 'T1：跟随必须多轮请求，实测 ' + cursors.length + ' 轮');
+  assert.ok(new Set(cursors).size >= 2, 'T1：≥2 个不同的 sinceSeq，实测 ' + JSON.stringify(cursors));
+  assert.equal(cursors[0], 1, 'T1：首轮用的是 --since');
+  for (let i = 1; i < cursors.length; i += 1) {
+    assert.ok(cursors[i] >= cursors[i - 1], 'T1：游标只许单调前进：' + JSON.stringify(cursors));
+  }
+
+  // T1-b：后到的消息也被打印出来（不止首轮那个窗口）
+  const seqs = out.stdout.split('\n').filter((line) => line.startsWith('#')).map((line) => Number(line.slice(1).split(' ')[0]));
+  assert.ok(seqs.length >= 2, 'T1：至少两批/两条新消息被打印，实测 ' + JSON.stringify(seqs));
+  assert.equal(new Set(seqs).size, seqs.length, 'T1：同一条消息不许打印两次：' + JSON.stringify(seqs));
+  assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), 'T1：seq 递增，不许回放旧的');
+  assert.ok(seqs[seqs.length - 1] > 3, 'T1：末尾必须是首轮窗口（--since 1 → #2/#3）之后才长出来的新消息：' + JSON.stringify(seqs));
+  // 消息格式与成员路径同一个渲染口（formatGroupMessage），一行一条
+  const line = (seq, text) => '#' + seq + ' ' + new Date(HUB_TS + seq * 1000).toISOString() + ' ' + HUB.name + ' [chat] ' + text;
+  const lastSeq = seqs[seqs.length - 1];
+  assert.equal(out.stdout.trimEnd().split('\n')[0], line(2, 'second'), 'T1：首条是第一轮的 #2（格式逐字一致）');
+  assert.ok(out.stdout.includes(line(lastSeq, 'live-' + lastSeq)), 'T1：末尾那条也是同一个格式打印的');
+  // lastSeq 只随真收到的消息前进，与成员路径的 out.lastSeq 同源
+  assert.ok(out.stderr.includes('订阅结束 lastSeq=' + seqs[seqs.length - 1]), out.stderr);
+  assert.equal(peer.calls.length, 0, 'tail 也不许给成员发请求');
+});
+
+test('R3b hub 本地 tail 到点即停：轮询次数有界、进程自己退出、不留循环/计时器', async (t) => {
+  const admin = await startGroupAdmin(t, { grow: true });
+  const peer = await startRecorder(t, {});
+  const dir = hubNodeDir(t, { admin, peer });
+
+  const startedAt = Date.now();
+  const out = await runAsync(['group', 'tail', '--duration', '1', '--state-dir', dir]);
+  const elapsed = Date.now() - startedAt;
+  assert.equal(out.status, 0, out.stderr);
+
+  // T2：1s / 200ms 节拍 ≈ 5 轮，给 +2 抖动余量；退不出去的循环会一路涨上来
+  assert.ok(admin.calls.length >= 2, 'T2：必须先真的轮询，实测 ' + admin.calls.length + ' 次');
+  assert.ok(admin.calls.length <= 8, 'T2：轮询次数必须有界（--duration 1），实测 ' + admin.calls.length + ' 次');
+  // duration 既是下界也是上界：提前收 = 没跟随；拖过 3s = 计时器/循环没退干净
+  assert.ok(elapsed >= 950, 'T2：--duration 1 不许提前结束，实测 ' + elapsed + 'ms');
+  assert.ok(elapsed < 3000, 'T2：进程必须自己走到点并退出，实测 ' + elapsed + 'ms');
+  // 两行 stderr 各只一次：退出路径唯一，没有第二次订阅/第二条结束行
+  assert.equal(out.stderr.split('\n').filter((l) => l.includes('订阅结束')).length, 1, out.stderr);
+  assert.equal(out.stderr.split('\n').filter((l) => l.includes('订阅群事件')).length, 1, out.stderr);
+  assert.ok(/订阅结束 lastSeq=\d+/.test(out.stderr), out.stderr);
+});
+
+test('R4 hub 本地 probe：零出站请求，报的就是本机（leader 即自己）', async (t) => {
+  const admin = await startGroupAdmin(t);
+  const peer = await startRecorder(t, {});
+  const dir = hubNodeDir(t, { admin, peer });
+
+  const out = await runAsync(['group', 'probe', '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.deepEqual(out.stdout.trimEnd().split('\n'), [
+    '探测: ' + HUB.name + ' peerId=' + HUB.peerId + ' epoch=1 lastSeq=3',
+    '  地址: http://10.0.0.1:7788',
+    '  groupId=' + GROUP_ID + ' leader=' + HUB.peerId,
+  ]);
+  assert.equal(peer.calls.length, 0, 'hub 的 probe 一个字节都不许出站（真机上是打给成员的）');
+  assert.equal(admin.calls.length, 1);
+  assert.equal(admin.calls[0].path, '/api/lan-peers/group');
+});
+
+test('R5 hub 本地 join：说清「本机是群 hub」并 exit 0，绝不把 join 发出去', async (t) => {
+  const admin = await startGroupAdmin(t);
+  const peer = await startRecorder(t, {});
+  const dir = hubNodeDir(t, { admin, peer });
+
+  const out = await runAsync(['group', 'join', '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.ok(out.stdout.includes('本机是群 hub，无需加入'), out.stdout);
+  assert.equal(peer.calls.length, 0, 'hub 绝不把自己的 join 发给成员');
+  assert.equal(admin.calls.length, 0, 'join 连本机 admin 都不用打');
+});
+
+test('R6 成员节点：五个读动词照旧走 leader/群密钥路径，本机 admin 一个字都不收', async (t) => {
+  const admin = await startGroupAdmin(t);
+  const peer = await startRecorder(t, {});
+  const dir = nodeDir(t, {
+    instanceId: MEMBER.peerId,
+    role: { role: 'follower', leaderPeerId: HUB.peerId },
+    admin,
+    peers: [{ ...HUB, baseUrl: peer.baseUrl }],
+  });
+  writeJson0600(path.join(dir, 'group-key.json'), {
+    groupId: 'g-1',
+    epoch: 4,
+    leaderPeerId: HUB.peerId,
+    key: 'k'.repeat(43),
+    name: MEMBER.name,
+    hub: { peerId: HUB.peerId, baseUrl: peer.baseUrl },
+    members: { [HUB.peerId]: { name: HUB.name, baseUrl: peer.baseUrl }, [MEMBER.peerId]: { name: MEMBER.name } },
+  });
+
+  const verbs = [['state'], ['history'], ['tail', '--duration', '1'], ['probe'], ['join']];
+  for (const verb of verbs) {
+    const before = peer.calls.length;
+    await runAsync(['group', ...verb, '--state-dir', dir]);
+    assert.equal(peer.calls.length, before + 1, 'group ' + verb[0] + '：成员节点照旧打 leader 一次');
+    assert.equal(admin.calls.length, 0, 'group ' + verb[0] + '：成员节点的本机 admin 一个字都不该收');
+  }
+  // 五条全部指向 leader stub 的 /v1/group/*，没有一条走本地：本地分支只对 leader 开
+  assert.deepEqual(peer.calls.map((call) => String(call.path).split('?')[0]), [
+    '/v1/group/state',
+    '/v1/group/history',
+    '/v1/group/events',
+    '/v1/group/probe',
+    '/v1/group/join',
+  ]);
+});
+
 
 

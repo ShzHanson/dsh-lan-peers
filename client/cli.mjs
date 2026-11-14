@@ -594,7 +594,8 @@ function isLocalGroupLeader(dir) {
 /**
  * 发言通道：本机是 leader 时走回环管理接口（mode='local'），其余与读路径同一套优先级。
  * `--peer` 永远优先：用户显式点名时保持旧的中继语义不变。
- * 读路径（state/history/tail）没有对应的管理路由，所以 local 只在写路径生效。
+ * 读路径（state/history/tail/probe）也走回环 GET group，见 wantsLocalGroupRead ——
+ * 两条路径共用 isLocalGroupLeader 这一个 leader 判据，写走 POST group/post，读走 GET group。
  */
 function resolvePostChannel(dir, args = {}) {
   const explicit = String(args.peer ?? '').trim();
@@ -623,29 +624,178 @@ async function postGroupLocal(dir, args, { kind, text }) {
   return { seq: out?.seq ?? null, ts: out?.ts ?? null, ok: out?.ok === true };
 }
 
+/**
+ * 读通道的本机分支（0.12.3）：本机是 leader 时，state/history/tail/probe 读**本机**的权威视图。
+ *
+ * 判据与写路径同一个 isLocalGroupLeader；`--peer` 显式点名永远走老路径（用户要看的是那台机器）。
+ * 为什么不能沿用 resolveGroupChannel：hub 不需要加入自己的群，所以它没有 group-key.json，
+ * 那条解析会把读请求落到「唯一的伙伴」——一个成员——于是 hub 的 state/history 回答的是
+ * 那台成员的副本，而不是 hub 自己的视图。
+ */
+function wantsLocalGroupRead(dir, args = {}) {
+  return String(args.peer ?? '').trim() === '' && isLocalGroupLeader(dir);
+}
+
+/**
+ * 本机 leader 的群状态：打回环管理接口 GET group —— 面板 2s 节拍用的就是这一条，
+ * 所以 CLI 与面板看到的是同一份数据，不需要新的管理路由。
+ * sinceSeq 省略 = 只要群状态（state/probe）；给了 = 那个游标之后的窗口（history/tail）。
+ */
+async function fetchGroupLocal(dir, args, { sinceSeq } = {}) {
+  const query = sinceSeq === undefined ? '' : '?sinceSeq=' + Math.max(0, Math.floor(Number(sinceSeq) || 0));
+  const out = await adminCall(args.url, 'group' + query, undefined, dir);
+  if (!out || out.group === null || typeof out.group !== 'object') {
+    // 未启用/读失败时管理接口给的是 group:null：如实报错，绝不假装一个空群。
+    throw new Error(L('cli.group.localNoGroup', {
+      reason: String(out?.error ?? (out && out.enabled === false ? 'group-disabled' : 'no-group')),
+    }));
+  }
+  return {
+    groupId: String(out.group.groupId ?? ''),
+    name: String(out.group.name ?? ''),
+    members: Array.isArray(out.group.members) ? out.group.members : [],
+    messages: Array.isArray(out.messages) ? out.messages : [],
+    lastSeq: Number(out.lastSeq) || 0,
+    leaderPeerId: String(out.leader?.peerId ?? ''),
+    advertiseBaseUrl: String(out.advertiseBaseUrl ?? ''),
+  };
+}
+
+/**
+ * 成员路径的 state 渲染口（0.12.3 抽出来）：两条通道走同一个函数，
+ * 「hub 本地」与「hub 经中继」的输出就不可能漂开。keyBytes 永远是密钥长度，不是密钥。
+ */
+function printGroupStatePeerLike({ name, groupId, epoch, keyVersion, members, keyBytes }) {
+  console.log(L('cli.group.stateHeaderPeer', {
+    name,
+    groupId,
+    epoch,
+    keyVersion,
+    members: members.length,
+  }));
+  for (const member of members) {
+    console.log(
+      '  ' + (member.name || L('cli.common.unnamed')) + '\t' + member.peerId
+        + '\t' + (member.online ? 'online' : 'offline')
+        + '\tjoinedAt=' + (member.joinedAt ?? '?'),
+    );
+  }
+  console.log(L('cli.group.groupKeyLine', { value: keyBytes === 32 ? L('cli.group.groupKeyReceived') : L('cli.group.groupKeyNotSent') }));
+}
+
+/**
+ * 本机 leader 的 state：成员表/群名/群 id/序号来自 GET group（权威），
+ * epoch 与 keyVersion 取本机 group.json 的 keyVersion —— 与 hub 的 GET /v1/group/state 同源
+ * （GroupStore.state() 里 epoch = keyVersion）。
+ */
+async function groupStateLocal(dir, args) {
+  const state = await fetchGroupLocal(dir, args);
+  const localKey = readLocalGroupKey(dir);
+  const keyVersion = Number(localKey?.epoch) || 0;
+  printGroupStatePeerLike({
+    name: state.name,
+    groupId: state.groupId,
+    epoch: keyVersion,
+    keyVersion,
+    members: state.members,
+    keyBytes: localKey?.key ? Buffer.from(String(localKey.key), 'base64url').length : 0,
+  });
+}
+
+/**
+ * 本机 leader 的 history：同一个 sinceSeq 游标语义（这一页取游标之后的消息），
+ * 超过 limit 时与 GroupStore.messages 一样保留**最新**的那一批。
+ */
+async function groupHistoryLocal(dir, args) {
+  const limit = Math.min(Math.max(1, Math.floor(Number(args.limit ?? 200) || 200)), 200);
+  const since = groupSince(args);
+  const page = await fetchGroupLocal(dir, args, { sinceSeq: since });
+  const messages = page.messages.length > limit
+    ? page.messages.slice(page.messages.length - limit)
+    : page.messages;
+  for (const message of messages) console.log(formatGroupMessage(message));
+  process.stderr.write(L('cli.group.historyPeer', {
+    groupId: page.groupId,
+    count: messages.length,
+    lastSeq: page.lastSeq,
+  }) + '\n');
+}
+
+/**
+ * 本机 leader 的 tail：hub 自己就是日志的写者，订阅自己的 SSE 没有意义 —— 但**照样要跟随**。
+ * 成员路径看到的帧，源头就是 host/server.mjs 的事件流：每 200ms 轮询群存储、把 sinceSeq 之后
+ * 的消息推出去（GROUP_POLL_INTERVAL_MS=200，server.mjs:521；补发 + 轮询 + 推进游标同一处
+ * server.mjs:5519-5530）。所以本机这一侧按**同一个节拍**打回环 GET group?sinceSeq=<游标>，
+ * 拿到的就是那条流每一拍会推的那一批。
+ *
+ * 终止条件与成员路径逐条对齐（cmdGroupTail 的 controller/timer，cli.mjs:889-906）：
+ * --duration 到点即停，到点这一轮打印完就收；去重口径同 readGroupEvents
+ * （group-client.mjs:443：只收 seq 递增的），所以 lastSeq 只随真收到的消息前进，
+ * 「订阅结束」那行的取值与成员路径同源（没有消息时就是 --since 本身）。
+ * 轮询之间不残留计时器：唯一的等待压在 deadline 上，等到点即退出循环。
+ */
+const GROUP_TAIL_POLL_MS = 200;
+
+async function groupTailLocal(dir, args) {
+  const since = groupSince(args);
+  const durationMs = Math.max(1000, Number(args.duration ?? 60) * 1000);
+  process.stderr.write(L('cli.group.tailSubscribed', { since, seconds: Math.round(durationMs / 1000) }) + '\n');
+  const deadline = Date.now() + durationMs;
+  let lastSeq = since;
+  for (;;) {
+    const page = await fetchGroupLocal(dir, args, { sinceSeq: lastSeq });
+    for (const message of page.messages) {
+      const seq = Number(message?.seq) || 0;
+      if (seq <= lastSeq) continue;
+      lastSeq = seq;
+      console.log(formatGroupMessage(message));
+    }
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(GROUP_TAIL_POLL_MS, left));
+  }
+  process.stderr.write(L('cli.group.tailEnded', { lastSeq }) + '\n');
+}
+
+/**
+ * 本机 leader 的 probe：本机就是 leader，可达性是定义本身，
+ * 所以一个字节的出站请求都不发 —— 探的是自己，不是「唯一的伙伴」。
+ * 三条输出与成员路径同一个 key，只有取值是本机的（leader=<本机 peerId>）。
+ */
+async function groupProbeLocal(dir, args) {
+  const state = await fetchGroupLocal(dir, args);
+  const self = identity(dir);
+  const member = state.members.find((row) => String(row?.peerId ?? '') === String(self.instanceId ?? '')) ?? null;
+  const localKey = readLocalGroupKey(dir);
+  console.log(L('cli.group.probeLine', {
+    name: member?.name || self.name || '?',
+    peerId: self.instanceId || '?',
+    epoch: Number(localKey?.epoch) || 0,
+    lastSeq: state.lastSeq,
+  }));
+  console.log(L('cli.group.probeAddress', { url: state.advertiseBaseUrl || L('cli.group.probeNoPrivate') }));
+  console.log(L('cli.group.probeGroup', {
+    groupId: state.groupId || '-',
+    leader: state.leaderPeerId || '-',
+  }));
+}
+
 const groupSince = (args) => Math.max(0, Math.floor(Number(args.since ?? 0) || 0));
 
 async function cmdGroupState(dir, args) {
+  if (wantsLocalGroupRead(dir, args)) return groupStateLocal(dir, args);
   const { mode, peer, key } = resolveGroupConnection(dir, args);
   if (mode === 'peer') {
     const state = await fetchGroupState(peer);
-    console.log(L('cli.group.stateHeaderPeer', {
+    printGroupStatePeerLike({
       name: state.name,
       groupId: state.groupId,
       epoch: state.epoch,
       keyVersion: state.keyVersion,
-      members: state.members.length,
-    }));
-    for (const member of state.members) {
-      console.log(
-        '  ' + (member.name || L('cli.common.unnamed')) + '\t' + member.peerId
-          + '\t' + (member.online ? 'online' : 'offline')
-          + '\tjoinedAt=' + (member.joinedAt ?? '?'),
-      );
-    }
-    // 密钥本身永远不打印：只说「拿到了」
-    const keyBytes = state.groupKey ? Buffer.from(String(state.groupKey), 'base64url').length : 0;
-    console.log(L('cli.group.groupKeyLine', { value: keyBytes === 32 ? L('cli.group.groupKeyReceived') : L('cli.group.groupKeyNotSent') }));
+      members: state.members,
+      // 密钥本身永远不打印：只说「拿到了」
+      keyBytes: state.groupKey ? Buffer.from(String(state.groupKey), 'base64url').length : 0,
+    });
     return;
   }
   // 只有群密钥（或 leader 没有配对记录）：probe 给世代/leader/lastSeq，pull 给成员表
@@ -723,6 +873,7 @@ async function cmdGroupPost(dir, args) {
 }
 
 async function cmdGroupHistory(dir, args) {
+  if (wantsLocalGroupRead(dir, args)) return groupHistoryLocal(dir, args);
   const { mode, peer, key } = resolveGroupConnection(dir, args);
   const limit = Math.min(Math.max(1, Math.floor(Number(args.limit ?? 200) || 200)), 200);
   const since = groupSince(args);
@@ -756,6 +907,7 @@ async function cmdGroupHistory(dir, args) {
 }
 
 async function cmdGroupTail(dir, args) {
+  if (wantsLocalGroupRead(dir, args)) return groupTailLocal(dir, args);
   const target = groupTarget(dir, args);
   const since = groupSince(args);
   const durationMs = Math.max(1000, Number(args.duration ?? 60) * 1000);
@@ -783,6 +935,11 @@ async function cmdGroupJoin(dir, args) {
   // --name 只改本机在群里的显示名（hub 侧只允许写自己那一条）
   const name = typeof args.name === 'string' ? args.name.trim() : '';
   if (args.name != null && name === '') throw new Error(L('cli.group.joinNameEmpty') + '\n' + L('cli.help.group'));
+  // hub 加入自己的群没有语义：不伪造一次 peer 往返，直接说清并正常退出（exit 0）。
+  if (wantsLocalGroupRead(dir, args)) {
+    console.log(L('cli.group.joinIsHub'));
+    return;
+  }
   try {
     const joined = await joinGroup({ ...target, name });
     console.log(L('cli.group.joined', {
@@ -806,6 +963,7 @@ async function cmdGroupJoin(dir, args) {
  * 两条通道都由 host/server.mjs 的同一个端点处理，输出一致。
  */
 async function cmdGroupProbe(dir, args) {
+  if (wantsLocalGroupRead(dir, args)) return groupProbeLocal(dir, args);
   const { peer } = resolveHubPeer(dir, args.peer);
   const baseUrl = String(peer.baseUrl ?? '').replace(/\/+$/, '');
   if (baseUrl === '') throw new Error(L('cli.group.probeNoAddress'));
