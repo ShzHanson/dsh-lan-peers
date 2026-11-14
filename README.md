@@ -14,7 +14,7 @@
 
 | 面 | 内容 |
 |---|---|
-| 模型工具 | `lan_peers`（列出伙伴 + 在线探测）、`lan_peer_ask`（给伙伴派单并取回结果） |
+| 模型工具 | `lan_peers`（列出伙伴 + 在线探测）、`lan_peer_ask`（给伙伴派单并取回结果）、`lan_peer_send_file`（只发报价，字节留在本机，对端按需来拉） |
 | 界面 | Web / 桌面窗口左下角的 **🔗 伙伴** 面板：改设备名、生成临时配对码、添加伙伴 |
 | 认证 | 一次性 6 位配对码（10 分钟、单次），每对伙伴两把独立密钥 |
 | 传输 | HMAC-SHA256 请求签名（±60s 时钟窗 + nonce 防重放），请求与响应体积用 **AES-256-GCM** 加密 |
@@ -31,7 +31,7 @@
 
 ```bash
 # 从 tarball（releases 产出的 dsh-lan-peers-x.y.z.tgz）
-dsh plugin --profile web add /path/to/dsh-lan-peers-0.3.0.tgz
+dsh plugin --profile web add /path/to/dsh-lan-peers-<version>.tgz
 
 # 或本地目录（开发时）
 dsh plugin --profile web add link:/path/to/dsh-lan-peers
@@ -92,7 +92,7 @@ dsh plugin --profile web add dsh-lan-peers
 # 桌面版：退出并重新打开应用
 ```
 
-重启后 `http://<本机IP>:7788/v1/health` 应返回 `{"name":"…","capability":["ask","pair"]}`。
+重启后 `http://<本机IP>:7788/v1/health` 应返回 `{"name":"…","capability":["ask","pair",…]}`（能力表随版本增长，以实际返回为准）。
 
 > 桌面版 profile 由 Electron 独占管理，`dsh plugin --profile desktop` 会被拒绝。请按 `overlays/desktop.patch.yml` 手工编辑 `~/.dsh/profiles/desktop/{package.json,cordis.patch.yml}`，然后重启应用。
 
@@ -122,17 +122,31 @@ npx dsh-lan-peers ask --peer my-nas "在 /data/project 执行 pwd" --timeout 120
 
 对端会在自己的 `workspace` 里建真实会话、由对端模型执行，然后把最终回复加密回传。
 
+## 文件收发
+
+**模型**：发送方只发一份**报价**——文件名、体积、sha256、来自谁、时间，**一个字节都不发**；接收方点「下载」时字节才被拉过来；落盘前先核对整文件 sha256，对不上就失败、盘上不留半截文件；默认要先问一句，只有把那个人标成「信任」之后私聊文件才不再问（per-peer，记在本机）。
+
+**私聊**：字节始终留在**发送方**（`<stateDir>/outbox`，配额 5 GiB，7 天没被拉过就过期，超配额时最久没被拉取的先逐出）。所以**发送方离线时这份文件就下不下来**——这是刻意的取舍：私聊文件不占 NAS 的盘。
+
+**群聊**：由 **hub** 保管一份（总量 20 GiB，超了按最久没被访问的先逐出）；一份文件可以点名 全体成员 或 单个成员，没被点名的人在群里**根本看不到这一行**；被 hub 逐出的文件，成员面板上显示「已失效」，点下载得 `409 file-gone`。
+
+**撤回**：只有**还没被下载过**的报价能撤回；本地这份拷贝要等对端确认后才释放，对端离线时撤回直接失败（`503 peer-offline`），什么都没丢，可以重试。已经下载走的撤不回来——字节已经在对方的盘上。
+
+**命令行 / 工具**：`send-file <peer> <文件>` 现在只挂出报价（agent 侧的 `lan_peer_send_file` 语义相同）；收文件用 `download <fileId>`、不要了用 `decline <fileId>`（面板里就是「下载」那个按钮）。面板里浏览器上传固定上限 512 MiB，`fileMaxBytes` 调大也不放宽；更大的文件走命令行或工具这条路。
+
 ## 版本互通
 
-同一个群里允许混版本，但 **0.10 与 0.9.x / 0.8.4 之间有两条硬断裂**。下表是「两端各自正常工作时，用户实际看到的结果」。
+同一个群里允许混版本，但 **0.10 与 0.9.x / 0.8.4 之间有两条硬断裂**；**0.12 又把文件面换了一整套路由**，见下表的 0.12 行与其后的说明。下表是「两端各自正常工作时，用户实际看到的结果」。
 
 | 组合 | 私聊 ask | 群聊 chat | 群内派单 | 群纪要 | 群表决 | 引用行 |
 |---|---|---|---|---|---|---|
+| 0.12.x ↔ 0.11.x | WORKING | WORKING | 两侧都没有这条线（0.10 起已删除） | WORKING | WORKING | WORKING |
 | 0.10.x ↔ 0.9.x | WORKING | WORKING | BROKEN：老节点发的 `progress`/`result` 被 0.10 hub 判 `400 {"error":"bad-request"}`，群里没有「开始/结果」回执 | DEGRADED：老 hub 的 pull 不带 `notes`，成员面板一直空白、不报错 | DEGRADED：同理；成员提提案/投票打到老 hub 得 `404 {"error":"not-found"}` | DEGRADED：老 hub 的 meta 白名单没有 `quote`，静默丢弃，只少「引用 …」那一行 |
 | 0.10.x ↔ 0.8.4 | WORKING | WORKING | BROKEN：同上（0.8.4 的回执同样是 `progress`/`result`） | DEGRADED：同上 | DEGRADED：同上 | DEGRADED：同上 |
 
 **变在哪、为什么断**
 
+- **文件传输整条线断了（0.12）**：0.11 的文件路由集是 `/v1/file/{offer,chunk,complete,status}`（推块 + 接收方接受），0.12 换成 `/v1/file/{offer,pull,withdraw}`（报价 + 按需拉取），**没有一条共用语义**——0.12 节点与 0.11 节点之间**两个方向都传不了文件**；聊天与答题不受影响（那两条平面 0.12 没动）。**升级口径**：两台机器要在**同一个窗口**里一起升，否则文件传输会静默不工作 —— 没有版本协商。
 - **两条硬断裂**：① 群内派单整条线在 0.10.0 删除（`lan_group_ask`、管理面 `group/dispatch-options` / `group/accept`、执行器、回执），`GROUP_KINDS` 只剩 `['chat','system']`；② 于是老对端继续投 `progress`/`result` 回执一律 `400 {"error":"bad-request"}` —— 老节点那边只留一行 `[group] dispatch receipt failed …` 日志，群里从此看不到派单进度。**历史不会丢**：已有聊天记录里的 `progress`/`result` 仍照常显示成一行系统行。
 - **一条软断裂**：`meta.quote` 是 0.10 新增字段，老 hub 的 meta 白名单没有它，**静默丢弃、不报错**（HTTP 仍是 200）。代价是引用行消失，以及「首答胜」的去重判据在跨版本时失效。
 - **身份面不是断裂**：0.8.4 只有 v1 群级鉴权（`X-Peer-Auth: group` + groupKey HMAC），0.9 起有 v2（证书 + ed25519），0.10 默认两种都收（`allowLegacyGroupAuth` 默认 true）。
@@ -141,7 +155,7 @@ npx dsh-lan-peers ask --peer my-nas "在 /data/project 执行 pwd" --timeout 120
 
 **升级口径**：hub 与所有成员**在同一个窗口内一起升到 0.10** —— 跨 0.10 线的群内派单双向都不工作，纪要与表决也要 hub 先到 0.10 才有数据。
 
-> 证据：每格都能追到代码或用例（`host/server.mjs`、`lib/group-*.mjs`、`host/test/group.test.mjs`、`lib/panel-group.test.mjs`）。`interop/run-interop.mjs` 的六行 A–F 目前只覆盖 **0.3.1 基线 ↔ 当前版本**，**不含**上面两组组合 —— 所以本表是代码路径结论，不是互通实跑结论。
+> 证据：每格都能追到代码或用例（`host/server.mjs`、`lib/group-*.mjs`、`host/test/group.test.mjs`、`lib/panel-group.test.mjs`）。`interop/run-interop.mjs` 的六行 A–F 目前只覆盖 **0.3.1 基线 ↔ 当前版本**，**不含**上面两组 0.10 组合，也不含 0.12 那组 —— 所以本表是代码路径结论，不是互通实跑结论。
 
 ## 安全模型
 
