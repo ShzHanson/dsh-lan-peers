@@ -247,7 +247,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.12.1';
+export const PLUGIN_VERSION = '0.12.2';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
