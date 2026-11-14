@@ -9852,6 +9852,74 @@ export function createPeerServer(overrides = {}) {
   }
 
   /**
+   * 契约（0.12.0-alpha S3c）withdraw：发送方收回自己那份 keeper 拷贝。
+   *
+   * 顺序是硬约束 —— **先让对端确认，再删本机这一份**：
+   *   对端 200 → 它那条待下载已经没了，本机才 drop（字节与条目一起回收）；
+   *   对端 404 → 它早就不认这条（重启过/已收回），本机照删，remote:'unknown'（不是错误）；
+   *   连不上   → 本机一个字节都不动，回 peer-offline，用户还能重试。
+   * 反过来（先删再问）就会出现「对端还挂着一条待下载、本机字节已经没了」：
+   * 用户点下载拿到 404，面板上却仍是一条可以拉的文件 —— 静静说假话。
+   */
+  async function withdrawOffer(rawFileId) {
+    const fileId = parseFileId(rawFileId);
+    if (fileId === '') {
+      if (config.logger) config.logger('[file] withdraw id=' + String(rawFileId ?? '').slice(0, 8) + ' from= state=unknown-file');
+      return { ok: false, reason: 'unknown-file' };
+    }
+    const found = fileOutbox.get(fileId);
+    if (!found.ok) {
+      if (config.logger) config.logger('[file] withdraw id=' + fileId.slice(0, 8) + ' from= state=unknown-file');
+      return { ok: false, reason: 'unknown-file' };
+    }
+    // 目标 peer 就写在 entry 上（send 那一刻定的）：不认别人给的名字/路径
+    const peerId = String(found.entry.to ?? '');
+    const peer = store.getPeer(peerId);
+    const baseUrl = peer ? baseUrlOf(peerId) : '';
+    const secret = String(peer?.secret ?? '');
+    if (!peer || baseUrl === '' || secret === '') {
+      if (config.logger) {
+        config.logger('[file] withdraw id=' + fileId.slice(0, 8) + ' from=' + shortPeer(peerId) + ' state=peer-offline');
+      }
+      return { ok: false, reason: 'peer-offline' };
+    }
+    let replied;
+    try {
+      replied = await fileCall({
+        baseUrl,
+        secret,
+        senderId: store.instanceId,
+        method: 'POST',
+        apiPath: '/v1/file/withdraw',
+        body: { fileId },
+        timeoutMs: 15_000,
+      });
+    } catch (error) {
+      // 对端没回话 = 它那边还挂着待下载：本机那份**不许**删，留着等用户重试
+      if (config.logger) {
+        config.logger('[file] withdraw id=' + fileId.slice(0, 8) + ' from=' + shortPeer(peerId) + ' state=peer-offline');
+      }
+      return { ok: false, reason: 'peer-offline', detail: String(error?.message ?? error).slice(0, 200) };
+    }
+    // 200 = 对端删掉了；404 = 对端早就不认这条 —— 两个结果一样：这条不再有人来拉
+    const remote = replied.status === 200 ? 'ok' : (replied.status === 404 ? 'unknown' : '');
+    if (remote === '') {
+      const reason = String(replied.json?.error ?? 'withdraw-failed');
+      if (config.logger) {
+        config.logger('[file] withdraw id=' + fileId.slice(0, 8) + ' from=' + shortPeer(peerId)
+          + ' state=' + reason.slice(0, 24));
+      }
+      return { ok: false, reason, status: replied.status };
+    }
+    fileOutbox.drop(fileId, 'withdrawn');
+    if (config.logger) {
+      config.logger('[file] withdraw id=' + fileId.slice(0, 8) + ' from=' + shortPeer(peerId)
+        + ' state=ok remote=' + remote);
+    }
+    return { ok: true, fileId, removed: true, remote };
+  }
+
+  /**
    * 文件门面（0.12.0-alpha S1：list/send/download/decline/setTrust/progress）。
    * 管理接口（lib/admin.mjs）只调这里；面板与 CLI 都经管理接口，不直接碰盘。
    */
@@ -9883,6 +9951,7 @@ export function createPeerServer(overrides = {}) {
     send: (input = {}) => offerFileToPeer(input),
     download: (fileId) => downloadOffer(fileId),
     decline: (fileId) => declineOffer(fileId),
+    withdraw: (fileId) => withdrawOffer(fileId),
     setTrust: (peerId, trusted) => fileTrust.set(peerId, trusted),
     isTrusted: (peerId) => fileTrust.isTrusted(peerId),
     progress: (id) => fileStore.progress(id),

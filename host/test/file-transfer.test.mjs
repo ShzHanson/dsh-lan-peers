@@ -1151,3 +1151,141 @@ test('T4 高水位：list() 三态 waiting → pulling → pulled，只增不减
   outbox.drop(put.fileId, 'test');
   assert.deepEqual(outbox.list(), []);
 });
+
+// ---------------------------------------------------------------------------
+// S3c：**撤回**（发送方收回自己那份 keeper 拷贝）
+//
+// 铁律：对端确认之后本机那份才删。顺序一旦反过来，对端还挂着一条待下载、
+// 本机字节已经没了 —— 用户点下载拿到 404，面板上却仍是一条能拉的文件。
+// 所以每条用例都同时看两处：对端那条 offer 与本机 outbox/<fileId> 目录。
+//
+// 非空化（W6）：把 withdrawOffer 里的 fileOutbox.drop 挪到 fileCall 之前 → W2 与
+// 「§W2 恢复之后真的能重试」三条断言一起变红（本机那份在对端没确认时就没了）。
+// ---------------------------------------------------------------------------
+
+/** 只拦 /v1/file/withdraw：别的请求原样放行（其余用例同一口径） */
+function watchWithdraw(handler) {
+  const original = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('/v1/file/withdraw')) return original(url, init);
+    seen.push({ url: String(url), init });
+    return handler(String(url), init);
+  };
+  return {
+    seen,
+    restore() { globalThis.fetch = original; },
+  };
+}
+
+/** 发一份真 offer（两个真节点，真实 HTTP/签名），返回 fileId 与本机 outbox 目录 */
+async function offeredFile(t, sender, receiver, bytes) {
+  const localFile = path.join(sender.stateDir, 'withdraw-demo.bin');
+  fs.writeFileSync(localFile, payloadBytes(bytes));
+  const offered = await sender.server.files.send({ peerId: receiver.server.store.instanceId, path: localFile });
+  assert.equal(offered.ok, true, JSON.stringify(offered));
+  return { offered, outboxDir: path.join(sender.stateDir, 'outbox', offered.fileId) };
+}
+
+test('§W1 撤回happy：对端确认之后本机才删 —— 对端那条待下载没了、本机 outbox 目录也没了', async (t) => {
+  const sender = await startServer(t);
+  const receiver = await startServer(t);
+  linkAll([sender, receiver]);
+  const admin = createAdmin({ server: sender.server });
+  const { offered, outboxDir } = await offeredFile(t, sender, receiver, 2048 + 3);
+
+  assert.equal(offersOf(receiver.server.files).length, 1, '先有一条待下载');
+  assert.equal(fs.statSync(path.join(outboxDir, 'data')).size, 2051, '本机 keeper 拷贝真的在');
+
+  const out = await adminHit(admin, 'POST', '/api/lan-peers/files/withdraw', { fileId: offered.fileId });
+  assert.equal(out.status, 200, JSON.stringify(out.json));
+  assert.deepEqual(out.json, { ok: true, fileId: offered.fileId, removed: true, remote: 'ok' });
+
+  assert.deepEqual(offersOf(receiver.server.files), [], '对端那条待下载真的消失了（同一个 /v1/file/withdraw）');
+  assert.equal(fs.existsSync(outboxDir), false, '对端确认之后本机那份被回收');
+  const after = await adminHit(admin, 'GET', '/api/lan-peers/files');
+  assert.deepEqual(after.json.outbox, [], 'GET files 的 outbox 桶不再列这一行');
+
+  // 再撤一次：本机已经没有这条了
+  const again = await sender.server.files.withdraw(offered.fileId);
+  assert.equal(again.ok, false);
+  assert.equal(again.reason, 'unknown-file');
+});
+
+test('§W2 撤回对端离线：503 peer-offline，本机那份与对端那条都原样留着（能重试）', async (t) => {
+  const sender = await startServer(t);
+  const receiver = await startServer(t);
+  linkAll([sender, receiver]);
+  const admin = createAdmin({ server: sender.server });
+  const { offered, outboxDir } = await offeredFile(t, sender, receiver, 1024);
+
+  const watcher = watchWithdraw(async () => { throw new TypeError('fetch failed: simulated offline peer'); });
+  let out;
+  try {
+    out = await adminHit(admin, 'POST', '/api/lan-peers/files/withdraw', { fileId: offered.fileId });
+  } finally {
+    watcher.restore();
+  }
+  assert.equal(watcher.seen.length, 1, '真的打过 /v1/file/withdraw（不是本地空转）');
+  assert.equal(out.status, 503);
+  assert.deepEqual(out.json, { error: 'peer-offline' });
+
+  assert.equal(fs.existsSync(path.join(outboxDir, 'data')), true, '本机那份**必须还在**（否则就静静说假话）');
+  const list = await adminHit(admin, 'GET', '/api/lan-peers/files');
+  assert.equal(list.json.outbox.length, 1, '行还在列表里：用户能再点一次');
+  assert.equal(offersOf(receiver.server.files).length, 1, '对端那条也还在（它根本没收到撤回）');
+
+  // 恢复之后真的能重试成功 —— 「可重试」不是一句空话
+  const retry = await sender.server.files.withdraw(offered.fileId);
+  assert.deepEqual(retry, { ok: true, fileId: offered.fileId, removed: true, remote: 'ok' });
+  assert.equal(fs.existsSync(outboxDir), false);
+  assert.deepEqual(offersOf(receiver.server.files), []);
+});
+
+test('§W3 撤回时对端 404（它早就不认这条）：本机照删，remote:unknown，不抛', async (t) => {
+  const sender = await startServer(t);
+  const receiver = await startServer(t);
+  linkAll([sender, receiver]);
+  const { offered, outboxDir } = await offeredFile(t, sender, receiver, 64);
+
+  const watcher = watchWithdraw(async () => new Response(
+    JSON.stringify({ error: 'not-found' }),
+    { status: 404, headers: { 'content-type': 'application/json' } },
+  ));
+  let out;
+  try {
+    out = await sender.server.files.withdraw(offered.fileId);
+  } finally {
+    watcher.restore();
+  }
+  assert.equal(watcher.seen.length, 1);
+  assert.deepEqual(out, { ok: true, fileId: offered.fileId, removed: true, remote: 'unknown' });
+  assert.equal(fs.existsSync(outboxDir), false, '对端已经不认这条：本机那份也不该永远占着配额');
+});
+
+test('§W4 未知 fileId：404 unknown-file，一个出站请求都不发', async (t) => {
+  const sender = await startServer(t);
+  const receiver = await startServer(t);
+  linkAll([sender, receiver]);
+  const admin = createAdmin({ server: sender.server });
+  await offeredFile(t, sender, receiver, 16);   // 有一个真的 outbox 条目，只是不用它的 id
+
+  const watcher = watchWithdraw(async () => new Response('{}', { status: 200 }));
+  let out;
+  try {
+    out = await adminHit(admin, 'POST', '/api/lan-peers/files/withdraw', {
+      fileId: '00000000-0000-4000-8000-000000000000',
+    });
+  } finally {
+    watcher.restore();
+  }
+  assert.equal(out.status, 404);
+  assert.deepEqual(out.json, { error: 'unknown-file' });
+  assert.deepEqual(watcher.seen, [], '不认识的 id 不许打对端（连试都不试）');
+
+  // 门禁之外的形状：缺 fileId 是 400，且同样一个请求都不发
+  const missing = await adminHit(admin, 'POST', '/api/lan-peers/files/withdraw', {});
+  assert.equal(missing.status, 400);
+  assert.deepEqual(missing.json, { error: 'fileId-required' });
+});
+
