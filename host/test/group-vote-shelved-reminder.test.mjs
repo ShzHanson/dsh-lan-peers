@@ -198,6 +198,29 @@ test('4b-3 T5：重启后 resume 重新挂上提醒（不立刻补发）', async
   assert.equal(systemMessages(stateDir).length, 1, '重启不补发（补发会让反复重启变成刷屏）');
 });
 
+/**
+ * T5b：**同一个实例**的 close() → 再 listen() 也必须重新挂上提醒。
+ *
+ * 这不是假想路径：test-support/ports.mjs 撞到 fetch 黑名单端口时会 stopListening() +
+ * 重新 listen() 同一个 server（ports.mjs:145），而本机的动态端口范围从 1024 起
+ * （netsh int ipv4 show dynamicport tcp → 启动端口 1024 / 端口数 13977），黑名单里的
+ * 6000 / 4190 / 6665-6697 / 10080 全在范围内（实测 1500 次随机端口有 0.133% 命中）。
+ * 一旦命中，关停闸不复位就会把 resume 静默跳过 —— 那正是 T5 间歇红（数据在、提醒没了）的形状。
+ */
+test('4b-3 T5b：close() 之后再次 listen（端口重试路径）仍重新挂上提醒，且不补发', async (t) => {
+  const hub = await startHub(t, { logger: () => {} });
+  const id = shelveOnce(hub.group);
+  assert.equal(hub.group.shelvedReminders(), 1);
+
+  await hub.server.close();
+  assert.equal(hub.group.shelvedReminders(), 0, 'close() 之后是 0（关停闸生效）');
+  await listenOnRandomPort(hub.server);
+
+  assert.deepEqual(hub.group.shelved().map((entry) => entry.proposalId), [id], '重新 listen 之后 shelved 仍在');
+  assert.equal(hub.group.shelvedReminders(), 1, '再次 listen 的 resume 必须把提醒重新挂上');
+  assert.equal(systemMessages(hub.stateDir).length, 1, '重新 listen 不补发（与重启同一口径）');
+});
+
 test('4b-3 T6：没有新的 console.error；日志只有 ≤8 的 id 与轮数，没有正文', async (t) => {
   const lines = [];
   const errors = [];

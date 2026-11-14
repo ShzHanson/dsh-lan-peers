@@ -3037,9 +3037,13 @@ export function createPeerServer(overrides = {}) {
   // 两者都是 AbortSignal，与调用方自带的 signal 合并，正常路径（对端可达）零影响。
   // ---------------------------------------------------------------------------
 
-  /** 本实例在飞推送的总闸（close() 时 abort） */
-  const pushGate = new AbortController();
-  /** close() 起手即置 true：此后不再起复制定时器、不再发起新的出站推送 */
+  /**
+   * 本实例在飞推送的总闸（close() 时 abort）。
+   * 必须是 let：close() 之后又 listen()（换端口的重试路径）要把闸换成新的一个，
+   * 否则复活的实例再也发不出一次推送。
+   */
+  let pushGate = new AbortController();
+  /** close() 起手即置 true：此后不再起复制定时器、不再发起新的出站推送（listen() 复位） */
   let closing = false;
 
   /** 推送失败的一行原因（只有原因码，没有正文、没有地址） */
@@ -11228,6 +11232,13 @@ export function createPeerServer(overrides = {}) {
       return store.issuePairingCode();
     },
     async listen(port = config.listenPort, host = config.listenHost) {
+      // 0.12.1 修复：listen() 可能发生在 close() **之后** —— test-support/ports.mjs 撞到
+      // fetch 黑名单端口时会 stopListening() + 重新 listen() 同一个实例（ports.mjs:145）。
+      // 关停闸（closing / pushGate）是一次性闩：不复位它，下面的 resumeVoteTicks() 会被
+      // 静默跳过，shelved 的提醒与 open 轮的定时器都不会重新挂上 —— 数据在盘上、提醒没了
+      // （T5 间歇红的就是这一条）。重新 listen 就是重新开门，两个闸在这里一起复位。
+      closing = false;
+      if (pushGate.signal.aborted) pushGate = new AbortController();
       await new Promise((resolve, reject) => {
         const onError = (err) => {
           httpServer.removeListener('listening', onListening);
