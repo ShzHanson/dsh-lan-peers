@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { listenOnRandomPort } from '../test-support/ports.mjs';
 import { execFile, execFileSync } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -336,4 +337,180 @@ test('group --help 列出 probe 与 replica', () => {
   assert.match(out, /replica +打印本地群副本/);
   assert.match(run(['--help']), /state \/ post \/ history \/ tail \/ join \/ probe \/ replica/);
 });
+
+// ---------------------------------------------------------------------------
+// v0.12.1 回归：hub 自己 `group post`（真机 NAS 上是 404 not-leader）
+//
+// 真机形状：NAS hub 没有 group-key.json（它不需要加入自己的群），于是 resolveGroupChannel
+// 落到「唯一的伙伴」兜底，把写请求中继给某个**成员**，被 404 not-leader 挡下。
+//
+// 这里用两个 node:http 桩把这个形状钉死：admin 桩记下每次调用的 method/path/body/token，
+// peer 桩记下每次中继请求 —— 「本地模式 = 零 peer 调用」这条断言才立得住（不是靠推断）。
+//
+// C6 非空性（谁挂了就说明分支真的在起作用）：
+//   · 删掉 resolvePostChannel 的 local 分支 → C1「admin.calls.length === 1」与
+//     C2「admin.calls.length === 1/2」红（请求会跑去 peer 桩，peer.calls 变成 1）。
+//   · 把 local 分支放宽到成员（例如去掉 isLocalGroupLeader、见文件即本地）→
+//     C3「admin.calls.length === 0」与 C4「--peer 时不许走本地 admin」红。
+//   · 用「没有 group-key.json」当 leader 判据 → C5「角色未知就不打本机 admin」红。
+// ---------------------------------------------------------------------------
+
+const HUB = peerFixture('peer-nas-hub', { name: 'nas-hub' });
+const HUB_TOKEN = 'cli-group-hub-token';
+
+/** 记录请求的桩：JSON 回包。peer 桩收到的是加密二进制，解析不了就留个长度标记。 */
+async function startRecorder(t, reply) {
+  const calls = [];
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      let body = null;
+      try {
+        body = raw === '' ? null : JSON.parse(raw);
+      } catch {
+        body = '[binary ' + raw.length + ']';
+      }
+      calls.push({ method: req.method, path: req.url, token: req.headers['x-lan-peers-token'] ?? '', body });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(typeof reply === 'function' ? reply(calls.length) : reply));
+    });
+  });
+  const info = await listenOnRandomPort(server);
+  t.after(() => new Promise((resolve) => { server.close(() => resolve()); }));
+  return { calls, baseUrl: info.url };
+}
+
+/**
+ * 一个节点的 state-dir。role 传：
+ *   {role:'leader',...} / {role:'follower', leaderPeerId:...} / 'corrupt'（坏 JSON）/ null（没有这个文件）
+ * admin 给了才写 admin-url + admin-token（成员节点也要给，才能证明「根本没被碰」）。
+ */
+function nodeDir(t, { instanceId = HUB.peerId, role = null, admin = null, peers = [] } = {}) {
+  const dir = makeTempStateDir('dsh-lan-peers-cli-hub-');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  writeJson0600(path.join(dir, 'state.json'), {
+    instanceId,
+    name: instanceId === HUB.peerId ? HUB.name : 'member-node',
+    createdAt: new Date().toISOString(),
+  });
+  if (role === 'corrupt') {
+    fs.writeFileSync(path.join(dir, 'group-role.json'), '{ 这不是 JSON', { mode: 0o600 });
+  } else if (role) {
+    writeJson0600(path.join(dir, 'group-role.json'), {
+      epoch: 4, leaseUntil: Date.now() + 9000, commitSeq: 3, groupId: 'g-1', ...role,
+    });
+  }
+  if (admin) {
+    fs.writeFileSync(path.join(dir, 'admin-url'), admin.baseUrl + '\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, 'admin-token'), HUB_TOKEN + '\n', { mode: 0o600 });
+  }
+  if (peers.length > 0) seedPeers(dir, peers);
+  return dir;
+}
+
+const HUB_TS = 1_760_000_000_000;
+
+test('C1 hub 本地模式：group-role 说本机是 leader → 打本机 admin/group/post，零 peer 调用', async (t) => {
+  const admin = await startRecorder(t, { ok: true, seq: 7, ts: HUB_TS });
+  const peer = await startRecorder(t, { ok: true, seq: 1, ts: Date.now() });
+  const dir = nodeDir(t, {
+    role: { role: 'leader', leaderPeerId: HUB.peerId },
+    admin,
+    peers: [{ ...MEMBER, baseUrl: peer.baseUrl }],
+  });
+
+  const out = await runAsync(['group', 'post', 'hi', '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /^已发送 seq=7 ts=\d{4}-\d{2}-\d{2}T/m);
+
+  assert.equal(admin.calls.length, 1, '整条命令只该有一次本机 admin 调用');
+  assert.equal(admin.calls[0].method, 'POST');
+  assert.equal(admin.calls[0].path, '/api/lan-peers/group/post');
+  assert.deepEqual(admin.calls[0].body, { kind: 'chat', text: 'hi' }, 'method+path+body 三条一起钉死');
+  assert.equal(admin.calls[0].token, HUB_TOKEN, 'token 仍走 <stateDir>/admin-token');
+  assert.equal(peer.calls.length, 0, '本地模式绝不给任何伙伴发写请求（真机 404 not-leader 的根因）');
+});
+
+test('C2 leaderPeerId === 本机 instanceId 也算 leader（role 缺失或不一致都一样）', async (t) => {
+  const admin = await startRecorder(t, { ok: true, seq: 8, ts: HUB_TS });
+  const peer = await startRecorder(t, { ok: true, seq: 1, ts: Date.now() });
+  const peers = [{ ...MEMBER, baseUrl: peer.baseUrl }];
+
+  // role 字段在、但写成 follower：leaderPeerId 才是权威
+  const followerShaped = nodeDir(t, {
+    role: { role: 'follower', leaderPeerId: HUB.peerId }, admin, peers,
+  });
+  const first = await runAsync(['group', 'post', 'hi', '--state-dir', followerShaped]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(admin.calls.length, 1, 'role=follower 但 leaderPeerId 指向自己 → 仍然本地');
+
+  // role 字段整个缺席
+  const roleAbsent = nodeDir(t, { role: { leaderPeerId: HUB.peerId }, admin, peers });
+  const second = await runAsync(['group', 'post', 'hi', '--state-dir', roleAbsent]);
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(admin.calls.length, 2, '没有 role 字段时按 leaderPeerId 判');
+  assert.equal(peer.calls.length, 0, '两种情况都零中继');
+});
+
+test('C3 成员节点：照旧中继给 leader，绝不碰本机 admin', async (t) => {
+  const admin = await startRecorder(t, { ok: true, seq: 9, ts: HUB_TS });
+  const peer = await startRecorder(t, { ok: true, seq: 2, ts: Date.now() });
+  const dir = nodeDir(t, {
+    instanceId: MEMBER.peerId,
+    role: { role: 'follower', leaderPeerId: HUB.peerId },
+    admin,
+    peers: [{ ...HUB, baseUrl: peer.baseUrl }],
+  });
+  writeJson0600(path.join(dir, 'group-key.json'), {
+    groupId: 'g-1',
+    epoch: 4,
+    leaderPeerId: HUB.peerId,
+    key: 'k'.repeat(43),
+    name: MEMBER.name,
+    hub: { peerId: HUB.peerId, baseUrl: peer.baseUrl },
+    members: { [HUB.peerId]: { name: HUB.name, baseUrl: peer.baseUrl }, [MEMBER.peerId]: { name: MEMBER.name } },
+  });
+
+  const out = await runAsync(['group', 'post', 'hi', '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(peer.calls.length, 1, '成员必须中继给 leader');
+  assert.equal(peer.calls[0].method, 'POST');
+  assert.equal(peer.calls[0].path, '/v1/group/post');
+  assert.equal(admin.calls.length, 0, '成员节点的本机 admin 一个字都不该收（否则又是 v0.8.0 那个坑）');
+});
+
+test('C4 --peer 在 hub 上仍然强制走 per-peer 老路径', async (t) => {
+  const admin = await startRecorder(t, { ok: true, seq: 9, ts: HUB_TS });
+  const peer = await startRecorder(t, { ok: true, seq: 3, ts: Date.now() });
+  const dir = nodeDir(t, {
+    role: { role: 'leader', leaderPeerId: HUB.peerId },
+    admin,
+    peers: [{ ...HUB, baseUrl: peer.baseUrl }],
+  });
+
+  const out = await runAsync(['group', 'post', 'hi', '--peer', HUB.name, '--state-dir', dir]);
+  assert.equal(out.status, 0, out.stderr);
+  assert.equal(peer.calls.length, 1, '显式 --peer = 用户点名，老语义不变');
+  assert.equal(peer.calls[0].path, '/v1/group/post');
+  assert.equal(admin.calls.length, 0, '--peer 时不许走本地 admin');
+});
+
+test('C5 group-role.json 坏掉或不存在 → 回落今天的解析，不崩', async (t) => {
+  const admin = await startRecorder(t, { ok: true, seq: 9, ts: HUB_TS });
+  const peer = await startRecorder(t, { ok: true, seq: 4, ts: Date.now() });
+  const peers = [{ ...MEMBER, baseUrl: peer.baseUrl }];
+
+  const corrupt = nodeDir(t, { role: 'corrupt', admin, peers });
+  const first = await runAsync(['group', 'post', 'hi', '--state-dir', corrupt]);
+  assert.equal(first.status, 0, first.stderr);
+
+  const missing = nodeDir(t, { role: null, admin, peers });
+  const second = await runAsync(['group', 'post', 'hi', '--state-dir', missing]);
+  assert.equal(second.status, 0, second.stderr);
+
+  assert.equal(peer.calls.length, 2, '没有可信角色文件时仍按旧规则解析（这里是唯一伙伴）');
+  assert.equal(admin.calls.length, 0, '角色未知就绝不擅自打本机 admin');
+});
+
 

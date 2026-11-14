@@ -575,8 +575,32 @@ function resolveGroupConnection(dir, args = {}) {
   }
 }
 
-/** 发言通道：与读路径同一套优先级（写操作只有 leader 能落库） */
+/**
+ * 本机就是群 leader 吗（v0.12.1 真机：hub 自己 `group post` 撞 404 not-leader）。
+ *
+ * 权威只有 <stateDir>/group-role.json：role=leader，或 leaderPeerId 就是本机实例 id。
+ * 判据**不能**是「没有 group-key.json」：hub 不需要加入自己的群，所以它没有这个文件，
+ * 而纯 1:1 节点一样没有 —— 用「缺 group-key」当 leader 判据，正好把 hub 送进下面第 4 条兜底
+ * （唯一的伙伴 = 某个成员），于是写请求落到非 leader 身上，被 404 not-leader 挡下。
+ */
+function isLocalGroupLeader(dir) {
+  const role = readGroupRoleFile(dir);
+  if (!role) return false;
+  if (role.role === 'leader') return true;
+  const selfId = String(identity(dir).instanceId ?? '');
+  return selfId !== '' && role.leaderPeerId === selfId;
+}
+
+/**
+ * 发言通道：本机是 leader 时走回环管理接口（mode='local'），其余与读路径同一套优先级。
+ * `--peer` 永远优先：用户显式点名时保持旧的中继语义不变。
+ * 读路径（state/history/tail）没有对应的管理路由，所以 local 只在写路径生效。
+ */
 function resolvePostChannel(dir, args = {}) {
+  const explicit = String(args.peer ?? '').trim();
+  if (explicit === '' && isLocalGroupLeader(dir)) {
+    return { mode: 'local', peer: null, key: null, reason: 'local-leader' };
+  }
   try {
     return resolveGroupChannel(dir, args);
   } catch (error) {
@@ -584,6 +608,19 @@ function resolvePostChannel(dir, args = {}) {
     if (!key) throw error;
     return { mode: 'group', peer: null, key };
   }
+}
+
+/**
+ * hub 本地发言（v0.12.1）：不再中继给任何伙伴，打本机回环管理接口 group/post —— 与面板的
+ * 发送按钮同一条路，落库 + 广播 + 回执全在 host 里。地址/token 走 resolveAdminUrl/adminCall。
+ */
+async function postGroupLocal(dir, args, { kind, text }) {
+  const out = await adminCall(args.url, 'group/post', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, text }),
+  }, dir);
+  return { seq: out?.seq ?? null, ts: out?.ts ?? null, ok: out?.ok === true };
 }
 
 const groupSince = (args) => Math.max(0, Math.floor(Number(args.since ?? 0) || 0));
@@ -654,9 +691,15 @@ async function postGroupText(dir, args, text) {
   const kind = String(args.kind ?? 'chat');
   if (!GROUP_KINDS.includes(kind)) throw new Error(L('cli.group.badKind', { kinds: GROUP_KINDS.join(' / ') }));
   const channel = resolvePostChannel(dir, args);
-  const sent = channel.mode === 'peer'
-    ? await postGroup({ ...channel.peer, kind, text })
-    : await postGroupWithGroupKey({
+  let sent;
+  let via = '';
+  if (channel.mode === 'local') {
+    // hub 自己发：本机回环管理接口，零中继。
+    sent = await postGroupLocal(dir, args, { kind, text });
+  } else if (channel.mode === 'peer') {
+    sent = await postGroup({ ...channel.peer, kind, text });
+  } else {
+    sent = await postGroupWithGroupKey({
       baseUrl: channel.key.baseUrl,
       groupKey: channel.key.groupKey,
       groupId: channel.key.groupId,
@@ -664,10 +707,13 @@ async function postGroupText(dir, args, text) {
       kind,
       text,
     });
+    via = L('cli.group.sentViaGroupKey', { baseUrl: channel.key.baseUrl });
+  }
   console.log(L('cli.group.sent', {
     seq: sent.seq,
-    ts: new Date(Number(sent.ts)).toISOString(),
-    channel: channel.mode === 'group' ? L('cli.group.sentViaGroupKey', { baseUrl: channel.key.baseUrl }) : '',
+    // 本地模式的 ts 来自 host 回执；host 没给就落到当下，别打印 1970。
+    ts: new Date(Number(sent.ts) || Date.now()).toISOString(),
+    channel: via,
   }));
 }
 
