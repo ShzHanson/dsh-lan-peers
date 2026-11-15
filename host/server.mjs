@@ -66,6 +66,20 @@ import {
   normalizeWorkspaceKey,
 } from '../lib/session-reuse.mjs';
 import { readSessionReusePrefs } from '../lib/session-reuse-prefs.mjs';
+// 0.12.5-alpha（slice A）入群邀请：推送式授权。落盘形状在 lib 里（接收方一份、邀请方账本一份），
+// 走线/门禁在本文件与 lib/admin.mjs。
+import {
+  dropGroupInvite,
+  joinStateOf,
+  listInvites,
+  putGroupInvite,
+  readGroupInvite,
+  readInviteLedger,
+  recordInviteAttempt,
+} from '../lib/group-invite.mjs';
+// 推送走的就是 /v1/ask 那条 per-peer 签名通道（同一个 callPeer：签名 + 加密体 + 验响应）。
+// 它早已随 lib/group-client.mjs 一起进入本进程，这里只是直接用它，不另造一条通道。
+import { callPeer } from '../client/peer-call.mjs';
 import {
   FILE_CHUNK_HARD_MAX,
   FILE_DEFAULT_CHUNK_BYTES,
@@ -144,6 +158,7 @@ import {
   sameGroupName,
   sendGroupHeartbeat,
   signGroupCanonical,
+  applyGroupGrant,
   writeAdvertiseState,
   writeGroupKeyFile,
 } from '../lib/group-client.mjs';
@@ -313,6 +328,12 @@ export const GROUP_PEER_V1_PATHS = Object.freeze([
   '/v1/group/lookup',
   '/v1/group/apply',
   '/v1/group/apply-status',
+  // 0.12.5-alpha（slice A）：hub 推给成员的邀请。与上面四条同一把尺子 ——
+  // 只要配对过（per-peer 签名）就答，与群开关无关：收邀请的节点**正是**那种还没有群的节点。
+  '/v1/group/invite',
+  // 0.12.5-alpha（slice B）：被邀请方接受/拒绝之后回头告诉邀请方（账本 → joined/declined）。
+  // 同一个 per-peer 门（已配对 + 签名），但**只有** hub 会处理它：账本只在 hub 盘上。
+  '/v1/group/invite/ack',
 ]);
 
 /**
@@ -6021,6 +6042,123 @@ export function createPeerServer(overrides = {}) {
     return { status: 200, body: out, peerId: auth.peerId };
   }
 
+
+  /**
+   * POST /v1/group/invite —— hub → 成员：**推送式**授权（0.12.5-alpha slice A）。
+   *
+   * 与 apply/apply-status 同一个门（authenticate = 已配对 + per-peer 签名），但方向相反：
+   * 本机不需要 config.group.hub，也不需要先申请 —— 这正是「roster 里加了人、对方却永远
+   * group-disabled」那个洞的补法。
+   *
+   * 本机已经是这个群（group-key.json 的 groupId 相同）时**不落盘**：授权只对「还没入群」有意义，
+   * 重复推送不该覆盖一份正在用的快照。
+   */
+  function groupInviteIn(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const body = readPeerJsonBody(rawBody);
+    const groupId = String(body?.groupId ?? '').trim();
+    const key = String(body?.key ?? '');
+    const members = Array.isArray(body?.members) ? body.members : null;
+    if (!body || groupId === '' || key === '' || members === null) {
+      if (config.logger) {
+        config.logger('[group] invite refused from=' + shortPeerId(auth.peerId) + ' reason=bad-invite');
+      }
+      return { status: 400, body: { error: 'bad-invite' }, peerId: auth.peerId };
+    }
+    const existing = readGroupKeyFile(config.stateDir);
+    if (String(existing?.groupId ?? '') === groupId) {
+      if (config.logger) {
+        config.logger('[group] invite ignored from=' + shortPeerId(auth.peerId) + ' gid=' + shortPeerId(groupId)
+          + ' reason=already-member');
+      }
+      return { status: 200, body: { ok: true, groupId, alreadyMember: true }, peerId: auth.peerId };
+    }
+    const hub = body.hub && typeof body.hub === 'object' ? body.hub : {};
+    const grant = {
+      groupId,
+      key,
+      keyVersion: Number(body.keyVersion) || 0,
+      name: normalizeGroupName(body.name),
+      members: members.map((member) => ({
+        peerId: String(member?.peerId ?? ''),
+        name: String(member?.name ?? ''),
+        baseUrl: String(member?.baseUrl ?? '').trim().replace(/\/+$/, ''),
+      })).filter((member) => member.peerId !== ''),
+      hub: {
+        peerId: String(hub.peerId ?? auth.peerId),
+        name: String(hub.name ?? ''),
+        baseUrl: String(hub.baseUrl ?? '').trim().replace(/\/+$/, ''),
+      },
+      invitedAt: String(body.invitedAt ?? ''),
+    };
+    const stored = putGroupInvite(config.stateDir, {
+      grant,
+      // 来处只认签名出来的身份，不认 body 里自称的那一份
+      from: { peerId: auth.peerId, name: String(auth.peer?.name ?? '') },
+      now: config.now(),
+    });
+    // 一行日志：只有 id 前 8 位，没有名字也没有 body（群密钥更不会进日志）
+    if (config.logger) {
+      config.logger('[group] invite received from=' + shortPeerId(auth.peerId) + ' gid=' + shortPeerId(groupId));
+    }
+    return {
+      status: 200,
+      body: { ok: true, groupId, pending: true, stored: stored.stored },
+      peerId: auth.peerId,
+    };
+  }
+
+  /**
+   * POST /v1/group/invite/ack —— 被邀请方 → 邀请方（0.12.5-alpha slice B）。
+   *
+   * 邀请是推送式的，所以 hub 在发出那一刻只知道「我推出去了」；对方接受了没有它无从得知
+   * （memberProgress 要等对方下一次 pull）。这条 ack 就是补那一格：账本 invited → joined/declined。
+   *
+   * 门禁三条，缺一不可：
+   *   ① per-peer 签名（authenticate）—— 与 invite 同一个门，方向相反；
+   *   ② 本机必须是这个群的 hub（账本只存在于 hub 盘上）；
+   *   ③ **只有当初被邀请的那个人能 ack**：账本里必须有他且状态还是 invited
+   *      （已经把结果记下来的 ack 再来一次 → 403 not-invited，绝不覆盖既成事实）。
+   */
+  function groupInviteAck(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    if (!groupStore) return { status: 409, body: { error: 'not-a-hub' }, peerId: auth.peerId };
+    const body = readPeerJsonBody(rawBody);
+    const groupId = String(body?.groupId ?? '').trim();
+    const decision = String(body?.decision ?? '').trim();
+    const state = decision === 'accept' ? 'joined' : (decision === 'decline' ? 'declined' : '');
+    if (groupId === '' || state === '') {
+      if (config.logger) {
+        config.logger('[group] invite ack refused from=' + shortPeerId(auth.peerId) + ' reason=bad-ack');
+      }
+      return { status: 400, body: { error: 'bad-ack' }, peerId: auth.peerId };
+    }
+    if (String(groupStore.state({ includeKey: false }).groupId ?? '') !== groupId) {
+      if (config.logger) {
+        config.logger('[group] invite ack refused from=' + shortPeerId(auth.peerId) + ' gid='
+          + shortPeerId(groupId) + ' reason=group-mismatch');
+      }
+      return { status: 409, body: { error: 'group-mismatch' }, peerId: auth.peerId };
+    }
+    const ledger = readInviteLedger(config.stateDir);
+    const entry = ledger[String(auth.peerId)];
+    if (!entry || entry.state !== 'invited') {
+      if (config.logger) {
+        config.logger('[group] invite ack refused from=' + shortPeerId(auth.peerId) + ' gid='
+          + shortPeerId(groupId) + ' reason=not-invited');
+      }
+      return { status: 403, body: { error: 'not-invited' }, peerId: auth.peerId };
+    }
+    recordInviteAttempt(config.stateDir, auth.peerId, state, config.now());
+    if (config.logger) {
+      config.logger('[group] invite ack from=' + shortPeerId(auth.peerId) + ' gid=' + shortPeerId(groupId)
+        + ' state=' + state);
+    }
+    return { status: 200, body: { ok: true, groupId, state }, peerId: auth.peerId };
+  }
+
   /** POST /v1/group/apply-intake —— 群级鉴权，介绍人 → hub（契约 §4.2） */
   function groupApplyIntake(req, rawBody, url, auth) {
     if (!groupStore) return { status: 409, body: { error: 'not-a-hub' }, peerId: auth.peerId };
@@ -8783,6 +8921,8 @@ export function createPeerServer(overrides = {}) {
       if (url.pathname === '/v1/group/advertise') return groupAdvertise(req, rawBody);
       if (url.pathname === '/v1/group/lookup') return groupLookup(req, rawBody);
       if (url.pathname === '/v1/group/apply') return groupApply(req, rawBody);
+      if (url.pathname === '/v1/group/invite') return groupInviteIn(req, rawBody);
+      if (url.pathname === '/v1/group/invite/ack') return groupInviteAck(req, rawBody);
       return groupApplyStatus(req, rawBody);
     }
     // S3：成员节点只有当上 leader 才收 post（否则这些路径仍当作不存在，v0.5.0 语义不变）
@@ -11063,6 +11203,211 @@ export function createPeerServer(overrides = {}) {
     });
   }
 
+
+  // -------------------------------------------------------------------------
+  // 0.12.5-alpha（slice A）：入群邀请 —— 推送式授权
+  //
+  // 三个动作都在本机完成，但**方向**不同：
+  //   invite({peerId})      hub 专属：把本机 group.json 的授权推给名单里的某个成员；
+  //   acceptInvite         接收方：applyGroupGrant 落 group-key.json，再走既有提升；
+  //   declineInvite        接收方：丢弃，不留痕（下次 hub 还能再邀）。
+  // 面板要的「这个成员现在什么状态」由 partnerJoinStates() 给，判据见注释。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 「这个名单成员到底入群了没有」—— hub 手里**唯一**的客观信号是：
+   * 它有没有用群密钥来过（probe / pull 会在 X-Peer-LastSeq 上自报，落进 memberProgress）。
+   * 光在 group.json 的 members 里不算：roster 是 hub 自己写的一行字，正是本 feature 要补的缺口。
+   */
+  function joinedMemberIds() {
+    if (!groupStore) return [];
+    return [...memberProgress.keys()];
+  }
+
+  /** 名单成员的入群态三态（joined / invited / not-invited）：面板据此选按钮 */
+  function partnerJoinStates() {
+    if (!groupStore) return {};
+    // 自己永远是「已入群」：memberProgress 只记别人（hub 不从自己身上收进度）
+    const joined = new Set([...joinedMemberIds(), store.instanceId]);
+    const ledger = readInviteLedger(config.stateDir);
+    const out = {};
+    for (const peerId of Object.keys(groupStore.state().members)) {
+      out[peerId] = joinStateOf(peerId, { joined, ledger });
+    }
+    return out;
+  }
+
+  /** 交给成员的 grant：形状与 apply 链路里那份一致（成员侧 applyGroupGrant 照旧吃它） */
+  function inviteGrantOf(data) {
+    const members = groupMembersView().map((member) => ({
+      peerId: member.peerId,
+      name: member.name,
+      baseUrl: member.baseUrl,
+    }));
+    return {
+      groupId: String(data.groupId),
+      key: String(data.groupKey),
+      keyVersion: Number(data.keyVersion ?? data.epoch) || 0,
+      name: String(data.name ?? ''),
+      members,
+      hub: { peerId: store.instanceId, name: config.name, baseUrl: localAdvertiseBaseUrl() },
+      invitedAt: new Date(config.now()).toISOString(),
+    };
+  }
+
+  /**
+   * hub → 成员：推一条邀请。返回 { ok, peerId, state }。
+   * 已入群（joinedMemberIds）**不推**：那会让一个正在跑的成员白白重装一份快照。
+   * 推不出去只记 unreachable（账本里留痕），不抛 —— 面板点一次失败不该变成 500。
+   */
+  async function inviteToGroup({ peerId } = {}) {
+    const id = String(peerId ?? '');
+    if (!groupStore) return { ok: false, peerId: id, state: 'unreachable', error: 'not-a-hub' };
+    if (id === '') return { ok: false, peerId: id, state: 'unreachable', error: 'peerId-required' };
+    const members = groupStore.state().members;
+    if (!Object.prototype.hasOwnProperty.call(members, id)) {
+      return { ok: false, peerId: id, state: 'unreachable', error: 'unknown-member' };
+    }
+    if (joinedMemberIds().includes(id)) {
+      // I5/I9：已入群时**一个字节都不发**（调用点在下面，走不到 callPeer）
+      recordInviteAttempt(config.stateDir, id, 'already-member', config.now());
+      return { ok: true, peerId: id, state: 'already-member' };
+    }
+    const peer = store.getPeer(id);
+    const baseUrl = String(peer?.baseUrl ?? '').trim().replace(/\/+$/, '');
+    const secret = String(peer?.secret ?? '');
+    const grant = inviteGrantOf(groupStore.state({ includeKey: true }));
+    if (baseUrl === '' || secret === '') {
+      recordInviteAttempt(config.stateDir, id, 'unreachable', config.now());
+      if (config.logger) {
+        config.logger('[group] invite failed peer=' + shortPeerId(id) + ' state=unreachable reason=unpaired');
+      }
+      return { ok: false, peerId: id, state: 'unreachable', error: 'unpaired' };
+    }
+    let reply;
+    try {
+      reply = await callPeer({
+        baseUrl,
+        secret,
+        senderId: store.instanceId,
+        method: 'POST',
+        apiPath: '/v1/group/invite',
+        body: grant,
+        // 推送闸 + 3s 上界：对端不在线时这条路由必须**有界**地回来
+        timeoutMs: GROUP_PUSH_TIMEOUT_MS,
+        fetchImpl: pushFetch,
+      });
+    } catch (error) {
+      const reason = String(error?.message ?? error);
+      recordInviteAttempt(config.stateDir, id, 'unreachable', config.now());
+      if (config.logger) {
+        config.logger('[group] invite failed peer=' + shortPeerId(id) + ' state=unreachable reason='
+          + reason.slice(0, 60));
+      }
+      return { ok: false, peerId: id, state: 'unreachable', error: 'unreachable' };
+    }
+    // 对端说「我已经在这个群里了」：账本照实记 already-member，但不改本机的 joined 判据
+    const state = reply?.alreadyMember === true ? 'already-member' : 'invited';
+    recordInviteAttempt(config.stateDir, id, state, config.now());
+    if (config.logger) {
+      config.logger('[group] invite sent peer=' + shortPeerId(id) + ' state=' + state);
+    }
+    return { ok: true, peerId: id, state };
+  }
+
+  /**
+   * 接受/拒绝之后回头告诉邀请方（0.12.5-alpha slice B）：账本 invited → joined/declined。
+   *
+   * **best-effort**：本机的入群此时已经落盘了，这条 ack 只是让邀请方那本账跟上来。
+   * 所以它永不抛、永不改返回值、失败只留一行日志 —— 把「入群成功」变成「入群失败」
+   * 是这条路上唯一不能犯的错。
+   */
+  async function ackInvite(groupId, decision, fromPeerId) {
+    const id = String(groupId ?? '');
+    const peer = fromPeerId ? store.getPeer(String(fromPeerId)) : null;
+    const baseUrl = String(peer?.baseUrl ?? '').trim().replace(/\/+$/, '');
+    const secret = String(peer?.secret ?? '');
+    if (id === '' || baseUrl === '' || secret === '') {
+      if (config.logger) config.logger('[group] invite ack failed gid=' + shortPeerId(id));
+      return false;
+    }
+    try {
+      await callPeer({
+        baseUrl,
+        secret,
+        senderId: store.instanceId,
+        method: 'POST',
+        apiPath: '/v1/group/invite/ack',
+        body: { groupId: id, decision },
+        // 与邀请推送同一个上界：对方不在线时这条 ack 必须**有界**地放弃
+        timeoutMs: GROUP_PUSH_TIMEOUT_MS,
+        fetchImpl: pushFetch,
+      });
+    } catch {
+      if (config.logger) config.logger('[group] invite ack failed gid=' + shortPeerId(id));
+      return false;
+    }
+    if (config.logger) {
+      config.logger('[group] invite ack sent gid=' + shortPeerId(id) + ' decision=' + decision);
+    }
+    return true;
+  }
+
+  /**
+   * 接收方接受：applyGroupGrant（既有实现，不另写第二份）→ 丢掉这条邀请 →
+   * 走既有的运行期提升（promoteToMember，v0.8.0 按名入群拿 grant 时用的就是它）。
+   * 半份授权（缺 groupId/key）→ grant-incomplete，且**不动** group-key.json，邀请也留着。
+   * slice B：成功之后补一条 best-effort 的 ack，让邀请方账本变成 joined。
+   */
+  async function acceptInvite({ groupId } = {}) {
+    const id = String(groupId ?? '').trim();
+    const invite = readGroupInvite(config.stateDir, id);
+    if (!invite) {
+      const error = new Error('invite-not-found');
+      error.status = 404;
+      throw error;
+    }
+    applyGroupGrant(config.stateDir, invite);
+    dropGroupInvite(config.stateDir, id);
+    // 已在群里（role=member）时提升是空操作 —— group-key.json 已换，下一次读盘即生效
+    const promoted = promoteToMember();
+    if (config.logger) {
+      config.logger('[group] invite accepted gid=' + shortPeerId(id) + ' promoted=' + (promoted === true));
+    }
+    // 邀请方账本要变成 joined；这条 ack 失败也不影响上面已经成功的入群。
+    await ackInvite(id, 'accept', invite?.from?.peerId);
+    return { ok: true, groupId: id };
+  }
+
+  async function declineInvite({ groupId } = {}) {
+    const id = String(groupId ?? '').trim();
+    if (id === '') {
+      const error = new Error('invite-not-found');
+      error.status = 404;
+      throw error;
+    }
+    // 先取（要 from），再删：dropGroupInvite 之后这份 entry 就没了
+    const invite = readGroupInvite(config.stateDir, id);
+    if (!dropGroupInvite(config.stateDir, id)) {
+      const error = new Error('invite-not-found');
+      error.status = 404;
+      throw error;
+    }
+    if (config.logger) config.logger('[group] invite declined gid=' + shortPeerId(id));
+    await ackInvite(id, 'decline', invite?.from?.peerId);
+    return { ok: true };
+  }
+
+  const inviteFacade = {
+    invite: (input) => inviteToGroup(input ?? {}),
+    invites: () => listInvites(config.stateDir),
+    inviteStates: () => readInviteLedger(config.stateDir),
+    joinedMemberIds: () => joinedMemberIds(),
+    partnerJoinStates: () => partnerJoinStates(),
+    acceptInvite: (input) => acceptInvite(input ?? {}),
+    declineInvite: (input) => declineInvite(input ?? {}),
+  };
+
   const discoveryFacade = {
     broadcast: (reason = 'manual') => broadcastGroupName({ manual: true, reason }),
     identity: () => localGroupIdentity(),
@@ -11110,6 +11455,9 @@ export function createPeerServer(overrides = {}) {
           isHub: true,
           ...s3Facade,
           ...discoveryFacade,
+          // 0.12.5-alpha（slice A）：邀请（推/收/接受/拒绝 + 三态判据）在两个分支都在 ——
+          // 收邀请的节点可能还没有群（enabled=false 那一支），少了它就是本 feature 的原洞。
+          ...inviteFacade,
           // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
           ...answerFacade,
           state: (options = {}) => groupStore.state(options),
@@ -11198,6 +11546,9 @@ export function createPeerServer(overrides = {}) {
           isHub: false,
           ...s3Facade,
           ...discoveryFacade,
+          // 0.12.5-alpha（slice A）：邀请（推/收/接受/拒绝 + 三态判据）在两个分支都在 ——
+          // 收邀请的节点可能还没有群（enabled=false 那一支），少了它就是本 feature 的原洞。
+          ...inviteFacade,
           // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
           ...answerFacade,
           // S2 成员侧：本地副本 + 拉取/推送入口（hub 端点仍在 hub 那边）。
