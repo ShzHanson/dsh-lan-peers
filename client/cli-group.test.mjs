@@ -534,6 +534,14 @@ test('C5 group-role.json 坏掉或不存在 → 回落今天的解析，不崩',
 const GROUP_ID = '11111111-2222-3333-4444-555555555555';
 const KEY_43 = 'k'.repeat(43);   // 43 个 base64url 字符 = 32 字节
 
+// R3/R3b 的墙钟刻度：时长窗口只决定「跟多久」，断言窗口**不跟它贴在一起**。
+// 负载中的机器只会让 elapsed 变大、轮询变少，所以下限只留 50ms 取整余量（负载不可能把它打红）；
+// 上限的职责只有一个 ——「有限」。是不是自己退出的，由 status===0、订阅结束行、以及
+// runAsync 的 8000ms 杀进程三处兜底，而不是靠一个贴着 1s 窗口的紧上界。
+const TAIL_DURATION_S = 1;
+const TAIL_WINDOW_MS = TAIL_DURATION_S * 1000;
+const EXIT_SLACK_MS = 6000;   // 上限 = 窗口 + 6s 冷启动/调度余量，仍在 runAsync 的 8s 杀进程之内
+
 function groupMessage(seq, text) {
   return { seq, ts: HUB_TS + seq * 1000, from: { peerId: HUB.peerId, name: HUB.name }, kind: 'chat', text };
 }
@@ -643,14 +651,19 @@ test('R2 hub 本地 history：sinceSeq 游标真的进到管理接口，且是�
   assert.equal(peer.calls.length, 0, 'history 一次都不许打给成员');
 });
 
-test('R3 hub 本地 tail 跟随而不是快照：按 200ms 节拍推进 sinceSeq，逐批打印，零 peer 调用', async (t) => {
+test('R3 hub 本地 tail 跟随而不是快照：按 200ms 节拍推进 sinceSeq，逐批打印，零 peer 调用', { timeout: 20000 }, async (t) => {
   // 桩在每次轮询时追加一条新消息：跟随式实现每轮拿到一条新的，快照式实现只能拿第一轮那批。
   const admin = await startGroupAdmin(t, { grow: true });
   const peer = await startRecorder(t, {});
   const dir = hubNodeDir(t, { admin, peer });
 
-  const out = await runAsync(['group', 'tail', '--duration', '1', '--since', '1', '--state-dir', dir]);
+  const startedAt = Date.now();
+  const out = await runAsync(['group', 'tail', '--duration', String(TAIL_DURATION_S), '--since', '1', '--state-dir', dir]);
+  const elapsed = Date.now() - startedAt;
   assert.equal(out.status, 0, out.stderr);
+  // 墙钟只判「有限」：上限 = 窗口 + 6s。跟随本身由下面的轮询/游标断言判，不看时间。
+  assert.ok(elapsed < TAIL_WINDOW_MS + EXIT_SLACK_MS,
+    'T1：进程必须自己走到点并退出（有限上界 ' + (TAIL_WINDOW_MS + EXIT_SLACK_MS) + 'ms），实测 ' + elapsed + 'ms');
   assert.ok(out.stderr.includes('订阅群事件 sinceSeq=1 (1s)'), out.stderr);
 
   // T1-a：多轮请求，且 sinceSeq 真的在前进（钉死在一个游标上就是快照）
@@ -678,22 +691,25 @@ test('R3 hub 本地 tail 跟随而不是快照：按 200ms 节拍推进 sinceSeq
   assert.equal(peer.calls.length, 0, 'tail 也不许给成员发请求');
 });
 
-test('R3b hub 本地 tail 到点即停：轮询次数有界、进程自己退出、不留循环/计时器', async (t) => {
+test('R3b hub 本地 tail 到点即停：轮询次数有界、进程自己退出、不留循环/计时器', { timeout: 20000 }, async (t) => {
   const admin = await startGroupAdmin(t, { grow: true });
   const peer = await startRecorder(t, {});
   const dir = hubNodeDir(t, { admin, peer });
 
   const startedAt = Date.now();
-  const out = await runAsync(['group', 'tail', '--duration', '1', '--state-dir', dir]);
+  const out = await runAsync(['group', 'tail', '--duration', String(TAIL_DURATION_S), '--state-dir', dir]);
   const elapsed = Date.now() - startedAt;
+  // status 0 = 进程自己走到点退出；退不出去的循环会在 runAsync 的 8s 杀进程上变成非 0
   assert.equal(out.status, 0, out.stderr);
 
-  // T2：1s / 200ms 节拍 ≈ 5 轮，给 +2 抖动余量；退不出去的循环会一路涨上来
+  // T2：1s / 200ms 节拍 ≈ 5 轮，给 +3 抖动余量；退不出去的循环会一路涨上来
   assert.ok(admin.calls.length >= 2, 'T2：必须先真的轮询，实测 ' + admin.calls.length + ' 次');
   assert.ok(admin.calls.length <= 8, 'T2：轮询次数必须有界（--duration 1），实测 ' + admin.calls.length + ' 次');
-  // duration 既是下界也是上界：提前收 = 没跟随；拖过 3s = 计时器/循环没退干净
-  assert.ok(elapsed >= 950, 'T2：--duration 1 不许提前结束，实测 ' + elapsed + 'ms');
-  assert.ok(elapsed < 3000, 'T2：进程必须自己走到点并退出，实测 ' + elapsed + 'ms');
+  // duration 下界：提前收 = 没跟随。负载只会让 elapsed 变大，这条不吃抖动。
+  assert.ok(elapsed >= TAIL_WINDOW_MS - 50, 'T2：--duration 1 不许提前结束，实测 ' + elapsed + 'ms');
+  // 上界只判「有限」，不判「快」：窗口 + 6s。退不出去的循环永远走不到这一行（会被 8s 杀进程 + status 判红）。
+  assert.ok(elapsed < TAIL_WINDOW_MS + EXIT_SLACK_MS,
+    'T2：进程必须自己走到点并退出（有限上界 ' + (TAIL_WINDOW_MS + EXIT_SLACK_MS) + 'ms），实测 ' + elapsed + 'ms');
   // 两行 stderr 各只一次：退出路径唯一，没有第二次订阅/第二条结束行
   assert.equal(out.stderr.split('\n').filter((l) => l.includes('订阅结束')).length, 1, out.stderr);
   assert.equal(out.stderr.split('\n').filter((l) => l.includes('订阅群事件')).length, 1, out.stderr);

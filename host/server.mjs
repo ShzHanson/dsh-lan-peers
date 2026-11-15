@@ -247,7 +247,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.12.3';
+export const PLUGIN_VERSION = '0.12.4-alpha';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -963,7 +963,7 @@ function privateAddressRank(address) {
  * 从 os.networkInterfaces() 的形状里挑一个私有 IPv4：跳过 internal、跳过虚拟网卡名、
  * 只保留 RFC1918，按 rank + 网卡名排序取第一个。没有则返回 null（调用方回落到配置值）。
  */
-export function pickPrivateIpv4(interfaces = os.networkInterfaces()) {
+function scanIpv4Addresses(interfaces = os.networkInterfaces()) {
   const found = [];
   const names = Object.keys(interfaces ?? {}).sort();
   for (const name of names) {
@@ -973,12 +973,37 @@ export function pickPrivateIpv4(interfaces = os.networkInterfaces()) {
       const family = entry.family === 'IPv4' || entry.family === 4;
       if (!family || entry.internal === true) continue;
       const address = String(entry.address ?? '');
-      if (!isPrivateIpv4(address)) continue;
+      if (address === '') continue;
       found.push({ name: String(name), address, rank: privateAddressRank(address) });
     }
   }
   found.sort((left, right) => (left.rank - right.rank) || left.name.localeCompare(right.name) || left.address.localeCompare(right.address));
-  return found.length > 0 ? found[0].address : null;
+  return found;
+}
+
+/**
+ * 本机**全部**非回环 IPv4（排序口径与 pickPrivateIpv4 同一份，所以第一条就是它的首选）。
+ * 两块网卡（有线 + 无线）就有两条：面板要把地址全列出来，不再替用户挑一个 —— 挑错
+ * 那一枚，对端照着连就连不上。拿不到网卡时返回空数组（调用方据此说「没发现局域网地址」）。
+ */
+export function listPrivateIpv4s(interfaces = os.networkInterfaces()) {
+  try {
+    const seen = new Set();
+    const out = [];
+    for (const entry of scanIpv4Addresses(interfaces)) {
+      if (seen.has(entry.address)) continue;
+      seen.add(entry.address);
+      out.push(entry.address);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function pickPrivateIpv4(interfaces = os.networkInterfaces()) {
+  const hit = scanIpv4Addresses(interfaces).find((entry) => isPrivateIpv4(entry.address));
+  return hit ? hit.address : null;
 }
 
 /** 本机自动探测到的地址（拿不到私有 IPv4 时返回 null） */
@@ -11155,6 +11180,10 @@ export function createPeerServer(overrides = {}) {
           lastSeq: () => groupStore.state().lastSeq,
           // S1/S2：地址探测 + 复制队列（测试/CLI 可以直接驱动，不必等定时器）
           advertiseBaseUrl: () => localAdvertiseBaseUrl(),
+          // 面板「本机」那一行的两个数：真实监听端口（还没 listen 时退回配置值）与本机
+          // 全部非回环 IPv4 —— 端口只有 host 知道，地址只有 host 探测得到。
+          listenPort: () => boundAddress?.port ?? config.listenPort,
+          localAddresses: () => listPrivateIpv4s(),
           local: () => localGroupContext(),
           replica: null,
           flushReplicate: () => flushReplication(),
@@ -11222,6 +11251,8 @@ export function createPeerServer(overrides = {}) {
           // 契约 §4 的门面在成员节点也要在：不带新字段时走既有回执通道（hub / 群级签名）
           post: (input) => groupPostFacade(input),
           advertiseBaseUrl: () => localAdvertiseBaseUrl(),
+          listenPort: () => boundAddress?.port ?? config.listenPort,
+          localAddresses: () => listPrivateIpv4s(),
           local: () => localGroupContext(),
           // §18.3：成员副本是可重建缓存，只剪枝不归档 —— 归档是 hub 侧权威日志的事
           archives: () => [],
