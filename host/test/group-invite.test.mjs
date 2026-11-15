@@ -16,7 +16,7 @@ import { createPeerServer } from '../server.mjs';
 import { createAdmin } from '../../lib/admin.mjs';
 import { readGroupKeyFile } from '../../lib/group-client.mjs';
 import net from 'node:net';
-import { isFetchBlockedPort } from '../../test-support/ports.mjs';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { makeTempStateDir, request, writeJson0600 } from './helpers.mjs';
 import { waitFor } from './group-cluster.mjs';
 
@@ -169,21 +169,17 @@ async function hit(node, method, apiPath, body) {
   return { status: res.status, body: parsed, raw: res.body };
 }
 
-/** 先挑一个「fetch 不拒绝」的空闲端口（与 group-cluster 同一套） */
+/**
+ * 先挑一个「fetch 不拒绝」的空闲端口：交给 test-support/ports.mjs 的助手。
+ * 本仓铁律——任何 *.test.mjs 都不许裸 listen(0)（host/test/ports-scan.test.mjs 静态拦截）；
+ * 助手已经负责避开 WHATWG 黑名单端口并在撞上时换一个。
+ */
 async function pickFreePort() {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const port = await new Promise((resolve, reject) => {
-      const probe = net.createServer();
-      probe.unref();
-      probe.once('error', reject);
-      probe.listen(0, '127.0.0.1', () => {
-        const found = probe.address().port;
-        probe.close(() => resolve(found));
-      });
-    });
-    if (!isFetchBlockedPort(port)) return port;
-  }
-  throw new Error('no fetch-safe free port');
+  const probe = net.createServer();
+  probe.unref();
+  const info = await listenOnRandomPort(probe);
+  await new Promise((resolve) => probe.close(resolve));
+  return info.port;
 }
 
 const inviteFiles = (dir) => path.join(dir, 'group-invites.json');
