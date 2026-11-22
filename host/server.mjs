@@ -355,6 +355,15 @@ export const DM_V1_PATHS = Object.freeze([
 ]);
 
 /**
+ * 0.13.0-α 危险区：身份重置通知（per-peer 签名 + 信封，与 unpair 同一把尺子）。
+ * 为什么必须是 per-peer：这条通知的认证靠的正是**即将被销毁的那把**旧密钥 ——
+ * 所以它只能在启动时、重生之前发；能签出它的人，就是那个身份本身。
+ */
+export const PEER_RESET_V1_PATHS = Object.freeze([
+  '/v1/peer/reset-notice',
+]);
+
+/**
  * 0.8.5-α 契约 §2：派单工作区/权限（per-peer 签名 + 信封）。
  * options 是 GET（无 body，信封头照样带），approval 同样是 GET。
  */
@@ -377,6 +386,7 @@ const KNOWN_V1_PATHS = Object.freeze([
   ...FILE_V1_PATHS,
   ...DM_V1_PATHS,
   ...DISPATCH_V1_PATHS,
+  ...PEER_RESET_V1_PATHS,
 ]);
 
 /** §5 ask 默认超时（秒） */
@@ -5336,6 +5346,49 @@ export function createPeerServer(overrides = {}) {
       body: { ok: true, removed, peers: store.getPeerCount() },
       peerId: auth.peerId,
     };
+  }
+
+  /**
+   * hub 侧「把某个 peerId 从群成员表里删掉」的**唯一**实现：管理接口/面板的移除按钮
+   * 与身份重置通知都调这一份。它同时轮换 groupKey（被移除者手里的旧钥立刻作废）——
+   * 两处各写一遍就等于有两份会漂移的口径，其中一份迟早忘了轮换。
+   */
+  function removeGroupMemberFromRoster(peerId) {
+    if (!groupStore) return false;
+    const removed = groupStore.removeMember(peerId);
+    if (!removed) return false;
+    const id = String(peerId ?? '');
+    memberProgress.delete(id);
+    peerBaseUrls.delete(id);
+    peerPriorities.delete(id);
+    if (config.logger) {
+      config.logger(`[group] key rotated keyVersion=${groupStore.state().keyVersion} reason=member-removed`);
+    }
+    return removed;
+  }
+
+  /**
+   * /v1/peer/reset-notice（签名+加密）：请求方声明「我的身份即将重置，把我删掉」。
+   *
+   * 为什么这条通知值得信：它只能用**即将被销毁的那把**旧密钥签出来（发送方在重生之前发），
+   * 所以一条合法通知就是「这个 peerId 不会再有第二次生命」。与 unpair 同一把尺子：
+   * 只认 auth.peerId，body 一律不参与选目标（{resetAt, reason} 只给人类排障看）。
+   * 收到就删本地配对记录；本机若是 hub 且它在成员表里，走既有移除路径（会轮换群密钥）。
+   */
+  function resetNotice(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    const removed = store.removePeer(auth.peerId);
+    // 该 peer 挂起的 ECDH 握手一并作废（与 unpair 同一个理由：删掉之后不能靠 confirm 写回来）
+    for (const [code, pending] of pendingPairs) {
+      if (pending.peerId === auth.peerId) pendingPairs.delete(code);
+    }
+    let group = 'not-hub';
+    if (groupStore) group = removeGroupMemberFromRoster(auth.peerId) ? 'cleared' : 'not-member';
+    if (config.logger) {
+      config.logger(`[peer] reset-notice from=${shortPeerId(auth.peerId)} removed=${removed ? 1 : 0}`);
+    }
+    return { status: 200, body: { ok: true, removed, group }, peerId: auth.peerId };
   }
 
   // ---- §3 v0.5.0 群（hub 侧；成员侧用 lib/group-client.mjs 走网络） --------
@@ -10930,6 +10983,8 @@ export function createPeerServer(overrides = {}) {
     if (method === 'GET' && url.pathname === '/v1/events') return events(req, rawBody, url, res);
     if (method === 'GET' && url.pathname === '/v1/peers') return peers(req, rawBody);
     if (method === 'POST' && url.pathname === '/v1/unpair') return unpair(req, rawBody);
+    // 0.13.0-α：对端说「我的身份要重置了，把我删掉」。与 unpair 同一条认证，只认 auth.peerId。
+    if (method === 'POST' && url.pathname === '/v1/peer/reset-notice') return resetNotice(req, rawBody);
     // v0.5.0 群：未知的 /v1/group/* 也走这里（404 而不是落到通用 405）
     if (url.pathname.startsWith('/v1/group/')) return groupDispatch(req, rawBody, url, res);
     // 0.8.5-α：文件互传四条（未知的 /v1/file/* 404，已知路径用错方法 405）
@@ -10983,7 +11038,9 @@ export function createPeerServer(overrides = {}) {
             // 0.8.5-α 契约 §3：私聊对齐同样是 per-peer 路径（未配对 → 401）
             || DM_V1_PATHS.includes(url.pathname)
             // 0.8.5-α 契约 §2：派单两条也是 per-peer 路径（未配对 → 401；GET 无 body，信封头照样带）
-            || DISPATCH_V1_PATHS.includes(url.pathname));
+            || DISPATCH_V1_PATHS.includes(url.pathname)
+            // 0.13.0-α：身份重置通知也是 per-peer 路径 —— 未配对/签名不对一律 401，与 unpair 同门
+            || PEER_RESET_V1_PATHS.includes(url.pathname));
         if (groupAuthRequest) {
           const groupCtx = localGroupContext();
           if (groupCtx?.groupKey) {
@@ -11600,18 +11657,8 @@ export function createPeerServer(overrides = {}) {
           addMember: (peerId, name) => groupStore.addMember(peerId, name),
           /** 被移除名单（只读）：管理接口/测试用它解释「为什么这个 peer 进不来」 */
           isBlocked: (peerId) => groupStore.isBlocked(peerId),
-          removeMember: (peerId) => {
-            const removed = groupStore.removeMember(peerId);
-            if (!removed) return removed;
-            const id = String(peerId ?? '');
-            memberProgress.delete(id);
-            peerBaseUrls.delete(id);
-            peerPriorities.delete(id);
-            if (config.logger) {
-              config.logger(`[group] key rotated keyVersion=${groupStore.state().keyVersion} reason=member-removed`);
-            }
-            return removed;
-          },
+          // 与身份重置通知共用同一份实现（见 removeGroupMemberFromRoster）
+          removeMember: (peerId) => removeGroupMemberFromRoster(peerId),
           rename: (nextName) => groupStore.renameGroup(nextName),
           // 契约 §4：不带新字段时逐字是 0.8.4 的 append（同步、原样返回那条消息）；
           // 带 workspaceId/permission/target 才进「发帖 + 派单」链路（返回 Promise）。
