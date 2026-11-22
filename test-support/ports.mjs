@@ -87,8 +87,8 @@ function addressPortOf(server) {
  * 让 server 监听一个随机端口并返回 { port, url }（自定义 server 则原样返回它的 info）。
  * Node 原生 server 的 listen() 返回自身（非 thenable），这里补等 'listening' 事件。
  */
-async function startListening(server, host) {
-  const started = server.listen(0, host);
+async function startListening(server, host, requested = 0) {
+  const started = server.listen(requested, host);
   if (started && typeof started.then === 'function') {
     const info = await started;
     if (info && typeof info === 'object' && Number(info.port) > 0) return info;
@@ -131,18 +131,62 @@ async function stopListening(server) {
   });
 }
 
+// 显式候选端口的扫描区间：RFC 6335 的动态/私有端口段（49152-65535）。
+// 选它而不是操作系统 ip_local_port_range，是因为这段在所有平台上都合法可用，
+// 且不会与内核正在发放的临时端口撞车（那正是下面要绕开的来源）。
+const CANDIDATE_PORT_MIN = 49152;
+const CANDIDATE_PORT_MAX = 65535;
+
 /**
- * listen( 0 ) + 避开 fetch 黑名单端口，撞上就换一个（最多 attempts 次）。
+ * 在扫描区间里挑一个「没被 fetch 拒过、这一发还没问过」的端口：
+ * 随机起点 + 线性扫描，整段最多走一圈（有界），走空返回 0。
+ * 随机起点是为了并发跑的多条用例不会从同一个号开始抢。
+ */
+function pickCandidatePort(asked) {
+  const span = CANDIDATE_PORT_MAX - CANDIDATE_PORT_MIN + 1;
+  const start = Math.floor(Math.random() * span);
+  for (let step = 0; step < span; step += 1) {
+    const candidate = CANDIDATE_PORT_MIN + ((start + step) % span);
+    if (isFetchBlockedPort(candidate) || asked.has(candidate)) continue;
+    return candidate;
+  }
+  return 0;
+}
+
+/**
+ * listen( 0 ) + 避开 fetch 黑名单端口，撞上就换一个（最多 attempts 个不同端口）。
+ *
+ * 为什么不能只是「关掉再 listen(0)」：Linux/Windows 的内核会把刚释放的临时端口
+ * 优先再发一次，于是每次重试都可能落回同一个 bad port，循环耗尽 —— 这就是
+ * "no fetch-safe ephemeral port after 5 attempts (last=6669)" 那条假红。
+ * 所以第 1 发仍走 listen(0)（happy path 一次命中，行为与旧实现逐字相同），
+ * 之后每一发改成**显式**端口，且跳过本调用里已经问过 / 已经被 fetch 拒掉的号。
+ *
  * 用法：const info = await listenOnRandomPort(server);  // info.port / info.url
  */
 export async function listenOnRandomPort(server, host = '127.0.0.1', attempts = 5) {
-  let info = null;
   const live = needsLiveProbe(server);
-  for (let index = 0; index < attempts; index += 1) {
-    info = await startListening(server, host);
+  const asked = new Set();          // 本调用问过的端口：保证每一次都是新的
+  let last = null;
+  const budget = Math.max(1, Number(attempts) || 0);
+  for (let index = 0; index < budget; index += 1) {
+    const requested = index === 0 ? 0 : pickCandidatePort(asked);
+    if (index > 0 && requested === 0) break;  // 候选段已经扫空
+    asked.add(requested);
+    let info = null;
+    try {
+      info = await startListening(server, host, requested);
+    } catch (error) {
+      if (index === 0) throw error;   // listen(0) 的失败照旧上抛：调用方看到的东西不变
+      last = requested;               // 显式候选被占用：记下，换下一个
+      continue;
+    }
     const safeByList = !isFetchBlockedPort(info.port);
     if (safeByList && (!live || !(await fetchRejectsPort(host, info.port, { target: 'server' })))) return info;
+    last = info.port;
     await stopListening(server);
   }
-  throw new Error('no fetch-safe ephemeral port after ' + attempts + ' attempts (last=' + (info && info.port) + ')');
+  const tried = [...asked];
+  throw new Error('no fetch-safe port after ' + tried.length + ' distinct ports tried'
+    + ' (' + tried.join(', ') + '; last=' + last + ')');
 }
