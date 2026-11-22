@@ -9,7 +9,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { DIGEST_OUT_FILE } from '../../lib/group-digest.mjs';
 import { secretOf, startCluster, waitFor } from './group-cluster.mjs';
+
+/** 提示里那条「路径：<绝对路径>」——正文 handoff 的唯一来源 */
+function handoffPathIn(prompt) {
+  const line = prompt.split('\n').find((row) => row.startsWith('路径：'));
+  return line ? line.slice('路径：'.length) : '';
+}
 
 /** 立刻补差一次：后台节拍可能正有一轮在飞（那时 pull() 报 skipped），让一让再试 */
 async function pullNow(member, attempts = 40) {
@@ -65,6 +72,14 @@ test('H1 hub 计数触发：40 条 → 一条摘要、窗口 1..40、平面形�
   assert.ok(prompts[0].prompt.includes('第 40 条：压测报告我来写'));
   assert.equal(prompts[0].prompt.includes(secretOf(member.peerId)), false, '提示里不许出现对端密钥');
   assert.equal(prompts[0].prompt.includes(secretOf(hub.peerId)), false, '提示里不许出现本机密钥');
+
+  // 正文 handoff：提示里给的是**绝对路径**，且只由 hub 的 stateDir 推出（不来自模型输出）
+  const handoff = handoffPathIn(prompts[0].prompt);
+  assert.equal(path.isAbsolute(handoff), true, 'handoff 路径必须是绝对路径');
+  assert.equal(path.basename(handoff), DIGEST_OUT_FILE);
+  assert.equal(handoff, path.join(path.resolve(hub.dir), DIGEST_OUT_FILE), '路径由 stateDir 推出');
+  assert.ok(prompts[0].prompt.includes('DONE'), '回复只要一个 DONE');
+  assert.equal(fs.existsSync(handoff), false, '这一趟没写文件 → 退回回复，且 stateDir 里不留文件');
 
   // 盘上就是那份 {version:1, digests:[...]}
   const file = digestFileOf(hub);
