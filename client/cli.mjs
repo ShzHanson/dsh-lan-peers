@@ -1750,6 +1750,120 @@ async function cmdSendFile(args) {
   console.log(L('cli.file.offered', { id: fileId, bytes, sha256, ms }));
 }
 
+// ---------------------------------------------------------------------------
+// 0.13 群文件（CLI 侧）：把本机一个文件发进**本机所在的那个群**。
+//
+// 不新开路由：面板的群上传本来就是这条链（lib/admin.mjs:3135 / :3193 / :3282），
+// 终点在 finish 里按 scope 挑 —— 'group' 交给 hub 的群文件路由（分片校验、公告都在里面）。
+//   init  {name,bytes}                      → {uploadId,chunkBytes,maxBytes}
+//   chunk {uploadId,offset,dataBase64} × N  → {received}（offset 必须正好等于上一次的 received）
+//   finish{uploadId,scope:'group',targets}  → {fileId,bytes,sha256,targets,rev}
+// 与面板一致的三条硬规矩：单片 512 KiB（用服务端回显的 chunkBytes）、偏移严格顺序、
+// 任一片失败立即中止（不补发、不重试、不发 finish）。
+// 差别只在观感：进度行最多每 2 秒一次（面板每片都刷，终端里那是灾难）。
+// ---------------------------------------------------------------------------
+
+const GROUP_FILE_CHUNK_FALLBACK = 512 * 1024;
+const GROUP_FILE_PROGRESS_MS = 2000;
+
+/** 发字节的进度行：最多每 GROUP_FILE_PROGRESS_MS 一行；非 TTY 不刷（管道里刷 \r 只会污染输出）。 */
+function startGroupFileProgress(size) {
+  const forced = String(process.env.DSH_LAN_PEERS_PROGRESS ?? '').trim() === '1';
+  if (!forced && process.stderr.isTTY !== true) return { tick() {}, stop() {} };
+  let last = 0;
+  let painted = false;
+  return {
+    tick(sent) {
+      const now = Date.now();
+      if (now - last < GROUP_FILE_PROGRESS_MS) return;
+      last = now;
+      const total = size > 0 ? size : 1;
+      const pct = Math.max(0, Math.min(100, Math.round((sent / total) * 100)));
+      process.stderr.write('\r  ' + L('cli.file.progressBytes', { received: sent, total: size, pct }) + '   ');
+      painted = true;
+    },
+    stop() {
+      if (painted) process.stderr.write('\r' + ' '.repeat(36) + '\r');
+    },
+  };
+}
+
+async function cmdGroupFile(args) {
+  const dir = stateDir(args);
+  const raw = String(args._[0] ?? '').trim();
+  if (raw === '') throw new Error(L('cli.file.groupFileUsage') + '\n' + L('cli.help.groupFile'));
+  // --targets 原样交给 hub（CLI 不做名字解析）：缺省 all
+  const flag = args.targets;
+  const targets = flag === undefined || flag === true || String(flag).trim() === '' ? 'all' : String(flag).trim();
+  const file = path.resolve(raw);
+  // 三道本机闸门全在网络调用之前：找不到 / 不是普通文件 / 空文件，一个请求都不发。
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch {
+    throw new Error(L('cli.file.notFound', { file: raw }));
+  }
+  if (!stat.isFile()) throw new Error(L('cli.file.notRegular', { file: raw }));
+  if (!(stat.size > 0)) throw new Error(L('cli.file.empty', { file: raw }));
+  let adminUrl;
+  try {
+    adminUrl = resolveAdminUrl(dir, args);
+  } catch (error) {
+    reportFilesError(error);
+    return;
+  }
+  process.stderr.write(L('cli.common.sending', { label: targets, bytes: stat.size }) + '\n');
+  const progress = startGroupFileProgress(stat.size);
+  const post = (apiPath, body) => adminCall(adminUrl, apiPath, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }, dir);
+  let uploadId = '';
+  let result = null;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const started = await post('files/upload/init', { name: path.basename(file), bytes: stat.size });
+    uploadId = String(started?.uploadId ?? '').trim();
+    if (uploadId === '') throw new Error('bad-upload-id');
+    const echoed = Number(started?.chunkBytes);
+    const chunkBytes = Number.isFinite(echoed) && echoed > 0 ? Math.floor(echoed) : GROUP_FILE_CHUNK_FALLBACK;
+    let offset = 0;
+    while (offset < stat.size) {
+      const want = Math.min(chunkBytes, stat.size - offset);
+      const slice = Buffer.allocUnsafe(want);
+      let read = 0;
+      try {
+        read = fs.readSync(fd, slice, 0, want, offset);
+      } catch {
+        throw new Error(L('cli.file.readFailed', { file: raw }));
+      }
+      if (read !== want) throw new Error(L('cli.file.readFailed', { file: raw }));
+      const sent = await post('files/upload/chunk', { uploadId, offset, dataBase64: slice.toString('base64') });
+      const received = Number(sent?.received);
+      // offset 与 received 必须逐片对齐：服务端回的下一个 offset 是它盘上的真实字节数。
+      if (!Number.isFinite(received) || received <= offset) throw new Error('bad-received');
+      offset = received;
+      progress.tick(offset);
+    }
+    result = await post('files/upload/finish', { uploadId, scope: 'group', targets });
+  } catch (error) {
+    // 中止：这一趟不补发、不重试、不发 finish；临时区尽力退掉（幂等接口，失败也不改错误口径）
+    if (uploadId !== '') await post('files/upload/cancel', { uploadId }).catch(() => {});
+    progress.stop();
+    reportFilesError(error);
+    return;
+  } finally {
+    fs.closeSync(fd);
+  }
+  progress.stop();
+  const fileId = String(result?.fileId ?? '');
+  const bytes = Number.isFinite(Number(result?.bytes)) ? Number(result.bytes) : stat.size;
+  const sha256 = String(result?.sha256 ?? '');
+  const to = String(result?.targets ?? '').trim() || targets;
+  console.log(L('cli.file.groupSent', { id: fileId.slice(0, 8), bytes, sha256: sha256.slice(0, 8), targets: to }));
+}
+
 const inboxSha = (row) => {
   const sha = String(row?.sha256 ?? '');
   return sha === '' ? '-' : sha;
@@ -2257,6 +2371,7 @@ const commands = {
   dm: cmdDm,
   dispatch: cmdDispatch,
   'send-file': cmdSendFile,
+  'group-file': cmdGroupFile,
   inbox: cmdInbox,
   download: cmdDownloadFile,
   decline: cmdDeclineFile,
@@ -2272,6 +2387,7 @@ const helpFor = {
   dm: 'cli.help.dm',
   dispatch: 'cli.dispatch.usage',
   'send-file': 'cli.help.sendFile',
+  'group-file': 'cli.help.groupFile',
   inbox: 'cli.help.inbox',
   download: 'cli.help.download',
   decline: 'cli.help.decline',

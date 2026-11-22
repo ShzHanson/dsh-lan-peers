@@ -223,6 +223,9 @@ import {
   targetAllows,
   visibleFiles,
 } from '../lib/group-files.mjs';
+// 0.12.8-alpha（slice H）群摘要：hub 侧的存储 + 摘要器（纯模块，时钟/会话/日志全可注入）。
+// 平面搭同一次 pull 回来（与 groupFiles 同一个形状：hub 权威、rev 门控、成员只读镜像）。
+import { GroupDigestStore, createHubSummarizer, normalizeDigestPlane } from '../lib/group-digest.mjs';
 // 0.10.0-α slice 4b-1：群表决状态机（纯模块）。hub 只负责落盘、走线、定时器与 hub-only 门。
 import {
   MAX_ROUNDS,
@@ -262,7 +265,7 @@ import { parseArgs } from 'node:util';
 // ---------------------------------------------------------------------------
 
 /** 插件版本，用于 /v1/health.version */
-export const PLUGIN_VERSION = '0.12.6-alpha';
+export const PLUGIN_VERSION = '0.13.0-alpha';
 
 /** §4.1 允许的时钟偏移 */
 export const CLOCK_SKEW_MS = 60_000;
@@ -790,6 +793,12 @@ export function resolveConfig(overrides = {}) {
     trustedCidrs,
     now: typeof overrides.now === 'function' ? overrides.now : Date.now,
     logger: typeof overrides.logger === 'function' ? overrides.logger : null,
+    // 0.12.7-alpha（slice C）：常驻参与者的活动钩子。必须过 resolveConfig ——
+    // createPeerServer 只认它的输出，裸 overrides 上的函数在这里就会断掉。
+    onParticipantEvent: typeof overrides.onParticipantEvent === 'function' ? overrides.onParticipantEvent : null,
+    // 0.12.8-alpha（slice H）：hub 侧摘要会话的通道（sessionId, prompt -> {sessionId, reused, reply}）。
+    // 与 onParticipantEvent 同一个理由必须过 resolveConfig；缺省 = 没有摘要会话（走确定性兜底）。
+    digestPrompt: typeof overrides.digestPrompt === 'function' ? overrides.digestPrompt : null,
     // §4 未写明 secret 是「字符串」还是「base64url 解码后的字节」，默认按字符串
     secretKeyEncoding: overrides.secretKeyEncoding === 'base64url' ? 'base64url' : 'utf8',
     // 兼容 §3/§8 冲突：验签时除 inboundSecret 外，也接受 peers.json 里的 secret
@@ -2897,6 +2906,24 @@ export function createPeerServer(overrides = {}) {
     permission: config.permission,
     now: config.now,
   });
+  /**
+   * 0.12.7-alpha（slice C）：常驻参与者的唯一注入口。
+   *
+   * 这里只**报告**「本机刚看见了什么」，不做任何判断（回声/系统行/批次/环路都在
+   * lib/participant.mjs 里，那一层可注入假时钟）。钩子是可选注入：没注入的装配
+   * （CLI、老测试）行为一字不变。钩子抛错绝不打断群/私聊本身的写路径。
+   */
+  const participantHook = config.onParticipantEvent;
+  function emitParticipant(event) {
+    if (!participantHook) return;
+    try {
+      participantHook(event);
+    } catch (error) {
+      if (config.logger) {
+        config.logger('[participant] hook failed: ' + String(error?.message ?? error).slice(0, 120));
+      }
+    }
+  }
   if (!runner || typeof runner.ask !== 'function' || typeof runner.poll !== 'function') {
     throw new TypeError('runner must implement ask(prompt) and poll(sessionId)');
   }
@@ -3217,6 +3244,76 @@ export function createPeerServer(overrides = {}) {
 
   /** 已下载台账：两个角色都有（它只记「本机拉过什么」） */
   const groupDownloads = new GroupFileDownloads({ stateDir: config.stateDir, now: config.now });
+
+  // -------------------------------------------------------------------------
+  // 0.12.8-alpha（slice H）· 群摘要：hub 汇总**一次**，摘要走平面分发，成员只读摘要
+  //
+  // 为什么不是群消息：加一个 kind 等于「要么全网升级、要么谁都收不到」；平面搭同一次
+  // pull 回来，老节点不认识这个字段就当没看见。摘要**不占 seq**（seq 是消息的水位）。
+  //
+  // 谁是作者：只有 hub 写（有 groupStore 才有摘要器）。成员那侧只有一个只读镜像 ——
+  // 「hub only」是两层：这里根本不给成员造实例，createHubSummarizer 自己还有一道
+  // isHub 闸（成员态的实例不建会话、不读日志、不写平面）。
+  // -------------------------------------------------------------------------
+
+  const digestStore = new GroupDigestStore({
+    stateDir: config.stateDir,
+    now: config.now,
+    logger: config.logger,
+    // hub 的平面里带 hubId（= 本机 instanceId）；成员只采纳 hubId 对得上的那份
+    hubId: groupStore ? store.instanceId : '',
+  });
+
+  /** 摘要会话通道（装配注入的优先）；缺省 = 没有摘要会话 → 确定性兜底 */
+  let digestPromptFn = config.digestPrompt;
+
+  const digestSummarizer = groupStore
+    ? createHubSummarizer({
+        isHub: true,
+        store: digestStore,
+        // 只读 hub 的权威日志：摘要器看到的永远只有群消息正文（无 token、无文件内容）
+        messages: (fromSeq) => groupStore.messages({ sinceSeq: fromSeq, limit: GROUP_HISTORY_MAX_LIMIT }),
+        promptSession: (sessionId, prompt) => {
+          if (!digestPromptFn) {
+            return Promise.reject(Object.assign(new Error('no-summarizer'), { code: 'no-summarizer' }));
+          }
+          return digestPromptFn(sessionId, prompt);
+        },
+        stateDir: config.stateDir,
+        now: config.now,
+        log: config.logger,
+      })
+    : null;
+
+  /** 平面只读视图：hub 读权威那份，成员读 pull 同步来的镜像 */
+  function digestPlaneValue() {
+    return digestStore.value();
+  }
+
+  /**
+   * 群摘要的观察/驱动门面（hub 与成员都挂，行为按角色分）：
+   *   plane()      平面视图（{rev, hubId, digests}）
+   *   summarize()  hub：立刻走一趟（生产靠计数/计时触发，这里给测试与排障）
+   *   noteNew()    计数触发的落点（dispatchGroupAnswers 已经挂好）
+   *   setPrompt()  装配注入摘要会话通道（成员一律 hub-only：连配置都不给）
+   */
+  const digestFacade = {
+    plane: () => digestPlaneValue(),
+    storeFile: () => digestStore.path,
+    count: () => digestStore.count(),
+    state: () => (digestSummarizer ? digestSummarizer.state() : { isHub: false, count: digestStore.count() }),
+    summarize: (trigger = 'manual') => (digestSummarizer
+      ? digestSummarizer.maybeSummarize(trigger)
+      : { ok: false, error: 'hub-only' }),
+    noteNew: () => (digestSummarizer ? digestSummarizer.noteNew() : { ok: false, error: 'hub-only' }),
+    tick: () => (digestSummarizer ? digestSummarizer.tick() : { ok: false, error: 'hub-only' }),
+    setPrompt: (fn) => {
+      if (!digestSummarizer) return { ok: false, error: 'hub-only' };
+      digestPromptFn = typeof fn === 'function' ? fn : null;
+      return { ok: true, hasPrompt: digestPromptFn !== null };
+    },
+    applyReplica: (value, options = {}) => digestStore.setReplica(value, options),
+  };
 
   /** 平面只读视图：hub 读权威文件，成员读 pull 同步来的镜像 */
   function filesPlaneValue() {
@@ -3557,6 +3654,8 @@ export function createPeerServer(overrides = {}) {
       // 然后挂上重提醒：进程活得比这次搁置久，人可能几天后才回来。
       scheduleShelvedReminder(id);
     }
+    // 0.12.7-alpha（slice C）：进下一轮 / 被搁置都是决策事件 → 立刻唤醒（平面已落盘）
+    emitParticipant({ kind: 'vote' });
     return { ok: true, outcome: settled.outcome, closed: true, vote: settled.vote };
   }
 
@@ -3575,6 +3674,8 @@ export function createPeerServer(overrides = {}) {
     if (config.logger) {
       config.logger(`[group] vote open id=${shortVoteId(vote.proposalId)} round=${vote.round} roster=${vote.roster.length}`);
     }
+    // 0.12.7-alpha（slice C）：提案开票 = 决策事件，常驻参与者立刻醒（不排队等批次窗）
+    emitParticipant({ kind: 'vote' });
     return { ok: true, vote };
   }
 
@@ -6631,6 +6732,9 @@ export function createPeerServer(overrides = {}) {
         // 按**收件人**过滤：targets:[peerId] 的条目只发给那一个人（hub 自己全见）。
         // 成员拿到只落镜像（replicaStore.setFiles），永不回写 hub —— 平面 hub 单写。
         groupFiles: filesView(auth.peerId, { isHub: false }),
+        // 0.12.8-alpha（slice H）：群摘要搭**同一次 pull** 回来（与纪要/表决/群文件同一个理由）。
+        // 平面里带 hubId：成员只采纳「作者是 hub」且 rev 更大的那一份，非 hub 作者一律忽略。
+        groupDigest: digestPlaneValue(),
         // 成员靠它把成员表刷新到最新（新成员加进来后不会一直判 not-a-member）
         memberIds: Object.keys(ctx.members),
       },
@@ -9512,6 +9616,22 @@ export function createPeerServer(overrides = {}) {
    */
   function dispatchGroupAnswers(messages, groupId) {
     const list = Array.isArray(messages) ? messages : [];
+    // 0.12.7-alpha（slice C）：常驻参与者搭**同一条缝** —— 本函数就是「一条新消息在本机
+    // 可见」的唯一出口（hub 收成员 post、成员 pull、复制、commit 广播、本机发言人六条路
+    // 都经这里）。所以不新增轮询：参与者的唤醒队列就挂在这上面。
+    // 回声/系统行/批次/环路四道闸全在 lib/participant.mjs 里，这里只报告原始消息。
+    if (list.length > 0) {
+      emitParticipant({ kind: 'group', groupId: String(groupId ?? ''), messages: list });
+      // 0.12.8-alpha（slice H）：计数触发的落点也挂在同一条缝上（够 40 条才真的叫那一个
+      // 摘要会话；不够只报数）。成员节点没有摘要器，这一行是空操作。
+      try {
+        digestSummarizer?.noteNew();
+      } catch (error) {
+        if (config.logger) {
+          config.logger('[digest] note-failed err=' + String(error?.message ?? error).slice(0, 48));
+        }
+      }
+    }
     const key = String(groupId ?? '');
     let queued = 0;
     pruneResidentSessions();
@@ -9665,6 +9785,11 @@ export function createPeerServer(overrides = {}) {
       // 0.12.0-alpha（S2）：群文件公告同样只落镜像（rev 更大的才采纳），永不回写 hub
       const syncedFiles = page.groupFiles && typeof page.groupFiles === 'object'
         ? replicaStore.setFiles(page.groupFiles)
+        : null;
+      // 0.12.8-alpha（slice H）：群摘要同样只落镜像（rev 更大**且**作者就是 hub 才采纳）。
+      // 这一层就是用户定的「成员只消费摘要」：原文照旧走既有工具，但摘要只有 hub 写得出来。
+      const syncedDigest = page.groupDigest && typeof page.groupDigest === 'object'
+        ? digestStore.setReplica(page.groupDigest, { hubId: String(hub.peerId ?? '') })
         : null;
       memberLastError = '';
       // hub 在 pull 响应里自报地址（X-Peer-Base 同一口径）：按名入群的节点本地没有 hub 的
@@ -10301,6 +10426,13 @@ export function createPeerServer(overrides = {}) {
     const incoming = readDmMessages(body.messages);
     // 用签名里的 peerId 定位这一对 —— body.peerId 是对端自报，不作数
     const merged = dmStore.merge(auth.peerId, incoming);
+    // 0.12.7-alpha（slice C）：对端写的那几条就是「新到的私聊」—— 常驻参与者据此立刻唤醒。
+    // from 是**对端视角**（对端的 self 就是本机的 peer），所以取 'self' 那几条；
+    // merge 自己去重，重复同步不会重复唤醒。
+    if (merged.added > 0) {
+      const freshDm = incoming.filter((entry) => entry.from === 'self' && entry.id !== '');
+      if (freshDm.length > 0) emitParticipant({ kind: 'dm', peerId: auth.peerId, entries: freshDm });
+    }
     const theirIds = new Set(incoming.map((entry) => entry.id));
     const missing = dmStore.list(auth.peerId)
       .filter((entry) => !theirIds.has(entry.id))
@@ -11510,6 +11642,8 @@ export function createPeerServer(overrides = {}) {
             quotaBytes: () => groupFiles.store.total,
             usedBytes: () => groupFiles.store.used,
           },
+          // 0.12.8-alpha（slice H）：群摘要平面（hub 权威 / 成员镜像）+ 摘要器的驱动口
+          digest: digestFacade,
           // 测试/排障可见：还挂着几个表决定时器（关轮与 close() 之后必须是 0）
           voteTimers: () => voteTimers.size,
           // 4b-3：还挂着几个 shelved 重提醒（裁决、close() 之后必须是 0）
@@ -11551,6 +11685,9 @@ export function createPeerServer(overrides = {}) {
           ...inviteFacade,
           // 0.10.0-α slice 3a：群问答的观察门面（waitAnswers / answerPending / resident）
           ...answerFacade,
+          // 0.12.8-alpha（slice H）：成员侧只有摘要的只读镜像 —— 摘要器一个都没有
+          // （digestFacade 的 summarize/noteNew/tick/setPrompt 在这里一律 hub-only）。
+          digest: digestFacade,
           // S2 成员侧：本地副本 + 拉取/推送入口（hub 端点仍在 hub 那边）。
           // v0.8.0：副本可能因「按名入群」在运行期才出现（role 从 off 提升成 member），
           // 所以这里必须是 getter —— 否则门面永远拿到初始化那一刻的 null。
@@ -11656,6 +11793,9 @@ export function createPeerServer(overrides = {}) {
       fileOutbox.start();
       // 0.12.0-alpha（S2）：群文件的半截上传/配额清扫（同样 unref，close() 里清掉）
       groupFiles?.store.start();
+      // 0.12.8-alpha（slice H）：群摘要的 10 分钟节拍（同样 unref，close() 里清掉）。
+      // 计数触发挂在 dispatchGroupAnswers 上；两条路都汇进同一个 maybeSummarize()。
+      digestSummarizer?.start();
       // 0.8.5-α 契约 §3：待批准 10 分钟到期置 expired（同样 unref，close() 里清掉）
       dispatchPending.start();
       // 0.12.1：日志轮转节拍（unref；close() 里清掉）。挂上就等一整个间隔再第一次动。
@@ -11699,6 +11839,8 @@ export function createPeerServer(overrides = {}) {
       fileOutbox.close();
       // 0.12.0-alpha（S2）：群文件清扫器一并收尾（热重载不留定时器）
       groupFiles?.close();
+      // 0.12.8-alpha（slice H）：摘要节拍一并收尾（热重载不留定时器）
+      digestSummarizer?.close();
       // 0.8.5-α 契约 §3：待批准队列同样要收尾（并丢掉只存在内存里的正文）
       dispatchPending.close();
       // 0.12.1：日志轮转节拍（unref 起来的，热重载必须显式清掉，否则旧实例还在转日志）
