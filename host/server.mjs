@@ -225,7 +225,7 @@ import {
 } from '../lib/group-files.mjs';
 // 0.12.8-alpha（slice H）群摘要：hub 侧的存储 + 摘要器（纯模块，时钟/会话/日志全可注入）。
 // 平面搭同一次 pull 回来（与 groupFiles 同一个形状：hub 权威、rev 门控、成员只读镜像）。
-import { GroupDigestStore, createHubSummarizer, normalizeDigestPlane } from '../lib/group-digest.mjs';
+import { GroupDigestStore, createHubSummarizer, normalizeDigestPlane, resolveModelSummary } from '../lib/group-digest.mjs';
 // 0.10.0-α slice 4b-1：群表决状态机（纯模块）。hub 只负责落盘、走线、定时器与 hub-only 门。
 import {
   MAX_ROUNDS,
@@ -799,6 +799,8 @@ export function resolveConfig(overrides = {}) {
     // 0.12.8-alpha（slice H）：hub 侧摘要会话的通道（sessionId, prompt -> {sessionId, reused, reply}）。
     // 与 onParticipantEvent 同一个理由必须过 resolveConfig；缺省 = 没有摘要会话（走确定性兜底）。
     digestPrompt: typeof overrides.digestPrompt === 'function' ? overrides.digestPrompt : null,
+    // 0.13.0-alpha（决定 A）：摘要要不要叫模型。默认 false —— 判断规则只在 resolveModelSummary 一处
+    digestModel: resolveModelSummary(overrides.digestModel),
     // §4 未写明 secret 是「字符串」还是「base64url 解码后的字节」，默认按字符串
     secretKeyEncoding: overrides.secretKeyEncoding === 'base64url' ? 'base64url' : 'utf8',
     // 兼容 §3/§8 冲突：验签时除 inboundSecret 外，也接受 peers.json 里的 secret
@@ -3282,6 +3284,7 @@ export function createPeerServer(overrides = {}) {
         stateDir: config.stateDir,
         now: config.now,
         log: config.logger,
+        modelSummary: config.digestModel,
       })
     : null;
 
