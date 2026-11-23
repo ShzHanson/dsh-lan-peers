@@ -11,7 +11,7 @@ import net from 'node:net';
 import path from 'node:path';
 
 import { startCluster, waitFor } from './group-cluster.mjs';
-import { isFetchBlockedPort } from './helpers.mjs';
+import { listenOnRandomPort } from '../../test-support/ports.mjs';
 import { normalizeGroupConfig } from '../../lib/group-client.mjs';
 
 const postHub = (hub, text) => hub.server.group.post({
@@ -26,18 +26,18 @@ const digestFileOf = (node) => JSON.parse(fs.readFileSync(path.join(node.dir, 'g
 /** 比较用：at 是墙钟（两个群不共享时钟），其余字段必须逐字节相同 */
 const contentOf = (entries) => JSON.stringify((entries ?? []).map((entry) => ({ ...entry, at: 0 })));
 
-/** 一个立刻 ECONNREFUSED 的地址：先占一个 fetch 不拒绝的空闲端口，再关掉它 */
+/**
+ * 一个立刻 ECONNREFUSED 的地址：先占一个 fetch 不拒绝的空闲端口，再关掉它。
+ * 端口必须走 test-support/ports.mjs —— 本仓铁律禁止裸 listen(0)（ports-scan 断言白名单为空），
+ * 而助手已负责避开 WHATWG 黑名单端口并在撞上时换一个。
+ */
 async function deadUrl() {
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    const port = await new Promise((resolve, reject) => {
-      const probe = net.createServer();
-      probe.once('error', reject);
-      probe.listen(0, '127.0.0.1', () => {
-        const found = probe.address().port;
-        probe.close(() => resolve(found));
-      });
-    });
-    if (!isFetchBlockedPort(port)) return 'http://127.0.0.1:' + port;
+    const probe = net.createServer();
+    probe.unref();
+    const info = await listenOnRandomPort(probe);
+    await new Promise((resolve) => probe.close(resolve));
+    return 'http://127.0.0.1:' + info.port;
   }
   throw new Error('no dead port');
 }
