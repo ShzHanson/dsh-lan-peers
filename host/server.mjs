@@ -226,6 +226,18 @@ import {
 // 0.12.8-alpha（slice H）群摘要：hub 侧的存储 + 摘要器（纯模块，时钟/会话/日志全可注入）。
 // 平面搭同一次 pull 回来（与 groupFiles 同一个形状：hub 权威、rev 门控、成员只读镜像）。
 import { GroupDigestStore, createHubSummarizer, normalizeDigestPlane, resolveModelSummary } from '../lib/group-digest.mjs';
+// 0.13.0-alpha（决定 C）远端摘要器：hub 派发、对端跑模型、成功才追加一条 agent-remote。
+// 纯模块（时钟/通道/日志全可注入）：冷却、一行 skip 日志、回复验签都在 lib 层用例里钉住。
+import {
+  DIGEST_SUMMARY_PATH,
+  SUMMARY_BUDGET_MS,
+  SUMMARY_HANDLER_BUDGET_MS,
+  createRemoteSummaryDispatcher,
+  createRemoteSummaryHandler,
+  resolveSummaryPeer,
+  signSummaryReply,
+  verifySummaryReply,
+} from '../lib/group-summarizer.mjs';
 // 0.10.0-α slice 4b-1：群表决状态机（纯模块）。hub 只负责落盘、走线、定时器与 hub-only 门。
 import {
   MAX_ROUNDS,
@@ -364,6 +376,15 @@ export const PEER_RESET_V1_PATHS = Object.freeze([
 ]);
 
 /**
+ * 0.13.0-alpha（决定 C）：远端摘要器的接收端点（per-peer 签名 + 信封）。
+ * 与文件互传/私聊同一把尺子：只要配对过就答，未配对先在这里 401 ——
+ * 认证完全复用既有 per-peer 路径，不引入第二套签名。
+ */
+export const SUMMARY_V1_PATHS = Object.freeze([
+  '/v1/group/digest-summary',
+]);
+
+/**
  * 0.8.5-α 契约 §2：派单工作区/权限（per-peer 签名 + 信封）。
  * options 是 GET（无 body，信封头照样带），approval 同样是 GET。
  */
@@ -387,6 +408,7 @@ const KNOWN_V1_PATHS = Object.freeze([
   ...DM_V1_PATHS,
   ...DISPATCH_V1_PATHS,
   ...PEER_RESET_V1_PATHS,
+  ...SUMMARY_V1_PATHS,
 ]);
 
 /** §5 ask 默认超时（秒） */
@@ -749,6 +771,8 @@ export function normalizeGroupConfig(raw) {
       ? Math.floor(commitMs)
       : GROUP_DEFAULT_COMMIT_TIMEOUT_MS,
     hubPriority: Number.isFinite(priority) ? Math.floor(priority) : GROUP_DEFAULT_HUB_PRIORITY,
+    // 决定 C：远端摘要器（peerId 或 peer 名）。空 = 只有确定性摘要 —— 老安装行为一个字都不变。
+    digestSummarizer: String(value.digestSummarizer ?? '').trim().slice(0, 128),
   };
 }
 
@@ -3279,6 +3303,68 @@ export function createPeerServer(overrides = {}) {
   /** 摘要会话通道（装配注入的优先）；缺省 = 没有摘要会话 → 确定性兜底 */
   let digestPromptFn = config.digestPrompt;
 
+  /**
+   * 0.13.0-alpha（决定 C）· hub 侧的**远端**派发器。
+   *
+   * 没配（group.digestSummarizer 为空）→ null：一个字都不做、一行日志都不记 ——
+   * 老安装的行为与决定 A 完全一致。
+   * 配了名字但解析不出来 → 只记一次 [digest] summarizer unknown name=...，之后按
+   * "没配" 处理（每个窗口一行 reason=not-configured）。
+   *
+   * 派发本身的预算 = SUMMARY_BUDGET_MS（2 s）：对端下线时这条路由必须**有界**地回来，
+   * 随后派发器进冷却（30 分钟或 3 个窗口），死掉的对端不会每个 tick 都被敲一次。
+   */
+  const remoteSummary = (() => {
+    // 成员不派发（成员态连摘要器实例都没有）：不建、不解析、也不记那行 unknown。
+    if (!groupStore) return null;
+    const wanted = String(config.group?.digestSummarizer ?? '').trim();
+    if (wanted === '') return null;
+    let knownPeers = [];
+    try {
+      knownPeers = store.listPeers();
+    } catch {
+      knownPeers = [];
+    }
+    // 名字 → peerId 只走既有配对记录（不引入第二本名册）
+    const target = resolveSummaryPeer(wanted, { peers: knownPeers });
+    if (target.peerId === '' && config.logger) {
+      config.logger('[digest] summarizer unknown name=' + wanted.slice(0, 64));
+    }
+    return createRemoteSummaryDispatcher({
+      configured: true,
+      peerId: target.peerId,
+      groupId: () => (groupStore ? String(groupStore.state().groupId ?? '') : ''),
+      call: async (job) => {
+        const peer = store.getPeer(target.peerId);
+        const baseUrl = String(peer?.baseUrl ?? '').trim().replace(/\/+$/, '');
+        const secret = String(peer?.secret ?? '');
+        if (baseUrl === '' || secret === '') {
+          throw Object.assign(new Error('unpaired'), { code: 'unpaired' });
+        }
+        // 出站走既有 per-peer 签名 + 信封（与 /v1/file/*、邀请推送同一条路）
+        return callPeer({
+          baseUrl,
+          secret,
+          senderId: store.instanceId,
+          method: 'POST',
+          apiPath: DIGEST_SUMMARY_PATH,
+          body: job,
+          timeoutMs: SUMMARY_BUDGET_MS,
+        });
+      },
+      // 信任：只认**被指定那一位**的密钥 + by（verifySummaryReply 里按 §4 顺序试密钥）
+      verify: (reply, job) => verifySummaryReply({
+        peer: store.getPeer(target.peerId),
+        reply,
+        job,
+        now: config.now,
+        keyEncoding: config.secretKeyEncoding,
+      }),
+      now: config.now,
+      log: config.logger,
+    });
+  })();
+
   const digestSummarizer = groupStore
     ? createHubSummarizer({
         isHub: true,
@@ -3295,8 +3381,64 @@ export function createPeerServer(overrides = {}) {
         now: config.now,
         log: config.logger,
         modelSummary: config.digestModel,
+        // 决定 C：确定性条目落盘之后的**机会式升级**（null = 没配，见上面）
+        remoteSummary,
       })
     : null;
+
+  /**
+   * 0.13.0-alpha（决定 C）· 接收端：hub 把一批消息派到本机，本机跑**一个**新会话，
+   * 把正文签回来。认证完全复用 per-peer 路径（authenticate），没有第二套签名。
+   *
+   * 四件事一定要做对：
+   *   · 只认 per-peer 签名（未配对/签名不对 → 401，body 都不解）；
+   *   · 一个 job 一个新会话（promptSession('') 由 createRemoteSummaryHandler 保证）；
+   *   · 没有通道 → {ok:false,error:'no-agent'}，绝不抛；
+   *   · 回复签上**本机身份**，让 hub 那边能判"这是不是被指定那一位"。
+   */
+  async function digestSummaryIn(req, rawBody) {
+    const auth = authenticate(req, rawBody);
+    if (!auth.ok) return { status: auth.status, body: { error: auth.error }, peerId: null };
+    let job = null;
+    try {
+      job = parseJsonBody(rawBody);
+    } catch {
+      return { status: 400, body: { error: 'bad-request' }, peerId: auth.peerId };
+    }
+    // 现读 config.digestPrompt：装配通道可能在 server 建好之后才接上
+    const handle = createRemoteSummaryHandler({
+      promptSession: typeof config.digestPrompt === 'function' ? config.digestPrompt : null,
+      budgetMs: SUMMARY_HANDLER_BUDGET_MS,
+      now: config.now,
+    });
+    const out = await handle(job);
+    if (!out || out.ok !== true) {
+      const error = String(out?.error ?? 'failed').slice(0, 40);
+      if (config.logger) {
+        config.logger('[digest] remote summary failed peer=' + shortPeerId(auth.peerId) + ' error=' + error);
+      }
+      return { status: 200, body: { ok: false, error }, peerId: auth.peerId };
+    }
+    const peer = store.getPeer(auth.peerId);
+    const secret = String(peer?.secret ?? '');
+    if (secret === '') {
+      return { status: 200, body: { ok: false, error: 'no-key' }, peerId: auth.peerId };
+    }
+    const signed = signSummaryReply({
+      secret,
+      keyEncoding: config.secretKeyEncoding,
+      by: store.instanceId,
+      job,
+      text: out.text,
+      now: config.now,
+    });
+    if (config.logger) {
+      config.logger('[digest] remote summary served peer=' + shortPeerId(auth.peerId)
+        + ' seq=' + signed.fromSeq + '-' + signed.toSeq
+        + ' chars=' + Array.from(signed.text).length);
+    }
+    return { status: 200, body: signed, peerId: auth.peerId };
+  }
 
   /** 平面只读视图：hub 读权威那份，成员读 pull 同步来的镜像 */
   function digestPlaneValue() {
@@ -3326,6 +3468,8 @@ export function createPeerServer(overrides = {}) {
       return { ok: true, hasPrompt: digestPromptFn !== null };
     },
     applyReplica: (value, options = {}) => digestStore.setReplica(value, options),
+    // 决定 C：远端摘要器的状态（配没配、冷却着没有、派发了几次）—— 排障与用例都读这一处
+    remote: () => (remoteSummary ? remoteSummary.state() : null),
   };
 
   /** 平面只读视图：hub 读权威文件，成员读 pull 同步来的镜像 */
@@ -10985,6 +11129,12 @@ export function createPeerServer(overrides = {}) {
     if (method === 'POST' && url.pathname === '/v1/unpair') return unpair(req, rawBody);
     // 0.13.0-α：对端说「我的身份要重置了，把我删掉」。与 unpair 同一条认证，只认 auth.peerId。
     if (method === 'POST' && url.pathname === '/v1/peer/reset-notice') return resetNotice(req, rawBody);
+    // 0.13.0-alpha（决定 C）：远端摘要端点必须在 /v1/group/ 前缀之前 ——
+    // 它不是群级端点（不用群密钥），只认 per-peer 签名。
+    if (url.pathname === DIGEST_SUMMARY_PATH) {
+      if (method !== 'POST') return { status: 405, body: { error: 'method-not-allowed' } };
+      return digestSummaryIn(req, rawBody);
+    }
     // v0.5.0 群：未知的 /v1/group/* 也走这里（404 而不是落到通用 405）
     if (url.pathname.startsWith('/v1/group/')) return groupDispatch(req, rawBody, url, res);
     // 0.8.5-α：文件互传四条（未知的 /v1/file/* 404，已知路径用错方法 405）
@@ -11040,7 +11190,9 @@ export function createPeerServer(overrides = {}) {
             // 0.8.5-α 契约 §2：派单两条也是 per-peer 路径（未配对 → 401；GET 无 body，信封头照样带）
             || DISPATCH_V1_PATHS.includes(url.pathname)
             // 0.13.0-α：身份重置通知也是 per-peer 路径 —— 未配对/签名不对一律 401，与 unpair 同门
-            || PEER_RESET_V1_PATHS.includes(url.pathname));
+            || PEER_RESET_V1_PATHS.includes(url.pathname)
+            // 决定 C：远端摘要端点同理（未配对 → 401，body 先按对端密钥解开再验签）
+            || SUMMARY_V1_PATHS.includes(url.pathname));
         if (groupAuthRequest) {
           const groupCtx = localGroupContext();
           if (groupCtx?.groupKey) {
