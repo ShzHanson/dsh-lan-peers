@@ -12,6 +12,7 @@ import path from 'node:path';
 
 import { startCluster, waitFor } from './group-cluster.mjs';
 import { isFetchBlockedPort } from './helpers.mjs';
+import { normalizeGroupConfig } from '../../lib/group-client.mjs';
 
 const postHub = (hub, text) => hub.server.group.post({
   peerId: hub.peerId,
@@ -55,7 +56,7 @@ test('W1 在线：hub 派给被指定那一位 → 确定性一条 + agent-remot
   const cluster = await startCluster(t, {
     count: 2,
     logger: (line) => lines.push(line),
-    groupExtra: { digestSummarizer: 'node-b' },
+    groupExtra: { digestSummarizer: normalizeGroupConfig({ digestSummarizer: 'node-b' }).digestSummarizer },
   });
   const [hub, member] = cluster.nodes;
   // 接收端挂上摘要会话通道（生产路径是 lib/index.js 注入的 createSessionPrompt）
@@ -112,7 +113,7 @@ test('W2 离线（硬要求）：被指定那一位打不通 → 摘要与"没�
   const cluster = await startCluster(t, {
     count: 2,
     logger: (line) => deadLines.push(line),
-    groupExtra: { digestSummarizer: 'node-b' },
+    groupExtra: { digestSummarizer: normalizeGroupConfig({ digestSummarizer: 'node-b' }).digestSummarizer },
   });
   const [hub, member] = cluster.nodes;
   const peersFile = path.join(hub.dir, 'peers.json');
