@@ -6056,9 +6056,11 @@ export function createPeerServer(overrides = {}) {
 
   /** 启动后一次（契约 §2a）：延迟到 listen 之后，定时器 unref 且 close() 会清掉 */
   function scheduleStartupAdvertise() {
-    if (advertiseTimer) return;
+    if (closing || advertiseTimer) return;
     advertiseTimer = setTimeout(() => {
       advertiseTimer = null;
+      // 停用闸：这个回调是一次真实出站广播（catch 不了 close()，只能自己看闸）
+      if (closing) return;
       void broadcastGroupName({ reason: 'startup' }).catch(() => {});
     }, ADVERTISE_STARTUP_DELAY_MS);
     advertiseTimer.unref?.();
@@ -7804,6 +7806,9 @@ export function createPeerServer(overrides = {}) {
       groupId: String(keyCtx.groupId),
       baseUrl: baseUrlOf(peerId),
     })))));
+    // close() 之后到达的心跳结果一律不落地：定时器虽已清，close 前已在飞的一次仍可能回来，
+    // 而下面两条分支都会写 group-role.json（leaseUntil / follower 转换），等于停用后还在改盘。
+    if (closing) return { ok: false, reason: 'closed' };
     let conflictWith = '';
     let ahead = null;
     for (const result of results) {
@@ -8182,7 +8187,8 @@ export function createPeerServer(overrides = {}) {
   }
 
   function startRoleTimers() {
-    if (!roleStore) return;
+    // 停用闸：心跳/租约两枚定时器 close() 之后绝不再点亮
+    if (!roleStore || closing) return;
     ensureRole();
     if (!heartbeatTimer) {
       heartbeatTimer = setInterval(() => {
@@ -9576,7 +9582,8 @@ export function createPeerServer(overrides = {}) {
    * 这里把本进程原地提升成成员：建副本、起拉取循环、参与选举。只提升一次。
    */
   function promoteToMember() {
-    if (groupRole !== 'off') return false;
+    // 停用闸：close() 之后一次提升（会起 memberTimer + 角色定时器）都不许发生
+    if (closing || groupRole !== 'off') return false;
     const keyHub = readGroupKeyFile(config.stateDir)?.hub ?? null;
     const known = keyHub && (String(keyHub.baseUrl ?? '') !== '' || String(keyHub.peerId ?? '') !== '');
     if (!known) return false;
@@ -9938,6 +9945,8 @@ export function createPeerServer(overrides = {}) {
   /** 成员每一轮：确保有密钥 → 向 leader 补差 → 收下并去重 */
 
   async function memberTick() {
+    // 停用闸：close() 之后一次都不许再发起拉取（在飞的那一趟回来时还会再查一次，见下）
+    if (closing) return { ok: false, reason: 'closed' };
     if (groupRole !== 'member' || memberInFlight) return { ok: false, reason: 'skipped' };
     // S3：自己已经当上 leader 时，本机就是顺序源，不该再去向（可能已死的）原 hub 补差
     if (isLocalLeader()) return { ok: false, reason: 'is-leader' };
@@ -9980,6 +9989,9 @@ export function createPeerServer(overrides = {}) {
         lastSeq: sinceSeq,
         timeoutMs: Math.max(1000, replicaPullMs),
       })));
+      // 停用闸（与 group-digest 的同一条不变式）：请求取消不了，但落地之后**一个字节都不许写** ——
+      // 下面每一行都会落盘（replicaStore.append / setNotes / rememberPeerBaseUrl）或发新请求（群名）
+      if (closing) return { ok: false, reason: 'closed' };
       if (String(page?.groupId ?? '') !== String(ctx.groupId)) {
         throw new Error('group-mismatch');
       }
@@ -10056,7 +10068,8 @@ export function createPeerServer(overrides = {}) {
       const reason = String(error?.message ?? error);
       if (memberLastError !== reason) {
         memberLastError = reason;
-        if (config.logger) config.logger(`[group] pull failed reason=${reason}`);
+        // close() 之后连一行日志都不许再出（日志是插件的可观测活动，见 shutdown.test.mjs Z1）
+        if (config.logger && !closing) config.logger(`[group] pull failed reason=${reason}`);
       }
       return { ok: false, reason };
     } finally {
