@@ -3412,6 +3412,9 @@ export function createPeerServer(overrides = {}) {
       promptSession: typeof config.digestPrompt === 'function' ? config.digestPrompt : null,
       budgetMs: SUMMARY_HANDLER_BUDGET_MS,
       now: config.now,
+      // 交接文件必须落在 <stateDir> 内：缺了它就会退到 process.cwd()，宿主 cwd 不可写时
+      // 写入失败 → 静默退回被截断的预览正文（真机表现为"摘要只有 120 字"，看不出是降级）。
+      stateDir: config.stateDir,
     });
     const out = await handle(job);
     if (!out || out.ok !== true) {

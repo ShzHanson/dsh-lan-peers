@@ -89,6 +89,15 @@ test('W1 在线：hub 派给被指定那一位 → 确定性一条 + agent-remot
   assert.equal(seen.length, 1, '接收端一个 job 只跑一次提示');
   assert.equal(seen[0].sessionId, '', '新会话（空 sessionId），绝不复用历史');
   assert.match(seen[0].prompt, /seq 1-40/);
+  // 投影预览截断（120 字 + '…'）的绕法：正文落盘、回复只写 DONE —— hub 侧同一套
+  assert.match(seen[0].prompt, /\n路径：.+digest-out\.txt\n/, 'handoff 路径必须是绝对路径，且文件名与 hub 侧同一个');
+  // 路径必须落在接收端的 <stateDir> 内。缺 stateDir 时会退到 process.cwd()：宿主 cwd 不可写时
+  // 写文件失败 → 静默退回被截断的预览正文（真机表现就是"摘要只有 120 字"，看不出是降级）。
+  const memberStateDir = path.resolve(String(member.server.config.stateDir));
+  const handoff = /路径：(.+digest-out\.txt)/.exec(seen[0].prompt);
+  assert.ok(handoff, '提示里必须有交接文件路径');
+  assert.equal(handoff[1], path.join(memberStateDir, 'digest-out.txt'), '交接文件必须落在本机 stateDir 内，不能是 process.cwd()');
+  assert.match(seen[0].prompt, /只写一个词：DONE/);
 
   // 成员 pull 回来的镜像里，模型摘要的 source/by 也得认得出来（不是被悄悄降级成 agent）
   await pullNow(member);
