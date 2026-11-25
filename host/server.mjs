@@ -3383,6 +3383,8 @@ export function createPeerServer(overrides = {}) {
         modelSummary: config.digestModel,
         // 决定 C：确定性条目落盘之后的**机会式升级**（null = 没配，见上面）
         remoteSummary,
+        // 0.13.0-α：开关现读 <stateDir>/config.json（热生效）；"谁在线"由上面那条唯一判据给
+        othersOnline: onlineOthersCount,
       })
     : null;
 
@@ -3531,6 +3533,16 @@ export function createPeerServer(overrides = {}) {
   /** 日志里的 id 一律 ≤8 字符（提案 id 本来就是 p<序号>，这里再兜一次底） */
   const shortVoteId = (id) => String(id ?? '').slice(0, 8);
 
+  /**
+   * 一位群成员此刻算不算「在线」——**唯一**判据：peers.json 里它的 lastSeen 落在窗口内
+   * （与 groupMembersView() 的 online 字段同一格 GROUP_ONLINE_WINDOW_MS）。
+   * 本机自己不走这条：hub 永远在线，那由调用方显式处理。
+   */
+  function peerSeenOnline(peerId, nowMs) {
+    const seenAt = Date.parse(store.getPeer(peerId)?.lastSeen ?? '');
+    return Number.isFinite(seenAt) && nowMs - seenAt <= GROUP_ONLINE_WINDOW_MS;
+  }
+
   /** 冻结名单 = 此刻在线的成员（hub 自己永远在线）；排序去重交给 lib，这里只管「谁在线」 */
   function voteRoster() {
     if (!groupStore) return [store.instanceId];
@@ -3542,12 +3554,28 @@ export function createPeerServer(overrides = {}) {
         roster.push(peerId);
         continue;
       }
-      const seenAt = Date.parse(store.getPeer(peerId)?.lastSeen ?? '');
-      if (Number.isFinite(seenAt) && nowMs - seenAt <= GROUP_ONLINE_WINDOW_MS) roster.push(peerId);
+      if (peerSeenOnline(peerId, nowMs)) roster.push(peerId);
     }
     // 兜底：成员表连自己都没有时也别开一轮「没人能投」的票（hub 永远在线）
     if (roster.length === 0) roster.push(store.instanceId);
     return roster;
+  }
+
+  /**
+   * 0.13.0-α：除本机外此刻在线的群成员数 —— 「没别人在线就暂停摘要」的唯一判据。
+   * 复用上面那条 peerSeenOnline（不发明第二套活体规则），**排除自己**：
+   * hub 永远在线，把自己算进去这个开关就永远不会生效。
+   */
+  function onlineOthersCount() {
+    if (!groupStore) return 0;
+    const nowMs = config.now();
+    const members = groupStore.state().members ?? {};
+    let count = 0;
+    for (const peerId of Object.keys(members)) {
+      if (peerId === store.instanceId) continue;
+      if (peerSeenOnline(peerId, nowMs)) count += 1;
+    }
+    return count;
   }
 
   /** 表决平面只读视图：hub 读权威文件，成员读自己同步来的副本（永不回写） */
